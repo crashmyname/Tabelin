@@ -13,6 +13,82 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
+<!-- ============ FILE MENU DROPDOWN ============ -->
+<div id="file-dropdown" class="file-dropdown hidden">
+  <div class="fd-header">
+    <i class="fa-solid fa-file-lines"></i>
+    <div>
+      <div class="fd-header-title" id="fd-wb-name">Untitled</div>
+      <div class="fd-header-sub" id="fd-wb-meta">—</div>
+    </div>
+  </div>
+
+  <div class="fd-section">
+    <button class="fd-item" data-action="new-wb">
+      <i class="fa-solid fa-file-circle-plus"></i> Workbook Baru
+      <span class="fd-shortcut">Ctrl+N</span>
+    </button>
+    <button class="fd-item" data-action="open">
+      <i class="fa-solid fa-folder-open"></i> Buka…
+    </button>
+    <button class="fd-item" data-action="home">
+      <i class="fa-solid fa-house"></i> Ke Home
+    </button>
+  </div>
+
+  <div class="fd-section">
+    <button class="fd-item" data-action="save">
+      <i class="fa-solid fa-floppy-disk"></i> Simpan
+      <span class="fd-shortcut">Ctrl+S</span>
+    </button>
+    <button class="fd-item" data-action="save-as">
+      <i class="fa-solid fa-copy"></i> Simpan Salinan…
+    </button>
+  </div>
+
+  <div class="fd-section">
+    <button class="fd-item" data-action="info">
+      <i class="fa-solid fa-circle-info"></i> Info Workbook
+    </button>
+    <button class="fd-item" data-action="print">
+      <i class="fa-solid fa-print"></i> Print
+      <span class="fd-shortcut">Ctrl+P</span>
+    </button>
+  </div>
+
+  <div class="fd-section">
+    <button class="fd-item" data-action="export-xlsx">
+      <i class="fa-solid fa-file-excel"></i> Export XLSX
+    </button>
+    <button class="fd-item" data-action="export-csv">
+      <i class="fa-solid fa-file-csv"></i> Export CSV
+    </button>
+    <button class="fd-item" data-action="export-pdf">
+      <i class="fa-solid fa-file-pdf"></i> Export PDF
+    </button>
+  </div>
+
+  <div class="fd-section">
+    <button class="fd-item" data-action="logout">
+      <i class="fa-solid fa-right-from-bracket"></i> Logout
+    </button>
+  </div>
+</div>
+
+<!-- ============ MODAL: INFO WORKBOOK ============ -->
+<div id="modal-info" class="modal hidden">
+  <div class="modal-card" style="min-width:420px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-circle-info"></i> Info Workbook</h3>
+    </div>
+    <div class="info-body" id="info-body">
+      <!-- diisi JS -->
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-info-close">Tutup</button>
+    </div>
+  </div>
+</div>
 
 <!-- ============ AUTH SCREEN ============ -->
 <div id="auth-screen" class="auth-screen">
@@ -103,6 +179,13 @@
 <!-- ============ APP ============ -->
 <div id="app" class="hidden">
 
+<!-- ---------- Protected banner ---------- -->
+  <div class="protect-banner" id="protect-banner">
+    <i class="fa-solid fa-lock"></i>
+    <span>Sheet ini <b>diproteksi</b> — sel tidak bisa diedit.</span>
+    <span class="spacer"></span>
+    <button class="banner-action" id="btn-banner-unprotect">Buka Proteksi</button>
+  </div>
   <!-- ---------- Read-only banner ---------- -->
   <div class="readonly-banner" id="readonly-banner">
     <i class="fa-solid fa-lock"></i>
@@ -155,8 +238,9 @@
 
   <!-- ---------- Ribbon tabs ---------- -->
   <div class="ribbon-tabs" id="ribbon-tabs">
+    <button id="tab-file" class="file-tab"><i class="fa-solid fa-folder"></i> File</button>
     <button data-tab="home" class="active"><i class="fa-solid fa-house"></i> Home</button>
-    <button data-tab="insert"><i class="fa-solid fa-chart-simple"></i> Insert</button>
+    <button data-tab="insert"><i class="fa-solid fa-plus"></i> Insert</button>
     <button data-tab="formulas"><i class="fa-solid fa-square-root-variable"></i> Formulas</button>
     <button data-tab="data"><i class="fa-solid fa-database"></i> Data</button>
     <button data-tab="view"><i class="fa-solid fa-eye"></i> View</button>
@@ -178,6 +262,25 @@
         <button class="rib" id="btn-paste" title="Paste (Ctrl+V)"><i class="fa-regular fa-paste"></i></button>
       </div>
       <div class="ribbon-group-label">Clipboard</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-find" title="Cari (Ctrl+F)">
+          <i class="fa-solid fa-magnifying-glass"></i>
+        </button>
+        <button class="rib" id="btn-replace" title="Cari & Ganti (Ctrl+H)">
+          <i class="fa-solid fa-right-left"></i>
+        </button>
+      </div>
+      <div class="ribbon-group-label">Find</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-goto" title="Go To Cell (Ctrl+G)">
+          <i class="fa-solid fa-location-crosshairs"></i>
+        </button>
+      </div>
+      <div class="ribbon-group-label">Go To</div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
@@ -259,10 +362,47 @@
       </div>
       <div class="ribbon-group-label">Clear</div>
     </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib protect-allowed" id="btn-protect-sheet" title="Proteksi Sheet">
+          <i class="fa-solid fa-lock"></i>
+        </button>
+        <button class="rib protect-allowed" id="btn-unprotect-sheet" title="Buka Proteksi">
+          <i class="fa-solid fa-lock-open"></i>
+        </button>
+      </div>
+      <div class="ribbon-group-label">Protect</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-add-comment" title="Tambah Komentar">
+          <i class="fa-solid fa-comment"></i>
+        </button>
+        <button class="rib" id="btn-delete-comment" title="Hapus Komentar">
+          <i class="fa-solid fa-comment-slash"></i>
+        </button>
+        <button class="rib" id="btn-show-comments" title="Tampilkan semua komentar">
+          <i class="fa-solid fa-comments"></i>
+        </button>
+      </div>
+      <div class="ribbon-group-label">Comment</div>
+    </div>
   </div>
 
   <!-- ---------- Ribbon: INSERT ---------- -->
   <div class="ribbon-pane" data-pane="insert">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-insert-link">
+          <i class="fa-solid fa-link"></i> Hyperlink
+        </button>
+        <button class="rib wide" id="btn-insert-image">
+          <i class="fa-solid fa-image"></i> Gambar
+        </button>
+        <input id="image-upload" type="file" accept="image/*" hidden />
+      </div>
+      <div class="ribbon-group-label">Insert</div>
+    </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
         <button class="rib wide" data-chart="bar">
@@ -338,12 +478,15 @@
         <button class="rib wide" id="btn-sort-desc">
           <i class="fa-solid fa-arrow-up-z-a"></i> Z→A
         </button>
+        <button class="rib wide" id="btn-sort-multi" title="Sort Multi-Kolom">
+          <i class="fa-solid fa-sort"></i> Multi
+        </button>
       </div>
       <div class="ribbon-group-label">Sort</div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
-        <button class="rib wide" id="btn-filter-toggle">
+        <button class="rib wide" id="btn-filter-toggle" title="Aktifkan filter cepat">
           <i class="fa-solid fa-filter"></i> Filter
         </button>
         <button class="rib wide" id="btn-filter-clear">
@@ -362,6 +505,25 @@
         </button>
       </div>
       <div class="ribbon-group-label">Conditional</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-validation" title="Data Validation">
+          <i class="fa-solid fa-list-check"></i> Validasi
+        </button>
+        <button class="rib wide" id="btn-validation-clear" title="Hapus semua validasi">
+          <i class="fa-solid fa-xmark"></i> Clear
+        </button>
+      </div>
+      <div class="ribbon-group-label">Validation</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-remove-dup" title="Hapus Baris Duplikat">
+          <i class="fa-solid fa-clone"></i> Duplikat
+        </button>
+      </div>
+      <div class="ribbon-group-label">Clean</div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
@@ -402,6 +564,23 @@
         </label>
       </div>
       <div class="ribbon-group-label">Show</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-freeze-top" title="Freeze baris teratas">
+          <i class="fa-solid fa-arrows-up-to-line"></i> Top Row
+        </button>
+        <button class="rib wide" id="btn-freeze-first-col" title="Freeze kolom pertama">
+          <i class="fa-solid fa-arrows-left-to-line"></i> First Col
+        </button>
+        <button class="rib wide" id="btn-freeze-here" title="Freeze sampai sel aktif">
+          <i class="fa-solid fa-thumbtack"></i> Freeze Here
+        </button>
+        <button class="rib wide" id="btn-unfreeze" title="Hapus semua freeze">
+          <i class="fa-solid fa-ban"></i> Unfreeze
+        </button>
+      </div>
+      <div class="ribbon-group-label">Freeze</div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body zoom-group">
@@ -494,11 +673,24 @@
     <label class="modal-label">
       <span>Rule</span>
       <select id="cf-type">
-        <option value="greaterThan">Greater than</option>
-        <option value="lessThan">Less than</option>
-        <option value="equal">Equal to</option>
-        <option value="between">Between</option>
-        <option value="contains">Contains text</option>
+        <optgroup label="Dasar">
+          <option value="greaterThan">Lebih besar dari</option>
+          <option value="lessThan">Lebih kecil dari</option>
+          <option value="equal">Sama dengan</option>
+          <option value="between">Di antara</option>
+          <option value="contains">Mengandung teks</option>
+        </optgroup>
+        <optgroup label="Advanced">
+          <option value="colorScale">Color Scale (gradient)</option>
+          <option value="dataBar">Data Bar</option>
+          <option value="iconSet">Icon Set</option>
+          <option value="top">Top N</option>
+          <option value="bottom">Bottom N</option>
+          <option value="aboveAverage">Di atas rata-rata</option>
+          <option value="belowAverage">Di bawah rata-rata</option>
+          <option value="duplicate">Duplikat</option>
+          <option value="unique">Unik</option>
+        </optgroup>
       </select>
     </label>
     <label class="modal-label">
@@ -509,6 +701,44 @@
       <span>Value 2</span>
       <input id="cf-value2" />
     </label>
+        <!-- Color Scale config -->
+    <div id="cf-colorscale-wrap" style="display:none">
+      <div class="modal-row">
+        <label class="modal-label">
+          <span>Warna Min</span>
+          <input type="color" id="cf-color-min" value="#dc2626" />
+        </label>
+        <label class="modal-label">
+          <span>Warna Mid</span>
+          <input type="color" id="cf-color-mid" value="#fbbf24" />
+        </label>
+        <label class="modal-label">
+          <span>Warna Max</span>
+          <input type="color" id="cf-color-max" value="#10b981" />
+        </label>
+      </div>
+    </div>
+
+    <!-- Data Bar config -->
+    <div id="cf-databar-wrap" style="display:none">
+      <label class="modal-label">
+        <span>Warna Data Bar</span>
+        <input type="color" id="cf-bar-color" value="#3b82f6" />
+      </label>
+    </div>
+
+    <!-- Icon Set config -->
+    <div id="cf-iconset-wrap" style="display:none">
+      <label class="modal-label">
+        <span>Jenis Icon</span>
+        <select id="cf-icon-type">
+          <option value="arrows">Panah (▲ ► ▼)</option>
+          <option value="traffic">Lampu Lalu Lintas</option>
+          <option value="stars">Bintang</option>
+          <option value="flags">Bendera</option>
+        </select>
+      </label>
+    </div>
     <div class="modal-row">
       <label class="modal-label">
         <span>Fill Color</span>
@@ -547,14 +777,43 @@
         </div>
         <div id="share-user-suggest" class="share-user-suggest hidden"></div>
       </label>
-      <label class="modal-label">
+            <div class="modal-label">
         <span>Permission</span>
-        <select id="share-permission">
-          <option value="view">👁 Hanya lihat</option>
-          <option value="edit">✏️ Bisa edit</option>
-          <option value="admin">⚙️ Admin</option>
-        </select>
-      </label>
+        <div class="perm-select" id="share-perm-select">
+          <input type="hidden" id="share-permission" value="view" />
+          <button type="button" class="perm-trigger" id="share-perm-trigger">
+            <i class="fa-solid fa-eye"></i>
+            <span class="perm-label">Hanya lihat</span>
+            <i class="fa-solid fa-chevron-down perm-arrow"></i>
+          </button>
+          <div class="perm-menu hidden" id="share-perm-menu">
+            <div class="perm-option active" data-value="view">
+              <i class="fa-solid fa-eye"></i>
+              <div>
+                <div class="perm-title">Hanya lihat</div>
+                <div class="perm-desc">User bisa melihat, tidak bisa edit</div>
+              </div>
+              <i class="fa-solid fa-check perm-check"></i>
+            </div>
+            <div class="perm-option" data-value="edit">
+              <i class="fa-solid fa-pen"></i>
+              <div>
+                <div class="perm-title">Bisa edit</div>
+                <div class="perm-desc">User bisa mengubah data</div>
+              </div>
+              <i class="fa-solid fa-check perm-check"></i>
+            </div>
+            <div class="perm-option" data-value="admin">
+              <i class="fa-solid fa-gear"></i>
+              <div>
+                <div class="perm-title">Admin</div>
+                <div class="perm-desc">User bisa edit & kelola akses</div>
+              </div>
+              <i class="fa-solid fa-check perm-check"></i>
+            </div>
+          </div>
+        </div>
+      </div>
       <button class="btn primary" id="btn-share-add" style="width:100%;margin-top:6px">
         <i class="fa-solid fa-user-plus"></i> Tambah Akses
       </button>
@@ -562,6 +821,15 @@
         Sudah Dibagikan
       </h4>
       <div id="share-list" class="sheets-list" style="max-height:220px"></div>
+            <h4 style="margin:20px 0 8px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.5px">
+        Link View-Only (Publik)
+      </h4>
+      <div class="view-link-actions">
+        <button class="btn primary" id="btn-create-view-link" style="flex:1">
+          <i class="fa-solid fa-link"></i> Buat Link View
+        </button>
+      </div>
+      <div id="view-link-list" class="view-link-list"></div>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="btn-share-close">Tutup</button>
@@ -805,7 +1073,373 @@ html
     </div>
   </div>
 </div>
+<!-- MODAL: HYPERLINK -->
+<div id="modal-link" class="modal hidden">
+  <div class="modal-card" style="min-width:460px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-link"></i> Insert Hyperlink</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Teks yang ditampilkan</span>
+        <input id="link-text" placeholder="Contoh: Klik di sini" />
+      </label>
+      <label class="modal-label">
+        <span>URL</span>
+        <input id="link-url" placeholder="https://… atau #Sheet2!A1" />
+      </label>
+      <div class="modal-actions">
+        <button class="btn primary" id="btn-link-apply">
+          <i class="fa-solid fa-check"></i> Terapkan
+        </button>
+        <button class="btn ghost" id="btn-link-remove">
+          <i class="fa-solid fa-trash"></i> Hapus Link
+        </button>
+        <button class="btn ghost" id="btn-link-cancel">Batal</button>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- MODAL: FIND & REPLACE -->
+<div id="modal-find" class="modal hidden">
+  <div class="modal-card find-modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-magnifying-glass"></i> Find & Replace</h3>
+      <button class="find-close-btn" id="btn-find-close">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+    </div>
 
+    <div class="find-body">
+      <!-- Find -->
+      <div class="find-row">
+        <label>Find what</label>
+        <input id="find-input" placeholder="Cari teks atau angka…" autocomplete="off" />
+        <button class="find-nav-btn" id="find-prev" title="Sebelumnya (Shift+Enter)">
+          <i class="fa-solid fa-chevron-up"></i>
+        </button>
+        <button class="find-nav-btn" id="find-next" title="Selanjutnya (Enter)">
+          <i class="fa-solid fa-chevron-down"></i>
+        </button>
+      </div>
+
+      <!-- Replace -->
+      <div class="find-row" id="replace-row">
+        <label>Replace with</label>
+        <input id="replace-input" placeholder="Ganti dengan…" autocomplete="off" />
+        <button class="find-action-btn" id="btn-replace-one" title="Ganti">
+          Ganti
+        </button>
+        <button class="find-action-btn primary" id="btn-replace-all" title="Ganti semua">
+          Ganti Semua
+        </button>
+      </div>
+
+      <!-- Options -->
+      <div class="find-options">
+        <label class="find-check">
+          <input type="checkbox" id="find-match-case" />
+          <span>Match case</span>
+        </label>
+        <label class="find-check">
+          <input type="checkbox" id="find-whole-cell" />
+          <span>Cocok utuh sel</span>
+        </label>
+        <label class="find-check">
+          <input type="checkbox" id="find-in-formulas" />
+          <span>Cari dalam formula</span>
+        </label>
+        <label class="find-check">
+          <input type="checkbox" id="find-all-sheets" />
+          <span>Semua sheet</span>
+        </label>
+      </div>
+
+      <!-- Scope -->
+      <div class="find-scope">
+        <span>Dalam:</span>
+        <label class="find-radio">
+          <input type="radio" name="find-scope" value="sheet" checked />
+          <span>Sheet ini</span>
+        </label>
+        <label class="find-radio">
+          <input type="radio" name="find-scope" value="selection" />
+          <span>Seleksi</span>
+        </label>
+        <label class="find-radio">
+          <input type="radio" name="find-scope" value="workbook" />
+          <span>Seluruh workbook</span>
+        </label>
+      </div>
+
+      <!-- Hasil -->
+      <div class="find-results" id="find-results"></div>
+    </div>
+  </div>
+</div>
+<!-- MODAL: GO TO -->
+<div id="modal-goto" class="modal hidden">
+  <div class="modal-card" style="min-width:420px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-location-crosshairs"></i> Go To</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Alamat Sel / Range</span>
+        <input id="goto-input" placeholder="Contoh: B10, A1:C20, atau Sheet2!A1" autocomplete="off" />
+        <small class="field-hint">Ketik alamat lalu Enter</small>
+      </label>
+      <div class="goto-history" id="goto-history"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-goto-apply">
+        <i class="fa-solid fa-arrow-right"></i> Go
+      </button>
+      <button class="btn ghost" id="btn-goto-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: SORT MULTI-KOLOM -->
+<div id="modal-sort" class="modal hidden">
+  <div class="modal-card" style="min-width:520px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-sort"></i> Sort Multi-Kolom</h3>
+    </div>
+    <div style="padding:0 24px">
+      <div class="sort-header-row">
+        <span>Kolom</span>
+        <span>Urutan</span>
+        <span></span>
+      </div>
+      <div id="sort-keys" class="sort-keys"></div>
+      <button class="btn ghost" id="btn-sort-add" style="width:100%;margin-top:8px">
+        <i class="fa-solid fa-plus"></i> Tambah Kolom
+      </button>
+
+      <label class="find-check" style="margin-top:12px">
+        <input type="checkbox" id="sort-has-header" checked />
+        <span>Baris pertama adalah header</span>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-sort-apply">
+        <i class="fa-solid fa-check"></i> Sort
+      </button>
+      <button class="btn ghost" id="btn-sort-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: REMOVE DUPLICATES -->
+<div id="modal-dup" class="modal hidden">
+  <div class="modal-card" style="min-width:460px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-clone"></i> Hapus Duplikat</h3>
+    </div>
+    <div style="padding:0 24px">
+      <p class="muted" style="margin:0 0 12px">
+        Pilih kolom yang digunakan untuk mengecek duplikat. Baris dengan nilai sama di semua kolom terpilih akan dihapus (kecuali yang pertama).
+      </p>
+      <div id="dup-columns" class="dup-columns"></div>
+      <label class="find-check" style="margin-top:12px">
+        <input type="checkbox" id="dup-has-header" checked />
+        <span>Baris pertama adalah header</span>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-dup-apply">
+        <i class="fa-solid fa-trash"></i> Hapus Duplikat
+      </button>
+      <button class="btn ghost" id="btn-dup-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: PROTECT SHEET -->
+<div id="modal-protect" class="modal hidden">
+  <div class="modal-card" style="min-width:420px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-lock"></i> Proteksi Sheet</h3>
+    </div>
+    <div style="padding:0 24px">
+      <p class="muted" style="margin:0 0 12px">
+        Sheet yang diproteksi tidak bisa diedit sampai password dimasukkan.
+      </p>
+      <label class="modal-label">
+        <span>Password (opsional)</span>
+        <input type="password" id="protect-password" placeholder="Kosongkan untuk lock tanpa password" autocomplete="new-password" />
+        <small class="field-hint">Simpan password dengan aman — tidak bisa di-recover</small>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-protect-apply">
+        <i class="fa-solid fa-lock"></i> Proteksi
+      </button>
+      <button class="btn ghost" id="btn-protect-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: UNPROTECT -->
+<div id="modal-unprotect" class="modal hidden">
+  <div class="modal-card" style="min-width:400px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-lock-open"></i> Buka Proteksi</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Password</span>
+        <input type="password" id="unprotect-password" placeholder="Masukkan password" autocomplete="off" />
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-unprotect-apply">
+        <i class="fa-solid fa-check"></i> Buka
+      </button>
+      <button class="btn ghost" id="btn-unprotect-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+<!-- MODAL: DATA VALIDATION -->
+<div id="modal-validation" class="modal hidden">
+  <div class="modal-card" style="min-width:560px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-list-check"></i> Data Validation</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Range</span>
+        <input id="val-range" placeholder="A1:A100" autocomplete="off" />
+      </label>
+
+      <label class="modal-label">
+        <span>Tipe Validasi</span>
+        <select id="val-type">
+          <option value="list">Daftar Pilihan (dropdown)</option>
+          <option value="number">Angka</option>
+          <option value="date">Tanggal</option>
+          <option value="text">Teks</option>
+          <option value="email">Email</option>
+          <option value="url">URL</option>
+        </select>
+      </label>
+
+      <!-- Kondisi number/date -->
+      <div id="val-condition-wrap" style="display:none">
+        <label class="modal-label">
+          <span>Kondisi</span>
+          <select id="val-condition">
+            <option value="between">Di antara</option>
+            <option value="notBetween">Bukan di antara</option>
+            <option value="gt">Lebih besar dari</option>
+            <option value="lt">Lebih kecil dari</option>
+            <option value="gte">≥ (lebih besar sama dengan)</option>
+            <option value="lte">≤ (lebih kecil sama dengan)</option>
+            <option value="equal">Sama dengan</option>
+          </select>
+        </label>
+        <div class="modal-row">
+          <label class="modal-label">
+            <span id="val-min-label">Minimal</span>
+            <input id="val-min" />
+          </label>
+          <label class="modal-label" id="val-max-wrap">
+            <span>Maksimal</span>
+            <input id="val-max" />
+          </label>
+        </div>
+      </div>
+
+      <!-- List options -->
+      <div id="val-list-wrap" style="display:none">
+        <label class="modal-label">
+          <span>Opsi (pisahkan dengan koma atau baris baru)</span>
+          <textarea id="val-options" rows="4" placeholder="Ya, Tidak, Mungkin" style="width:100%;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:9px;font-family:inherit;font-size:13px;outline:none;resize:vertical"></textarea>
+        </label>
+      </div>
+
+      <!-- Text pattern -->
+      <div id="val-text-wrap" style="display:none">
+        <label class="modal-label">
+          <span>Panjang teks</span>
+          <div class="modal-row">
+            <input id="val-text-min" type="number" min="0" placeholder="Min" />
+            <input id="val-text-max" type="number" min="0" placeholder="Max" />
+          </div>
+        </label>
+      </div>
+
+      <label class="modal-label">
+        <span>Pesan Error (opsional)</span>
+        <input id="val-error-msg" placeholder="Nilai tidak valid" />
+      </label>
+
+      <div id="val-existing" style="margin-top:12px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-val-apply">
+        <i class="fa-solid fa-check"></i> Terapkan
+      </button>
+      <button class="btn ghost" id="btn-val-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: COMMENT -->
+<div id="modal-comment" class="modal hidden">
+  <div class="modal-card" style="min-width:420px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-comment"></i> <span id="comment-title">Tambah Komentar</span></h3>
+    </div>
+    <div style="padding:0 24px">
+      <div class="comment-target" id="comment-target"></div>
+      <label class="modal-label">
+        <span>Komentar</span>
+        <textarea id="comment-text" rows="4" placeholder="Tulis komentar…" style="width:100%;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:9px;font-family:inherit;font-size:13px;outline:none;resize:vertical"></textarea>
+      </label>
+      <div class="comment-meta" id="comment-meta"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-comment-save">
+        <i class="fa-solid fa-check"></i> Simpan
+      </button>
+      <button class="btn ghost" id="btn-comment-cancel">Batal</button>
+      <button class="btn ghost" id="btn-comment-delete" style="color:#dc2626">
+        <i class="fa-solid fa-trash"></i> Hapus
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: SHOW ALL COMMENTS -->
+<div id="modal-comments-list" class="modal hidden">
+  <div class="modal-card" style="min-width:560px;max-width:640px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-comments"></i> Semua Komentar</h3>
+    </div>
+    <div style="padding:0 24px">
+      <div id="comments-list-body" class="comments-list-body"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-comments-close">Tutup</button>
+    </div>
+  </div>
+</div>
+<!-- CONTEXT MENU -->
+<div id="cell-context-menu" class="cell-context-menu hidden">
+  <button data-action="comment"><i class="fa-solid fa-comment"></i> Komentar</button>
+  <button data-action="comment-view" class="hidden"><i class="fa-solid fa-eye"></i> Lihat Komentar</button>
+  <button data-action="validation"><i class="fa-solid fa-list-check"></i> Validasi Sel</button>
+  <div class="ct-divider"></div>
+  <button data-action="copy"><i class="fa-solid fa-copy"></i> Copy</button>
+  <button data-action="paste"><i class="fa-solid fa-paste"></i> Paste</button>
+  <button data-action="clear"><i class="fa-solid fa-eraser"></i> Clear</button>
+  <div class="ct-divider"></div>
+  <button data-action="insert-row"><i class="fa-solid fa-plus"></i> Insert Row</button>
+  <button data-action="delete-row"><i class="fa-solid fa-minus"></i> Delete Row</button>
+</div>
+<script src="/collab.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

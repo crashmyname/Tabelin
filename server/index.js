@@ -11,6 +11,10 @@ import revisionsRouter from './routes/revisions.js';
 import templatesRouter from './routes/templates.js';
 import apiKeysRouter from './routes/api-keys.js';
 import apiV1Router from './routes/api-v1.js';
+import viewLinksRouter from './routes/view-links.js';
+import publicViewRouter from './routes/public-view.js';
+import compression from 'compression';
+import { setupWebSocket } from './collab.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -26,6 +30,8 @@ app.use('/api/sheets', revisionsRouter);
 app.use('/api/templates', templatesRouter);
 app.use('/api/keys', apiKeysRouter);
 app.use('/api/v1', apiV1Router);
+app.use('/api/sheets', viewLinksRouter);
+app.use('/api/public', publicViewRouter);
 
 /* =========================================
    ERROR HANDLER — WAJIB! cegah server mati
@@ -39,6 +45,14 @@ app.use((err, req, res, next) => {
     error: err.message || 'Internal server error'
   });
 });
+app.use(compression({
+  level: 6,
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
 
 /* Cegah process mati karena unhandled rejection */
 process.on('unhandledRejection', (reason, promise) => {
@@ -59,5 +73,8 @@ pool.on('error', (err) => {
 const PORT = process.env.PORT || 3000;
 
 initDb()
-  .then(() => app.listen(PORT, () => console.log(`http://localhost:${PORT}`)))
-  .catch(e => { console.error('❌ DB init failed:', e); process.exit(1); });
+  .then(() => {
+    const server = app.listen(PORT, () => console.log(`http://localhost:${PORT}`));
+    setupWebSocket(server);
+  })
+  .catch(e => { console.error('DB init failed:', e); process.exit(1); });

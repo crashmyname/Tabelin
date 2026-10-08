@@ -87,10 +87,21 @@ export async function initDb() {
     );
     CREATE INDEX IF NOT EXISTS idx_api_keys_key   ON api_keys(key);
     CREATE INDEX IF NOT EXISTS idx_api_keys_user  ON api_keys(user_id);
+    CREATE TABLE IF NOT EXISTS view_links (
+      id SERIAL PRIMARY KEY,
+      sheet_id INTEGER NOT NULL REFERENCES sheets(id) ON DELETE CASCADE,
+      token TEXT UNIQUE NOT NULL,
+      label TEXT,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ,
+      view_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_view_links_token ON view_links(token);
   `);
 
   await seedTemplates();
-  console.log('✅ DB ready');
+  console.log('DB ready');
 }
 
 /* ---------- Seed template bawaan (hanya sekali) ---------- */

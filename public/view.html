@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>View — Tabelin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+<link rel="stylesheet" href="/styles.css" />
+<script src="https://cdn.jsdelivr.net/npm/hyperformula@2.7.1/dist/hyperformula.full.min.js"></script>
+</head>
+<body class="view-page">
+
+<!-- ============ VIEW HEADER ============ -->
+<header class="v-header">
+  <div class="v-brand">
+    <div class="v-logo"><i class="fa-solid fa-table-cells-large"></i></div>
+    <span class="v-brand-text">Tabelin</span>
+  </div>
+
+  <div class="v-divider"></div>
+
+  <div class="v-title-wrap">
+    <i class="fa-solid fa-file-lines"></i>
+    <span id="view-title" class="v-title">Memuat…</span>
+  </div>
+
+  <div class="spacer"></div>
+
+  <span class="v-badge">
+    <i class="fa-solid fa-eye"></i> View Only
+  </span>
+</header>
+
+<!-- ============ VIEW TOOLBAR ============ -->
+<div class="v-toolbar">
+  <div class="v-group">
+    <button class="v-btn" id="btn-filter-toggle" title="Aktifkan filter">
+      <i class="fa-solid fa-filter"></i>
+      <span>Filter</span>
+    </button>
+    <button class="v-btn" id="btn-filter-clear" title="Bersihkan semua filter">
+      <i class="fa-solid fa-filter-circle-xmark"></i>
+      <span>Clear</span>
+    </button>
+  </div>
+
+  <div class="v-sep"></div>
+
+  <div class="v-group v-zoom-group">
+    <i class="fa-solid fa-magnifying-glass-minus"></i>
+    <input type="range" id="zoom" min="60" max="150" value="100" />
+    <i class="fa-solid fa-magnifying-glass-plus"></i>
+    <span id="zoom-label" class="v-zoom-label">100%</span>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="v-info" id="v-info"></div>
+</div>
+
+<!-- ============ FORMULA BAR (readonly) ============ -->
+<div class="v-formula-bar">
+  <span id="cell-address" class="v-cell-address">A1</span>
+  <input id="formula-input" class="v-formula-input" readonly placeholder="Mode lihat saja" />
+</div>
+
+<!-- ============ GRID ============ -->
+<div class="v-grid-wrap" id="grid-wrap">
+  <table id="grid"></table>
+</div>
+
+<!-- ============ STATUS BAR ============ -->
+<div class="v-statusbar">
+  <span id="v-status-left"><i class="fa-solid fa-circle-check"></i> Siap</span>
+  <span class="spacer"></span>
+  <span id="status-stat"></span>
+</div>
+
+<!-- ============ LOADING OVERLAY ============ -->
+<div id="loading-overlay" class="v-loading-overlay">
+  <div class="v-loading-card">
+    <div class="v-spinner">
+      <div class="v-spinner-ring"></div>
+      <div class="v-spinner-icon"><i class="fa-solid fa-table-cells-large"></i></div>
+    </div>
+    <div id="loading-text" class="v-loading-text">Memuat…</div>
+  </div>
+</div>
+
+<!-- ============ ERROR STATE ============ -->
+<div id="error-state" class="v-error-state hidden">
+  <div class="v-error-card">
+    <i class="fa-solid fa-triangle-exclamation"></i>
+    <h2>Link Tidak Valid</h2>
+    <p id="error-message">Link sudah kadaluarsa atau tidak ditemukan.</p>
+  </div>
+</div>
+
+<script src="/view.js"></script>
+</body>
+</html>
