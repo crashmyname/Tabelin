@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Web Excel — Spreadsheet Modern</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+<link rel="stylesheet" href="/styles.css" />
+<script src="https://cdn.jsdelivr.net/npm/hyperformula@2.7.1/dist/hyperformula.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!-- ============ AUTH SCREEN ============ -->
+<div id="auth-screen" class="auth-screen">
+  <div class="auth-bg-orb orb-1"></div>
+  <div class="auth-bg-orb orb-2"></div>
+  <div class="auth-bg-orb orb-3"></div>
+
+  <div class="auth-card">
+    <div class="auth-logo">
+      <i class="fa-solid fa-table-cells-large"></i>
+    </div>
+    <h1>Web Excel</h1>
+    <p class="muted">Spreadsheet modern di browser</p>
+
+    <div class="auth-field">
+      <i class="fa-solid fa-user"></i>
+      <input id="auth-user" placeholder="Username" autocomplete="username" />
+    </div>
+    <div class="auth-field">
+      <i class="fa-solid fa-lock"></i>
+      <input id="auth-pass" type="password" placeholder="Password" autocomplete="current-password" />
+    </div>
+
+    <div class="auth-actions">
+      <button id="btn-login" class="btn primary">
+        <i class="fa-solid fa-right-to-bracket"></i> Masuk
+      </button>
+      <button id="btn-register" class="btn ghost">
+        <i class="fa-solid fa-user-plus"></i> Daftar
+      </button>
+    </div>
+    <div id="auth-msg" class="auth-msg"></div>
+
+    <div class="auth-hint">
+      <i class="fa-solid fa-shield-halved"></i> Data Anda aman & tersimpan otomatis
+    </div>
+  </div>
+</div>
+
+<!-- ============ HOME SCREEN ============ -->
+<div id="home-screen" class="home-screen hidden">
+  <header class="home-header">
+    <div class="home-brand">
+      <div class="brand-logo"><i class="fa-solid fa-table-cells-large"></i></div>
+      <span class="brand-text">Web Excel</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="user-chip dark">
+      <div class="avatar"><i class="fa-solid fa-user"></i></div>
+      <span id="home-who">User</span>
+    </div>
+    <button class="icon-btn light" id="btn-home-logout" title="Logout">
+      <i class="fa-solid fa-right-from-bracket"></i>
+    </button>
+  </header>
+
+  <main class="home-main">
+    <div class="home-hero">
+      <h1>Workbook Saya</h1>
+      <p class="muted">Pilih workbook untuk mulai bekerja, atau buat baru</p>
+
+      <div class="home-actions">
+        <button class="btn primary" id="btn-home-new">
+          <i class="fa-solid fa-plus"></i> Workbook Baru
+        </button>
+        <button class="btn ghost" id="btn-home-templates">
+          <i class="fa-solid fa-layer-group"></i> Template
+        </button>
+      </div>
+    </div>
+
+    <div class="home-filters">
+      <div class="home-search-wrap">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input id="home-search" placeholder="Cari workbook…" />
+      </div>
+      <select id="home-filter">
+        <option value="all">Semua</option>
+        <option value="mine">Milik Saya</option>
+        <option value="shared">Dibagikan ke Saya</option>
+      </select>
+    </div>
+
+    <div id="home-list" class="home-list"></div>
+  </main>
+</div>
+
+<!-- ============ APP ============ -->
+<div id="app" class="hidden">
+
+  <!-- ---------- Read-only banner ---------- -->
+  <div class="readonly-banner" id="readonly-banner">
+    <i class="fa-solid fa-lock"></i>
+    <span>Anda hanya memiliki akses <b>lihat</b> ke workbook ini. Perubahan tidak akan disimpan.</span>
+    <span class="spacer"></span>
+    <button class="banner-action" id="btn-readonly-home">Kembali ke Home</button>
+  </div>
+
+  <!-- ---------- Titlebar ---------- -->
+  <div class="titlebar">
+    <div class="brand">
+      <div class="brand-logo"><i class="fa-solid fa-table-cells-large"></i></div>
+      <span class="brand-text">Web Excel</span>
+    </div>
+
+    <button class="icon-btn" id="btn-go-home" title="Kembali ke Home" style="margin-left:8px">
+      <i class="fa-solid fa-house"></i>
+    </button>
+
+    <div class="wb-name-wrap">
+      <input id="wb-name" class="wb-name" value="Untitled" />
+      <span id="save-status" class="save-status"></span>
+    </div>
+
+    <div class="spacer"></div>
+
+    <button class="icon-btn" id="btn-sheets-list" title="Buka Workbook">
+      <i class="fa-solid fa-folder-open"></i>
+    </button>
+    <button class="icon-btn" id="btn-templates" title="Templates">
+      <i class="fa-solid fa-layer-group"></i>
+    </button>
+    <button class="icon-btn" id="btn-share" title="Bagikan">
+      <i class="fa-solid fa-share-nodes"></i>
+    </button>
+    <button class="icon-btn" id="btn-history" title="Riwayat">
+      <i class="fa-solid fa-clock-rotate-left"></i>
+    </button>
+    <button class="icon-btn" id="btn-api" title="API Access">
+      <i class="fa-solid fa-plug"></i>
+    </button>
+    <div class="user-chip">
+      <div class="avatar"><i class="fa-solid fa-user"></i></div>
+      <span id="who">User</span>
+    </div>
+    <button class="icon-btn danger" id="btn-logout" title="Logout">
+      <i class="fa-solid fa-right-from-bracket"></i>
+    </button>
+  </div>
+
+  <!-- ---------- Ribbon tabs ---------- -->
+  <div class="ribbon-tabs" id="ribbon-tabs">
+    <button data-tab="home" class="active"><i class="fa-solid fa-house"></i> Home</button>
+    <button data-tab="insert"><i class="fa-solid fa-chart-simple"></i> Insert</button>
+    <button data-tab="formulas"><i class="fa-solid fa-square-root-variable"></i> Formulas</button>
+    <button data-tab="data"><i class="fa-solid fa-database"></i> Data</button>
+    <button data-tab="view"><i class="fa-solid fa-eye"></i> View</button>
+  </div>
+
+  <!-- ---------- Ribbon: HOME ---------- -->
+  <div class="ribbon-pane active" data-pane="home">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-undo" title="Undo (Ctrl+Z)"><i class="fa-solid fa-rotate-left"></i></button>
+        <button class="rib" id="btn-redo" title="Redo (Ctrl+Y)"><i class="fa-solid fa-rotate-right"></i></button>
+      </div>
+      <div class="ribbon-group-label">Undo</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-copy" title="Copy (Ctrl+C)"><i class="fa-regular fa-copy"></i></button>
+        <button class="rib" id="btn-cut" title="Cut (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
+        <button class="rib" id="btn-paste" title="Paste (Ctrl+V)"><i class="fa-regular fa-paste"></i></button>
+      </div>
+      <div class="ribbon-group-label">Clipboard</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <select id="font-family" title="Font Family">
+          <option>Calibri</option><option>Arial</option><option>Times New Roman</option>
+          <option>Courier New</option><option>Verdana</option><option>Georgia</option>
+        </select>
+        <select id="font-size" title="Font Size">
+          <option>8</option><option>9</option><option>10</option><option selected>11</option>
+          <option>12</option><option>14</option><option>16</option><option>18</option>
+          <option>20</option><option>24</option><option>32</option>
+        </select>
+        <button class="rib" id="btn-bold" title="Bold (Ctrl+B)"><i class="fa-solid fa-bold"></i></button>
+        <button class="rib" id="btn-italic" title="Italic (Ctrl+I)"><i class="fa-solid fa-italic"></i></button>
+        <button class="rib" id="btn-underline" title="Underline (Ctrl+U)"><i class="fa-solid fa-underline"></i></button>
+        <button class="rib" id="btn-strike" title="Strikethrough"><i class="fa-solid fa-strikethrough"></i></button>
+        <label class="rib color-pick" title="Font Color">
+          <i class="fa-solid fa-font"></i>
+          <input type="color" id="color-fg" value="#111111" />
+        </label>
+        <label class="rib color-pick" title="Fill Color">
+          <i class="fa-solid fa-fill-drip"></i>
+          <input type="color" id="color-bg" value="#ffff00" />
+        </label>
+      </div>
+      <div class="ribbon-group-label">Font</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" data-align="left" title="Align Left"><i class="fa-solid fa-align-left"></i></button>
+        <button class="rib" data-align="center" title="Align Center"><i class="fa-solid fa-align-center"></i></button>
+        <button class="rib" data-align="right" title="Align Right"><i class="fa-solid fa-align-right"></i></button>
+        <button class="rib" id="btn-wrap" title="Wrap Text"><i class="fa-solid fa-text-width"></i></button>
+      </div>
+      <div class="ribbon-group-label">Alignment</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <select id="num-format" title="Number Format">
+          <option value="general">General</option>
+          <option value="number">Number</option>
+          <option value="currency">Currency</option>
+          <option value="percent">Percent</option>
+          <option value="date">Date</option>
+          <option value="text">Text</option>
+        </select>
+      </div>
+      <div class="ribbon-group-label">Number</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <select id="border-style" title="Borders">
+          <option value="">None</option>
+          <option value="all">All</option>
+          <option value="outer">Outer</option>
+          <option value="top">Top</option>
+          <option value="bottom">Bottom</option>
+          <option value="left">Left</option>
+          <option value="right">Right</option>
+        </select>
+      </div>
+      <div class="ribbon-group-label">Borders</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-merge" title="Merge & Center">
+          <i class="fa-solid fa-object-group"></i>
+        </button>
+        <button class="rib" id="btn-unmerge" title="Unmerge">
+          <i class="fa-solid fa-object-ungroup"></i>
+        </button>
+      </div>
+      <div class="ribbon-group-label">Merge</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib" id="btn-clear-all" title="Clear All"><i class="fa-solid fa-eraser"></i></button>
+        <button class="rib" id="btn-clear-fmt" title="Clear Formatting"><i class="fa-solid fa-broom"></i></button>
+      </div>
+      <div class="ribbon-group-label">Clear</div>
+    </div>
+  </div>
+
+  <!-- ---------- Ribbon: INSERT ---------- -->
+  <div class="ribbon-pane" data-pane="insert">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" data-chart="bar">
+          <i class="fa-solid fa-chart-column"></i> Bar
+        </button>
+        <button class="rib wide" data-chart="line">
+          <i class="fa-solid fa-chart-line"></i> Line
+        </button>
+        <button class="rib wide" data-chart="pie">
+          <i class="fa-solid fa-chart-pie"></i> Pie
+        </button>
+        <button class="rib wide" data-chart="doughnut">
+          <i class="fa-solid fa-circle-notch"></i> Doughnut
+        </button>
+      </div>
+      <div class="ribbon-group-label">Charts</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-insert-row">
+          <i class="fa-solid fa-plus"></i> Row
+        </button>
+        <button class="rib wide" id="btn-insert-col">
+          <i class="fa-solid fa-plus"></i> Col
+        </button>
+        <button class="rib wide" id="btn-del-row">
+          <i class="fa-solid fa-minus"></i> Row
+        </button>
+        <button class="rib wide" id="btn-del-col">
+          <i class="fa-solid fa-minus"></i> Col
+        </button>
+      </div>
+      <div class="ribbon-group-label">Rows / Cols</div>
+    </div>
+  </div>
+
+  <!-- ---------- Ribbon: FORMULAS ---------- -->
+  <div class="ribbon-pane" data-pane="formulas">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib fn-btn" data-fn="SUM"><i class="fa-solid fa-sigma"></i> SUM</button>
+        <button class="rib fn-btn" data-fn="AVERAGE"><i class="fa-solid fa-divide"></i> AVERAGE</button>
+        <button class="rib fn-btn" data-fn="COUNT"><i class="fa-solid fa-list-ol"></i> COUNT</button>
+        <button class="rib fn-btn" data-fn="MAX"><i class="fa-solid fa-arrow-up-long"></i> MAX</button>
+        <button class="rib fn-btn" data-fn="MIN"><i class="fa-solid fa-arrow-down-long"></i> MIN</button>
+        <button class="rib fn-btn" data-fn="IF"><i class="fa-solid fa-code-branch"></i> IF</button>
+        <button class="rib fn-btn" data-fn="VLOOKUP"><i class="fa-solid fa-magnifying-glass"></i> VLOOKUP</button>
+        <button class="rib fn-btn" data-fn="XLOOKUP"><i class="fa-solid fa-bolt"></i> XLOOKUP</button>
+        <button class="rib fn-btn" data-fn="CONCAT"><i class="fa-solid fa-link"></i> CONCAT</button>
+        <button class="rib fn-btn" data-fn="ROUND"><i class="fa-solid fa-circle-half-stroke"></i> ROUND</button>
+        <button class="rib fn-btn" data-fn="TODAY"><i class="fa-regular fa-calendar"></i> TODAY</button>
+      </div>
+      <div class="ribbon-group-label">Quick Functions</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <div class="info-pill">
+          <i class="fa-solid fa-circle-info"></i>
+          400+ fungsi Excel tersedia
+        </div>
+      </div>
+      <div class="ribbon-group-label">Info</div>
+    </div>
+  </div>
+
+  <!-- ---------- Ribbon: DATA ---------- -->
+  <div class="ribbon-pane" data-pane="data">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-sort-asc">
+          <i class="fa-solid fa-arrow-down-a-z"></i> A→Z
+        </button>
+        <button class="rib wide" id="btn-sort-desc">
+          <i class="fa-solid fa-arrow-up-z-a"></i> Z→A
+        </button>
+      </div>
+      <div class="ribbon-group-label">Sort</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-filter-toggle">
+          <i class="fa-solid fa-filter"></i> Filter
+        </button>
+        <button class="rib wide" id="btn-filter-clear">
+          <i class="fa-solid fa-filter-circle-xmark"></i> Clear
+        </button>
+      </div>
+      <div class="ribbon-group-label">Filter</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-cf">
+          <i class="fa-solid fa-wand-magic-sparkles"></i> Add Rule
+        </button>
+        <button class="rib wide" id="btn-cf-clear">
+          <i class="fa-solid fa-trash-can"></i> Clear Rules
+        </button>
+      </div>
+      <div class="ribbon-group-label">Conditional</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-import">
+          <i class="fa-solid fa-file-import"></i> Import
+        </button>
+        <button class="rib wide" data-export="xlsx">
+          <i class="fa-solid fa-file-excel"></i> XLSX
+        </button>
+        <button class="rib wide" data-export="csv">
+          <i class="fa-solid fa-file-csv"></i> CSV
+        </button>
+        <button class="rib wide" data-export="pdf">
+          <i class="fa-solid fa-file-pdf"></i> PDF
+        </button>
+        <button class="rib wide" id="btn-print">
+          <i class="fa-solid fa-print"></i> Print
+        </button>
+        <input id="file-input" type="file" accept=".xlsx,.xls,.csv" hidden />
+      </div>
+      <div class="ribbon-group-label">Import / Export / Print</div>
+    </div>
+  </div>
+
+  <!-- ---------- Ribbon: VIEW ---------- -->
+  <div class="ribbon-pane" data-pane="view">
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <label class="toggle">
+          <input type="checkbox" id="chk-gridlines" checked />
+          <span class="toggle-slider"></span>
+          Gridlines
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="chk-headers" checked />
+          <span class="toggle-slider"></span>
+          Headers
+        </label>
+      </div>
+      <div class="ribbon-group-label">Show</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body zoom-group">
+        <i class="fa-solid fa-magnifying-glass-minus"></i>
+        <input type="range" id="zoom" min="60" max="150" value="100" />
+        <i class="fa-solid fa-magnifying-glass-plus"></i>
+        <span id="zoom-label" class="zoom-label">100%</span>
+      </div>
+      <div class="ribbon-group-label">Zoom</div>
+    </div>
+  </div>
+
+  <!-- ---------- Formula bar ---------- -->
+  <div class="formula-bar">
+    <span id="cell-address" class="cell-address">A1</span>
+    <button class="fx-btn" id="btn-fx" title="Insert Function">
+      <i class="fa-solid fa-function"></i>
+    </button>
+    <input id="formula-input" class="formula-input" placeholder="Ketik nilai atau formula… (contoh: =SUM(A1:A10))" />
+  </div>
+
+  <!-- ---------- Grid ---------- -->
+  <div class="grid-wrap" id="grid-wrap">
+    <table id="grid"></table>
+  </div>
+
+  <!-- ---------- Sheet tabs ---------- -->
+  <div class="sheet-tabs-bar">
+    <button class="tab-nav" id="tab-prev" title="Sebelumnya"><i class="fa-solid fa-chevron-left"></i></button>
+    <div class="sheet-tabs" id="sheet-tabs"></div>
+    <button class="tab-nav" id="tab-next" title="Berikutnya"><i class="fa-solid fa-chevron-right"></i></button>
+    <button class="tab-add" id="btn-add-sheet" title="Tambah Sheet">
+      <i class="fa-solid fa-plus"></i>
+    </button>
+  </div>
+
+  <!-- ---------- Statusbar ---------- -->
+  <div class="statusbar">
+    <span id="status-cell"><i class="fa-solid fa-circle-check"></i> Ready</span>
+    <span class="spacer"></span>
+    <span id="status-stat"></span>
+    <span class="sep">•</span>
+    <span id="status-zoom"><i class="fa-solid fa-magnifying-glass"></i> 100%</span>
+  </div>
+</div>
+
+<!-- ============ MODALS ============ -->
+<div id="modal-sheets" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-folder-open"></i> Workbook Saya</h3>
+    </div>
+    <div id="sheets-list" class="sheets-list"></div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-new-wb">
+        <i class="fa-solid fa-plus"></i> Workbook Baru
+      </button>
+      <button class="btn ghost" id="btn-close-modal">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-chart" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-chart-simple"></i> Chart Preview</h3>
+    </div>
+    <div class="chart-preview-wrap">
+      <canvas id="chart-canvas" width="600" height="360"></canvas>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-chart-pin">
+        <i class="fa-solid fa-thumbtack"></i> Pin to Sheet
+      </button>
+      <button class="btn ghost" id="btn-chart-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-cf" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-wand-magic-sparkles"></i> Conditional Formatting</h3>
+    </div>
+
+    <label class="modal-label">
+      <span>Range</span>
+      <input id="cf-range" placeholder="A1:A10" />
+    </label>
+    <label class="modal-label">
+      <span>Rule</span>
+      <select id="cf-type">
+        <option value="greaterThan">Greater than</option>
+        <option value="lessThan">Less than</option>
+        <option value="equal">Equal to</option>
+        <option value="between">Between</option>
+        <option value="contains">Contains text</option>
+      </select>
+    </label>
+    <label class="modal-label">
+      <span>Value</span>
+      <input id="cf-value" />
+    </label>
+    <label class="modal-label" id="cf-value2-row" style="display:none">
+      <span>Value 2</span>
+      <input id="cf-value2" />
+    </label>
+    <div class="modal-row">
+      <label class="modal-label">
+        <span>Fill Color</span>
+        <input type="color" id="cf-bg" value="#f8d7da" />
+      </label>
+      <label class="modal-label">
+        <span>Text Color</span>
+        <input type="color" id="cf-color" value="#721c24" />
+      </label>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-cf-apply">
+        <i class="fa-solid fa-check"></i> Terapkan
+      </button>
+      <button class="btn ghost" id="btn-cf-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: SHARE -->
+<div id="modal-share" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-share-nodes"></i> Bagikan Workbook</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label" style="position:relative">
+        <span>Username</span>
+        <div class="share-user-wrap">
+          <i class="fa-solid fa-user"></i>
+          <input id="share-username" placeholder="Ketik username…" autocomplete="off" />
+          <button class="share-clear-btn" id="share-username-clear" type="button" title="Bersihkan">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+        <div id="share-user-suggest" class="share-user-suggest hidden"></div>
+      </label>
+      <label class="modal-label">
+        <span>Permission</span>
+        <select id="share-permission">
+          <option value="view">👁 Hanya lihat</option>
+          <option value="edit">✏️ Bisa edit</option>
+          <option value="admin">⚙️ Admin</option>
+        </select>
+      </label>
+      <button class="btn primary" id="btn-share-add" style="width:100%;margin-top:6px">
+        <i class="fa-solid fa-user-plus"></i> Tambah Akses
+      </button>
+      <h4 style="margin:20px 0 8px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.5px">
+        Sudah Dibagikan
+      </h4>
+      <div id="share-list" class="sheets-list" style="max-height:220px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-share-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: HISTORY -->
+<div id="modal-history" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-clock-rotate-left"></i> Riwayat Revisi</h3>
+    </div>
+    <div style="padding:0 24px">
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button class="btn primary" id="btn-snapshot" style="flex:1">
+          <i class="fa-solid fa-camera"></i> Snapshot Sekarang
+        </button>
+      </div>
+      <div id="revision-list" class="sheets-list" style="max-height:400px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-history-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: TEMPLATES -->
+<div id="modal-templates" class="modal hidden">
+  <div class="modal-card" style="min-width:640px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-layer-group"></i> Template Siap Pakai</h3>
+    </div>
+    <div style="padding:0 24px">
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <button class="btn primary" id="btn-save-tpl" style="flex:1">
+          <i class="fa-solid fa-floppy-disk"></i> Simpan Workbook Ini sebagai Template
+        </button>
+      </div>
+      <div id="template-list" class="sheets-list" style="max-height:460px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-tpl-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<!-- Loading Overlay -->
+<div id="loading-overlay" class="loading-overlay hidden">
+  <div class="loading-card">
+    <div class="loading-spinner">
+      <div class="spinner-ring"></div>
+      <div class="spinner-icon"><i class="fa-solid fa-table-cells-large"></i></div>
+    </div>
+    <div id="loading-text" class="loading-text">Memuat…</div>
+    <div id="loading-progress" class="loading-progress"></div>
+  </div>
+</div>
+
+
+Ganti jadi:
+
+html
+<!-- Formula warning toast -->
+<div id="formula-warning" class="formula-warning hidden"></div>
+
+<!-- ============ MODAL: NEW WORKBOOK ============ -->
+<div id="modal-new-wb" class="modal hidden">
+  <div class="modal-card new-wb-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-wand-magic-sparkles"></i> Buat Workbook Baru</h3>
+    </div>
+
+    <div class="new-wb-body">
+      <!-- Preview card -->
+      <div class="new-wb-preview">
+        <div class="new-wb-preview-icon">
+          <i class="fa-solid fa-file-lines"></i>
+        </div>
+        <div class="new-wb-preview-info">
+          <div class="new-wb-preview-name" id="new-wb-preview-name">Workbook Baru</div>
+          <div class="new-wb-preview-meta">
+            <i class="fa-solid fa-circle-check"></i>
+            Siap dibuat & langsung dibuka
+          </div>
+        </div>
+      </div>
+
+      <!-- Nama -->
+      <label class="modal-label">
+        <span>Nama Workbook</span>
+        <input id="new-wb-name" placeholder="Contoh: Laporan Penjualan Q1" maxlength="80" autocomplete="off" />
+        <small id="new-wb-name-hint" class="field-hint"></small>
+      </label>
+
+      <!-- Start from -->
+      <div class="new-wb-start">
+        <span class="field-label">Mulai dari</span>
+        <div class="new-wb-options" id="new-wb-options">
+          <button type="button" class="new-wb-option active" data-mode="blank">
+            <i class="fa-solid fa-file"></i>
+            <div>
+              <div class="opt-title">Kosong</div>
+              <div class="opt-desc">Workbook baru tanpa isi</div>
+            </div>
+          </button>
+          <button type="button" class="new-wb-option" data-mode="template">
+            <i class="fa-solid fa-layer-group"></i>
+            <div>
+              <div class="opt-title">Dari Template</div>
+              <div class="opt-desc">Pilih template siap pakai</div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Quick templates (muncul kalau pilih template) -->
+      <div id="new-wb-templates" class="new-wb-templates hidden">
+        <span class="field-label">Pilih template</span>
+        <div id="new-wb-tpl-list" class="new-wb-tpl-list">
+          <!-- diisi JS -->
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-new-wb-confirm">
+        <i class="fa-solid fa-plus"></i> Buat Workbook
+      </button>
+      <button class="btn ghost" id="btn-new-wb-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: PRINT PREVIEW ============ -->
+<div id="modal-print" class="modal hidden">
+  <div class="modal-card print-modal-card">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-print"></i> Print Preview</h3>
+    </div>
+
+    <div class="print-toolbar">
+      <label>
+        <input type="radio" name="print-mode" value="current" checked>
+        Sheet Aktif
+      </label>
+      <label>
+        <input type="radio" name="print-mode" value="all">
+        Semua Sheet
+      </label>
+      <span class="print-sep"></span>
+      <label>
+        <input type="radio" name="print-orient" value="portrait" checked>
+        Portrait
+      </label>
+      <label>
+        <input type="radio" name="print-orient" value="landscape">
+        Landscape
+      </label>
+      <span class="print-sep"></span>
+      <label class="checkbox-label">
+        <input type="checkbox" id="print-gridlines" checked>
+        Gridlines
+      </label>
+      <span class="spacer"></span>
+      <button class="btn primary" id="btn-do-print" style="flex:0;padding:8px 18px">
+        <i class="fa-solid fa-print"></i> Print
+      </button>
+    </div>
+
+    <div class="print-preview-wrap">
+      <iframe id="print-iframe" frameborder="0"></iframe>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-print-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: API KEYS ============ -->
+<div id="modal-api" class="modal hidden">
+  <div class="modal-card" style="min-width:680px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-plug"></i> API Access</h3>
+    </div>
+
+    <div style="padding:0 24px">
+      <div class="api-create-row">
+        <input id="api-label" placeholder="Label (mis: Mobile App)" />
+        <select id="api-sheet">
+          <option value="">Semua Workbook</option>
+        </select>
+        <button class="btn primary" id="btn-api-create" style="flex:0">
+          <i class="fa-solid fa-plus"></i> Buat
+        </button>
+      </div>
+
+      <h4 class="api-section-title">Kunci API Anda</h4>
+      <div id="api-list" class="sheets-list" style="max-height:260px"></div>
+
+      <h4 class="api-section-title">Cara Pakai</h4>
+      <div class="api-docs">
+        <div class="api-endpoint">
+          <span class="api-method">GET</span>
+          <code>/api/v1/sheets</code>
+          <span class="api-desc">Daftar workbook yang bisa diakses</span>
+        </div>
+        <div class="api-endpoint">
+          <span class="api-method">GET</span>
+          <code>/api/v1/sheets/:id/data</code>
+          <span class="api-desc">Nilai sel (formula sudah dievaluasi) — JSON array</span>
+        </div>
+        <div class="api-endpoint">
+          <span class="api-method">GET</span>
+          <code>/api/v1/sheets/:id/json</code>
+          <span class="api-desc">Array of object (baris 1 = header)</span>
+        </div>
+        <div class="api-endpoint">
+          <span class="api-method">GET</span>
+          <code>/api/v1/sheets/:id/csv</code>
+          <span class="api-desc">Download CSV</span>
+        </div>
+        <div class="api-endpoint">
+          <span class="api-method">GET</span>
+          <code>/api/v1/sheets/:id/cells</code>
+          <span class="api-desc">Raw cells + formula</span>
+        </div>
+
+        <div class="api-code-wrap">
+          <button class="api-copy-btn" id="btn-api-copy">
+            <i class="fa-solid fa-copy"></i>
+          </button>
+          <pre id="api-sample">curl -H "X-API-Key: wex_xxxxx" http://localhost:3000/api/v1/sheets/1/data</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn ghost" id="btn-api-close">Tutup</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
