@@ -28,6 +28,7 @@ let clipboard = null;
 let undoStack = [];
 let redoStack = [];
 let editor = null;
+let insertingRefMode = false;
 let chartInstances = new Map();
 
 /* Virtual scroll */
@@ -763,7 +764,12 @@ function forceRenderCell(td, r, c) {
     inner.className = 'cell-inner';
     td.insertBefore(inner, td.firstChild);
   }
-  inner.textContent = cl?.s?.numFmt ? formatNumber(raw, cl.s.numFmt) : displayVal(raw);
+  inner.textContent = cl?.s?.numFmt
+    ? formatNumber(raw, cl.s.numFmt)
+    : displayVal(raw);
+
+  const isNum = typeof raw === 'number' || (!isNaN(Number(raw)) && raw !== '');
+  td.classList.toggle('num-cell', isNum && String(inner.textContent).length > 8);
   inner.classList.toggle('cell-link', !!cl?.link);
 
   td.classList.toggle('error', !!isErr(raw));
@@ -1154,7 +1160,7 @@ function openEditor(addr, initial) {
   const td = findTd(addr);
   if (!td) return;
 
-  const input = document.createElement('input');
+    const input = document.createElement('input');
   input.className = 'cell-input';
   input.value = initial !== undefined ? initial : getRaw(addr);
   const inner = td.querySelector('.cell-inner');
@@ -1165,29 +1171,44 @@ function openEditor(addr, initial) {
   if (initial === undefined) input.select();
   else input.setSelectionRange(input.value.length, input.value.length);
 
-  input.addEventListener('keydown', e => {
+  autoResizeEditor();
+  input.addEventListener('input', autoResizeEditor);
+
+  function autoResizeEditor() {
+    const len = String(input.value).length;
+    const tdW = td.offsetWidth || 96;
+    // Lebar karakter rata-rata font 12px ≈ 7.5px
+    const spillW = (len + 3) * 7.5 + 14;
+    const targetW = Math.max(tdW, Math.min(spillW, 600));
+    input.style.width = targetW + 'px';
+  }
+
+    input.addEventListener('keydown', e => {
+    if (insertingRefMode) return;
+
     if (e.key === 'Enter') {
-        e.preventDefault();
-        const val = input.value;
-        commit(addr, val);
-        closeEditor();
-        if (!editor) moveSel(1, 0);
+      e.preventDefault();
+      const val = input.value;
+      commit(addr, val);
+      closeEditor();
+      if (!editor) moveSel(1, 0);
     } else if (e.key === 'Escape') {
-        e.preventDefault();
-        closeEditor();
+      e.preventDefault();
+      closeEditor();
     } else if (e.key === 'Tab') {
-        e.preventDefault();
-        const val = input.value;
-        commit(addr, val);
-        closeEditor();
-        if (!editor) moveSel(0, e.shiftKey ? -1 : 1);
+      e.preventDefault();
+      const val = input.value;
+      commit(addr, val);
+      closeEditor();
+      if (!editor) moveSel(0, e.shiftKey ? -1 : 1);
     }
-    });
+  });
   input.addEventListener('blur', () => {
+    if (insertingRefMode) return;
     if (!editor || editor.input !== input) return;
     commit(addr, input.value);
     closeEditor();
-    });
+  });
 }
 
 function closeEditor() {
@@ -4005,12 +4026,16 @@ function insertRefToEditor(addr) {
   const input = editor.input;
   const val = input.value;
   if (!val.startsWith('=')) return false;
+
   const pos = input.selectionStart ?? val.length;
   const newVal = val.slice(0, pos) + addr + val.slice(pos);
   input.value = newVal;
+
   const newPos = pos + addr.length;
   input.setSelectionRange(newPos, newPos);
-  input.focus();
+
+  try { input.focus(); } catch {}
+
   return true;
 }
 
@@ -4035,26 +4060,80 @@ openEditor = function(addr, initial) {
 };
 
 /* =========================================================
-   PATCH grid mousedown — insert ref, bukan commit
+   INSERT REFERENCE SAAT EDIT FORMULA — versi simple + highlight
    ========================================================= */
-// Cari listener lama dan lepas — tapi karena anonymous, kita override pakai capturing phase
-const gridEl2 = document.getElementById('grid');
-gridEl2.addEventListener('mousedown', e => {
+let refDragState = null;   // { startAddr, curAddr }
+
+document.getElementById('grid').addEventListener('mousedown', e => {
   if (!editor) return;
   const input = editor.input;
   if (!input.value.startsWith('=')) return;
 
   const td = e.target.closest('td[data-addr]');
   if (!td) return;
-  // klik di dalam td yang sama (tempat editor) — biarkan
   if (td === input.closest('td')) return;
+  insertingRefMode = true;
 
-  // intercept! jangan blur, jangan selectCell — insert reference ke formula
   e.preventDefault();
   e.stopImmediatePropagation();
-  insertRefToEditor(td.dataset.addr);
   hideFxSuggest();
-}, true); // capture phase — jalan sebelum handler lama
+
+  const startAddr = td.dataset.addr;
+  let curAddr = startAddr;
+
+  // Highlight langsung
+  highlightRefRange(startAddr, startAddr);
+
+  const moveHandler = ev => {
+    const moveTd = document.elementFromPoint(ev.clientX, ev.clientY)
+      ?.closest('td[data-addr]');
+    if (!moveTd) return;
+    const newAddr = moveTd.dataset.addr;
+    if (newAddr === curAddr) return;
+    curAddr = newAddr;
+    highlightRefRange(startAddr, curAddr);
+  };
+
+  const upHandler = () => {
+    document.removeEventListener('mousemove', moveHandler);
+    document.removeEventListener('mouseup', upHandler);
+
+    const refText = (startAddr === curAddr)
+      ? startAddr
+      : `${startAddr}:${curAddr}`;
+    insertRefToEditor(refText);
+    setTimeout(clearRefHighlight, 800);
+
+    setTimeout(() => { insertingRefMode = false; }, 200);
+  };
+
+  document.addEventListener('mousemove', moveHandler);
+  document.addEventListener('mouseup', upHandler);
+}, true);
+
+/* Clear saat cell diklik biasa (bukan saat insert ref) */
+document.addEventListener('mousedown', e => {
+  if (editor) return;
+  if (e.target.closest('#grid')) {
+    clearRefHighlight();
+  }
+}, true);
+
+function highlightRefRange(start, end) {
+  document.querySelectorAll('#grid td.ref-highlight')
+    .forEach(td => td.classList.remove('ref-highlight'));
+
+  const addrs = expandRange(start, end);
+  for (const addr of addrs) {
+    const td = document.querySelector(`#grid td[data-addr="${addr}"]`);
+    if (td) td.classList.add('ref-highlight');
+  }
+}
+
+function clearRefHighlight() {
+  document.querySelectorAll('#grid td.ref-highlight')
+    .forEach(td => td.classList.remove('ref-highlight'));
+}
 
 /* =========================================================
    PATCH formula-input — autocomplete juga

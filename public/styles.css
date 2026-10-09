@@ -376,10 +376,24 @@ table#grid td.active{
 }
 table#grid td.error{color:#dc2626;font-weight:600}
 table#grid td input.cell-input{
-  position:absolute;inset:0;width:100%;height:100%;
-  border:0;padding:2px 6px;font:inherit;background:#fff;
-  outline:2px solid #10b981;outline-offset:-2px;font-size:12px;
-  font-family:inherit;
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  min-width: 100%;
+  width: auto;
+  border: 0;
+  padding: 2px 6px;
+  font: inherit;
+  background: #fff;
+  outline: 2px solid #10b981;
+  outline-offset: -2px;
+  font-size: 12px;
+  font-family: inherit;
+  z-index: 100;
+  box-sizing: border-box;
+  white-space: nowrap;
+  overflow: visible;
 }
 
 /* ---------- Sheet tabs ---------- */
@@ -3655,4 +3669,82 @@ table#grid td.has-comment {
   white-space: nowrap;
   font-family: 'Inter', sans-serif;
   box-shadow: 0 2px 6px rgba(0,0,0,.2);
+}
+/* =========================================================
+   SPILL TEXT — teks panjang meluber seperti Excel
+   ========================================================= */
+
+/* Cell aktif: teks tidak dipotong */
+table#grid td.active {
+  overflow: visible !important;
+  z-index: 6;
+}
+
+table#grid td.active .cell-inner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  padding: 2px 6px;
+  background: #fff;
+  z-index: 7;
+  min-width: 100%;
+  width: max-content;
+  max-width: 500px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+  font-size: inherit;
+}
+
+/* Angka di kanan — biar tidak kacau saat spill */
+table#grid td.active[data-align="right"] .cell-inner {
+  right: 0;
+  left: auto;
+}
+
+/* Cell yang di-edit: biarkan input */
+table#grid td.active input.cell-input {
+  z-index: 10;
+  position: absolute;
+  inset: 0;
+}
+
+/* Cell merged (colspan/rowspan) — aktif — biarkan tetap */
+table#grid td.merged-tl.active .cell-inner {
+  position: static;
+  background: transparent;
+}
+/* Sel angka di kolom lebar — biar tidak kepotong */
+table#grid td.num-cell .cell-inner {
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+/* =========================================================
+   REFERENCE HIGHLIGHT — saat insert ref ke formula
+   ========================================================= */
+table#grid td.ref-highlight {
+  background: rgba(16,185,129,.22) !important;
+  outline: 2px solid #10b981;
+  outline-offset: -2px;
+  z-index: 4;
+}
+table#grid td.ref-highlight .cell-inner {
+  color: #065f46;
+  font-weight: 600;
+}
+/* =========================================================
+   REFERENCE HIGHLIGHT — saat insert ref ke formula
+   ========================================================= */
+table#grid td.ref-highlight {
+  background: rgba(16,185,129,.22) !important;
+  outline: 2px solid #10b981 !important;
+  outline-offset: -2px;
+  z-index: 4;
+}
+table#grid td.ref-highlight .cell-inner {
+  color: #065f46;
+  font-weight: 600;
 }
