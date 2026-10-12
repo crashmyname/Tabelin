@@ -50,6 +50,9 @@
     <button class="fd-item" data-action="info">
       <i class="fa-solid fa-circle-info"></i> Info Workbook
     </button>
+    <button class="fd-item" data-action="optimize">
+      <i class="fa-solid fa-bolt"></i> Optimize (Chunk)
+    </button>
     <button class="fd-item" data-action="print">
       <i class="fa-solid fa-print"></i> Print
       <span class="fd-shortcut">Ctrl+P</span>
@@ -192,6 +195,21 @@
     <span>Anda hanya memiliki akses <b>lihat</b> ke workbook ini. Perubahan tidak akan disimpan.</span>
     <span class="spacer"></span>
     <button class="banner-action" id="btn-readonly-home">Kembali ke Home</button>
+  </div>
+
+  <!-- Cross-sheet reference banner -->
+  <div id="cross-sheet-banner" class="cross-sheet-banner hidden">
+    <i class="fa-solid fa-arrow-right-arrow-left"></i>
+    <div class="cs-info">
+      <div class="cs-target" id="cs-target">Menyunting rumus…</div>
+      <div class="cs-formula" id="cs-formula">=</div>
+    </div>
+    <button class="cs-btn cs-finish" id="cs-finish">
+      <i class="fa-solid fa-check"></i> Selesai
+    </button>
+    <button class="cs-btn cs-cancel" id="cs-cancel">
+      <i class="fa-solid fa-xmark"></i> Batal
+    </button>
   </div>
 
   <!-- ---------- Titlebar ---------- -->
@@ -1440,6 +1458,7 @@ html
   <button data-action="delete-row"><i class="fa-solid fa-minus"></i> Delete Row</button>
 </div>
 <script src="/collab.js"></script>
+<script src="/chunks.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

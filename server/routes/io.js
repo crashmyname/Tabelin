@@ -9,7 +9,10 @@ import { computeSheet, rcToA1 } from '../utils/spreadsheet.js';
 
 const router = Router();
 router.use(authRequired);
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 }   // 50 MB
+});
 
 async function getSheet(id, uid) {
   const { rows } = await pool.query(
@@ -18,12 +21,20 @@ async function getSheet(id, uid) {
 }
 
 /* ---------- IMPORT ---------- */
+/* =========================================================
+   IMPORT — dengan auto-chunking untuk data besar
+   ========================================================= */
+/* =========================================================
+   IMPORT — Multi-Sheet dengan preserve struktur Excel
+   ========================================================= */
 router.post('/:id/import', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file' });
 
     const sheet = await getSheet(req.params.id, req.user.id);
     if (!sheet) return res.status(404).json({ error: 'Not found' });
+
+    console.log(`📥 Import mulai: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)} MB)`);
 
     const wb = new ExcelJS.Workbook();
     const fname = req.file.originalname.toLowerCase();
@@ -34,42 +45,273 @@ router.post('/:id/import', upload.single('file'), async (req, res) => {
       await wb.xlsx.load(req.file.buffer);
     }
 
-    const ws = wb.worksheets[0];
-    if (!ws) return res.status(400).json({ error: 'No worksheet' });
+    if (!wb.worksheets || !wb.worksheets.length) {
+      return res.status(400).json({ error: 'File tidak punya worksheet' });
+    }
 
-    const cells = {};
-    ws.eachRow({ includeEmpty: false }, (row, r) => {
-      row.eachCell({ includeEmpty: false }, (cell, c) => {
-        const addr = rcToA1(r - 1, c - 1);
-        const val = cell.value;
-        if (val === null || val === undefined || val === '') return;
-        if (val instanceof Date) return void (cells[addr] = { v: val.toISOString().slice(0, 10) });
-        if (typeof val === 'object') {
-          if (val.formula) return void (cells[addr] = { f: '=' + val.formula });
-          if (val.result !== undefined) return void (cells[addr] = { v: val.result });
-          if (val.text !== undefined) return void (cells[addr] = { v: val.text });
-          return;
+    console.log(`📊 Total sheet di Excel: ${wb.worksheets.length}`);
+
+    // =====================================================
+    // 🎯 LOOP SEMUA WORKSHEET
+    // =====================================================
+    const allSheetsData = [];
+    let totalCells = 0;
+
+    wb.worksheets.forEach((ws, sheetIdx) => {
+      const sheetName = ws.name || `Sheet${sheetIdx + 1}`;
+      const cells = {};
+      const merged = [];
+      const colWidths = {};
+      const rowHeights = {};
+
+      let maxRow = 0;
+      let maxCol = 0;
+
+      // -----------------------------------------------
+      // 🎯 Parse cells + formatting
+      // -----------------------------------------------
+      ws.eachRow({ includeEmpty: false }, (row, r) => {
+        if (r > maxRow) maxRow = r;
+
+        // Row height
+        if (row.height && row.height > 15) {
+          rowHeights[r - 1] = Math.round(row.height * 1.33); // pt → px approximate
         }
-        cells[addr] = { v: val };
+
+        row.eachCell({ includeEmpty: false }, (cell, c) => {
+          if (c > maxCol) maxCol = c;
+
+          const addr = rcToA1(r - 1, c - 1);
+          const val = cell.value;
+          if (val === null || val === undefined || val === '') {
+            // Cek format saja
+            if (cell.style && hasStyle(cell.style)) {
+              cells[addr] = { s: extractStyle(cell.style) };
+            }
+            return;
+          }
+
+          const cellObj = {};
+
+          // Nilai
+          if (val instanceof Date) {
+            cellObj.v = val.toISOString().slice(0, 10);
+          } else if (typeof val === 'object') {
+            if (val.formula) {
+              cellObj.f = '=' + val.formula;
+            } else if (val.result !== undefined) {
+              cellObj.v = val.result;
+            } else if (val.text !== undefined) {
+              cellObj.v = val.text;
+            } else if (val.richText) {
+              cellObj.v = val.richText.map(r => r.text).join('');
+            } else if (val.hyperlink) {
+              cellObj.v = val.text || val.hyperlink;
+              cellObj.link = { url: val.hyperlink, text: val.text || val.hyperlink };
+              cellObj.s = { color: '#2563eb', underline: true };
+            } else {
+              cellObj.v = String(val);
+            }
+          } else {
+            cellObj.v = val;
+          }
+
+          // Style
+          if (cell.style && hasStyle(cell.style)) {
+            cellObj.s = { ...(cellObj.s || {}), ...extractStyle(cell.style) };
+          }
+
+          // Number format
+          if (cell.numFmt) {
+            cellObj.s = cellObj.s || {};
+            if (/^[#0,]+\.?\d*$/.test(cell.numFmt)) cellObj.s.numFmt = 'number';
+            else if (/Rp|\\"Rp\\"/.test(cell.numFmt) || /[$€£]/.test(cell.numFmt)) cellObj.s.numFmt = 'currency';
+            else if (/%/.test(cell.numFmt)) cellObj.s.numFmt = 'percent';
+            else if (/[ymd]/i.test(cell.numFmt) && /\d/.test(cell.numFmt)) cellObj.s.numFmt = 'date';
+          }
+
+          cells[addr] = cellObj;
+          totalCells++;
+        });
+      });
+
+      // -----------------------------------------------
+      // 🎯 Merged cells
+      // -----------------------------------------------
+      if (ws.model && ws.model.merges && ws.model.merges.length) {
+        for (const mergeRange of ws.model.merges) {
+          // Format: "A1:C1" atau "A1"
+          if (mergeRange && mergeRange.includes(':')) {
+            merged.push(mergeRange.toUpperCase());
+          } else if (mergeRange) {
+            // Single cell merge tidak valid, skip
+          }
+        }
+      }
+
+      // -----------------------------------------------
+      // 🎯 Column widths
+      // -----------------------------------------------
+      if (ws.columns) {
+        ws.columns.forEach((col, idx) => {
+          if (col && col.width) {
+            // Excel width (chars) → pixel approximate
+            const px = Math.round(col.width * 7 + 5);
+            colWidths[idx] = Math.max(40, Math.min(px, 500));
+          }
+        });
+      }
+
+      console.log(`   📄 Sheet "${sheetName}": ${Object.keys(cells).length} cells, ${merged.length} merges`);
+
+      allSheetsData.push({
+        name: sheetName,
+        cells,
+        colWidths,
+        rowHeight: 26,
+        cf: [],
+        charts: [],
+        merged,
+        filters: {},
+        images: []
       });
     });
 
-    const data = { sheets: [{ name: sheet.name, cells }], activeSheet: 0 };
+    // =====================================================
+    // 🎯 Build workbook data
+    // =====================================================
+    const data = {
+      sheets: allSheetsData,
+      activeSheet: 0
+    };
 
-    // ← FIX: stringify + cast eksplisit
+    const dataSize = JSON.stringify(data).length;
+    console.log(`💾 Total data: ${(dataSize / 1024 / 1024).toFixed(2)} MB, ${totalCells} cells, ${allSheetsData.length} sheets`);
+
+    // =====================================================
+    // 🎯 Save ke server
+    // =====================================================
     await pool.query(
-      `UPDATE sheets SET data = $2::jsonb, updated_at = NOW() WHERE id = $1::int`,
+      `UPDATE sheets
+          SET data = $2::jsonb,
+              updated_at = NOW()
+        WHERE id = $1::int`,
       [parseInt(req.params.id, 10), JSON.stringify(data)]
     );
 
-    res.json({ ok: true, cells: Object.keys(cells).length });
+    // Optional: auto-chunk kalau data besar
+    const THRESHOLD = 5 * 1024 * 1024;
+    if (dataSize > THRESHOLD) {
+      console.log('📦 Data > 5 MB — auto-chunking...');
+      // Trigger chunk migration async (tidak blocking response)
+      setImmediate(async () => {
+        try {
+          const BLOCK_ROWS = 256;
+          await pool.query('DELETE FROM sheet_chunks WHERE sheet_id = $1::int',
+            [parseInt(req.params.id, 10)]);
+
+          for (let sIdx = 0; sIdx < allSheetsData.length; sIdx++) {
+            const cells = allSheetsData[sIdx].cells;
+            const blocks = {};
+            for (const [addr, cell] of Object.entries(cells)) {
+              const m = /^([A-Z]+)(\d+)$/.exec(addr);
+              if (!m) continue;
+              const row = parseInt(m[2], 10) - 1;
+              const blockRow = Math.floor(row / BLOCK_ROWS) * BLOCK_ROWS;
+              if (!blocks[blockRow]) blocks[blockRow] = {};
+              blocks[blockRow][addr] = cell;
+            }
+            for (const [blockRow, blockCells] of Object.entries(blocks)) {
+              await pool.query(
+                `INSERT INTO sheet_chunks (sheet_id, sheet_idx, block_row, cells)
+                 VALUES ($1::int, $2::int, $3::int, $4::jsonb)`,
+                [parseInt(req.params.id, 10), sIdx, parseInt(blockRow, 10), JSON.stringify(blockCells)]
+              );
+            }
+          }
+          console.log('✅ Chunks created');
+        } catch (e) {
+          console.error('Chunk migration failed:', e);
+        }
+      });
+    }
+
+    // =====================================================
+    // 🎯 Response
+    // =====================================================
+    res.json({
+      ok: true,
+      cells: totalCells,
+      sheets: allSheetsData.length,
+      sheetNames: allSheetsData.map(s => s.name),
+      dataSize
+    });
+
   } catch (e) {
-    console.error('Import error:', e);
+    console.error('❌ Import error:', e);
     if (!res.headersSent) {
       res.status(500).json({ error: e.message || 'Import gagal' });
     }
   }
 });
+
+/* =========================================================
+   HELPER: Cek & extract style dari ExcelJS cell
+   ========================================================= */
+function hasStyle(style) {
+  if (!style) return false;
+  return !!(
+    style.font?.bold ||
+    style.font?.italic ||
+    style.font?.underline ||
+    style.font?.strike ||
+    style.font?.color?.argb ||
+    style.font?.size ||
+    style.fill?.fgColor?.argb ||
+    style.alignment?.horizontal
+  );
+}
+
+function extractStyle(style) {
+  const s = {};
+  if (style.font?.bold) s.bold = true;
+  if (style.font?.italic) s.italic = true;
+  if (style.font?.underline) s.underline = true;
+  if (style.font?.strike) s.strike = true;
+
+  // Font color
+  if (style.font?.color?.argb) {
+    const argb = style.font.color.argb;
+    if (argb && argb.length === 8) {
+      s.color = '#' + argb.slice(2);
+    }
+  }
+
+  // Font size
+  if (style.font?.size) {
+    s.fontSize = style.font.size;
+  }
+
+  // Fill color
+  if (style.fill?.type === 'pattern' && style.fill.fgColor?.argb) {
+    const argb = style.fill.fgColor.argb;
+    if (argb && argb.length === 8 && argb !== 'FFFFFFFF') {
+      s.bg = '#' + argb.slice(2);
+    }
+  }
+
+  // Alignment
+  if (style.alignment?.horizontal) {
+    s.align = style.alignment.horizontal; // 'left' | 'center' | 'right'
+  }
+
+  // Wrap
+  if (style.alignment?.wrapText) {
+    s.wrap = true;
+  }
+
+  return s;
+}
 
 /* ---------- XLSX ---------- */
 router.get('/:id/export/xlsx', async (req, res) => {

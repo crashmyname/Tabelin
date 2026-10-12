@@ -3748,3 +3748,96 @@ table#grid td.ref-highlight .cell-inner {
   color: #065f46;
   font-weight: 600;
 }
+/* ============ FREEZE PANES (clean) ============ */
+table#grid tbody tr.frozen-row {
+  background: #fff;
+}
+table#grid tbody tr.frozen-row > td,
+table#grid tbody tr.frozen-row > th {
+  border-bottom: 2px solid #10b981 !important;
+}
+table#grid tbody tr.frozen-row > th {
+  background: #ecfdf5 !important;
+  color: #059669 !important;
+}
+
+table#grid tbody td.freeze-col,
+table#grid tbody th.freeze-col {
+  background: #fff;
+  border-right: 2px solid #10b981 !important;
+}
+
+/* Sudut kiri-atas (overlap freeze row + freeze col) */
+table#grid tbody tr.frozen-row > td.freeze-col {
+  background: #f8fafc !important;
+}
+/* ============ CROSS-SHEET REFERENCE BANNER ============ */
+.cross-sheet-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, #dbeafe, #bfdbfe);
+  border-bottom: 2px solid #3b82f6;
+  color: #1e40af;
+  font-size: 13px;
+  z-index: 100;
+  animation: slideDown .2s ease-out;
+}
+@keyframes slideDown {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
+}
+.cross-sheet-banner > i {
+  color: #3b82f6;
+  font-size: 16px;
+}
+.cs-info {
+  flex: 1;
+  min-width: 0;
+}
+.cs-target {
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+.cs-formula {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 13px;
+  color: #1e3a8a;
+  background: rgba(255,255,255,.5);
+  padding: 3px 8px;
+  border-radius: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cs-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all .15s;
+}
+.cs-finish {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #fff;
+}
+.cs-finish:hover { box-shadow: 0 4px 12px rgba(16,185,129,.4); }
+.cs-cancel {
+  background: rgba(255,255,255,.6);
+  color: #1e40af;
+}
+.cs-cancel:hover { background: #fff; }
+/* Cell yang baru diklik di cross-sheet mode */
+table#grid td.cross-sheet-picked {
+  background: #dbeafe !important;
+  outline: 2px solid #3b82f6 !important;
+  outline-offset: -2px;
+}

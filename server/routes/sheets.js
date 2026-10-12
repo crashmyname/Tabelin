@@ -69,6 +69,18 @@ router.get('/:id', async (req, res) => {
   const a = await checkAccess(req.params.id, req.user.id);
   if (!a) return res.status(404).json({ error: 'Not found' });
   a.access_mode = a.access;
+
+  if (req.query.light === '1') {
+    const data = a.data || {};
+    if (data.sheets) {
+      data.sheets = data.sheets.map(s => ({
+        ...s,
+        cells: {}
+      }));
+    }
+    a.data = data;
+  }
+
   res.json(a);
 });
 

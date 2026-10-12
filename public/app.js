@@ -5,7 +5,7 @@
 const ROWS = 10000;
 const COLS = 50;
 let ROW_H = 26;
-const BUFFER = 20;
+const BUFFER = 3;
 const HF_LICENSE = 'gpl-v3';
 const HyperFormulaClass =
   (window.HyperFormula && window.HyperFormula.HyperFormula) || window.HyperFormula;
@@ -29,7 +29,9 @@ let undoStack = [];
 let redoStack = [];
 let editor = null;
 let insertingRefMode = false;
+let crossSheetRef = null;
 let chartInstances = new Map();
+let wbUsesChunks = false;
 
 /* Virtual scroll */
 let visibleStart = -1;
@@ -250,6 +252,10 @@ function showLoading(text = 'Memuat…') {
   if (txt) txt.textContent = text;
   if (el) el.classList.remove('hidden');
 }
+function updateLoadingProgress(text, percent) {
+  const txt = document.getElementById('loading-text');
+  if (txt) txt.textContent = `${text} (${percent}%)`;
+}
 function updateLoading(text) {
   const txt = document.getElementById('loading-text');
   if (txt) txt.textContent = text;
@@ -290,44 +296,282 @@ function computeUsedRange() {
   return { maxR, maxC };
 }
 
-/* Versi SYNC — untuk dipakai saat data kecil & butuh cepat */
-function resetHF() {
-  if (hf) hf.destroy();
-  const { maxR, maxC } = computeUsedRange();
-  const cells = sheet().cells || {};
-  const matrix = Array.from({ length: maxR }, () => new Array(maxC).fill(null));
+/* =========================================================
+   HF BUILD — hanya untuk bagian yang dibutuhkan
+   Hindari build matrix 500k sel yang bikin lag
+   ========================================================= */
+function computeUsedRangeForSheet(s) {
+  let maxR = 50, maxC = 26;
+  const cells = s?.cells || {};
+  for (const a of Object.keys(cells)) {
+    const p = parseAddr(a);
+    if (!p) continue;
+    if (p.r + 1 > maxR) maxR = p.r + 1;
+    if (p.c + 1 > maxC) maxC = p.c + 1;
+  }
+
+  // ⚡ BATASI: HF hanya build sampai 2000 baris × 50 kolom (= 100k sel)
+  // Sisanya di-render on-the-fly tanpa HF
+  const HF_MAX_R = 2000;
+  const HF_MAX_C = COLS;
+
+  maxR = Math.min(maxR + 20, HF_MAX_R);
+  maxC = Math.min(maxC + 5, HF_MAX_C);
+  return { maxR, maxC };
+}
+
+function buildSheetMatrix(s) {
+  const { maxR, maxC } = computeUsedRangeForSheet(s);
+  const cells = s?.cells || {};
+
+  // Paksa minimal 1×1 supaya HF tidak error
+  const R = Math.max(maxR, 1);
+  const C = Math.max(maxC, 1);
+
+  const matrix = Array.from({ length: R }, () => new Array(C).fill(null));
   for (const [a, c] of Object.entries(cells)) {
     const p = parseAddr(a);
-    if (!p || p.r >= maxR || p.c >= maxC) continue;
+    if (!p || p.r >= R || p.c >= C) continue;
     if (c.f) matrix[p.r][p.c] = c.f;
     else if (c.v !== undefined && c.v !== null && c.v !== '') matrix[p.r][p.c] = c.v;
   }
-  hf = HyperFormulaClass.buildFromArray(matrix, { licenseKey: HF_LICENSE });
-  hf.__maxR = maxR;
-  hf.__maxC = maxC;
+  return matrix;
 }
 
-/* Versi ASYNC — pakai spinner + yield ke browser */
+/* =========================================================
+   ✅ RESET HF — versi MULTI-SHEET + auto re-render listener
+   ========================================================= */
+function resetHF() {
+  _sheetIdCache.clear();
+  if (hf) { try { hf.destroy(); } catch {} hf = null; }
+
+  // ⚠️ PENTING: sheetsData harus OBJECT, bukan array
+  // Format: { "Sheet1": [[...], [...]], "Sheet2": [[...]] }
+  const sheetsData = {};
+  wbData.sheets.forEach((s, idx) => {
+    let name = s.name || ('Sheet' + (idx + 1));
+    // Pastikan nama unik
+    let unique = name;
+    let n = 1;
+    while (sheetsData[unique] !== undefined) {
+      n++;
+      unique = name + '_' + n;
+    }
+    sheetsData[unique] = buildSheetMatrix(s);
+  });
+
+  try {
+    hf = HyperFormulaClass.buildFromSheets(sheetsData, {
+      licenseKey: HF_LICENSE
+    });
+    hf.__maxR = ROWS;
+    hf.__maxC = COLS;
+    console.log('✅ HF built. Sheets:', hf.getSheetNames());
+
+    // 🎯 LISTENER: auto re-render saat HF selesai evaluate
+    attachHFListener();
+
+  } catch (e) {
+    console.error('❌ HF multi-sheet build failed:', e.message);
+    // Fallback: single-sheet dengan sheet aktif
+    try {
+      const cur = sheet();
+      const matrix = buildSheetMatrix(cur);
+      const safeMatrix = (matrix && matrix.length && matrix[0] && matrix[0].length)
+        ? matrix
+        : [['']];
+      hf = HyperFormulaClass.buildFromArray(safeMatrix, { licenseKey: HF_LICENSE });
+      hf.__maxR = safeMatrix.length || 50;
+      hf.__maxC = (safeMatrix[0] || []).length || 26;
+      console.log('⚠️ Fallback single-sheet:', hf.getSheetNames());
+
+      // 🎯 LISTENER juga untuk fallback
+      attachHFListener();
+
+    } catch (e2) {
+      console.error('❌ Fallback failed:', e2.message);
+      hf = HyperFormulaClass.buildFromArray([['']], { licenseKey: HF_LICENSE });
+      hf.__maxR = 50;
+      hf.__maxC = 26;
+
+      // 🎯 LISTENER juga untuk fallback minimal
+      attachHFListener();
+    }
+  }
+}
+
+/* =========================================================
+   🎯 Attach listener ke HF — auto re-render saat values updated
+   ========================================================= */
+function attachHFListener() {
+  if (!hf) return;
+
+  try {
+    const subscribe = hf.on || hf.subscribe || hf.addListener;
+    if (typeof subscribe === 'function') {
+      subscribe.call(hf, 'valuesUpdated', () => {
+        if (typeof clearHFCache === 'function') clearHFCache();
+        window._lastRenderKey = null;
+        if (!window._hfRenderPending) {
+          window._hfRenderPending = true;
+          requestAnimationFrame(() => {
+            window._hfRenderPending = false;
+            try { renderVirtual(false); } catch {}
+          });
+        }
+      });
+      console.log('🎧 HF listener attached (valuesUpdated)');
+    } else {
+      // 🎯 Fallback: polling ringan setiap 300ms
+      console.warn('⚠️ HF tidak support events, pakai polling fallback');
+      if (window._hfPollTimer) clearInterval(window._hfPollTimer);
+      window._hfPollTimer = setInterval(() => {
+        // Skip kalau sedang tidak ada formula aktif
+        const hasFormulas = Object.values(sheet().cells || {})
+          .some(c => c && c.f);
+        if (!hasFormulas) return;
+
+        // Cek apakah ada perubahan nilai di cache vs HF
+        let changed = false;
+        const checkCells = ['B1', 'C1', 'D1', 'A2', 'B2']; // sample cells
+        for (const addr of checkCells) {
+          const p = parseAddr(addr);
+          if (!p) continue;
+          const cached = _hfValueCache.get(activeSheetIdx + ':' + addr);
+          const current = hfGet(p.r, p.c);
+          if (cached !== current) { changed = true; break; }
+        }
+
+        if (changed) {
+          clearHFCache();
+          window._lastRenderKey = null;
+          try { renderVirtual(false); } catch {}
+        }
+      }, 500);
+    }
+  } catch (e) {
+    console.warn('Cannot attach HF listener:', e.message);
+  }
+}
+
+/* 🎯 Cache sheetId — hindari lookup HF tiap sel */
+let _sheetIdCache = new Map();
+
+function getSheetIdSafe(sheetIdx = activeSheetIdx) {
+  if (!hf) return null;
+  const sh = wbData.sheets[sheetIdx];
+  if (!sh) return null;
+  const sheetName = sh.name;
+  if (!sheetName) return null;
+
+  let id = undefined;
+  try { id = hf.getSheetId(sheetName); } catch { id = undefined; }
+
+  if (id === undefined || id === null) {
+    try {
+      hf.addSheet(sheetName);
+      id = hf.getSheetId(sheetName);
+      console.log('➕ Auto-added sheet:', sheetName, '→ ID:', id);
+
+      // 🎯 Kalau sheet baru di-add, load chunks & set cells-nya
+      if (window.Chunks && hf) {
+        const shData = wbData.sheets[sheetIdx];
+        // Kalau pakai chunk, trigger load blocks pertama
+        if (wbUsesChunks && shData.cells && Object.keys(shData.cells).length === 0) {
+          console.log('📦 Pre-loading blocks untuk', sheetName);
+          // Load 4 block pertama (baris 0-1024)
+          Promise.all([
+            Chunks.ensureBlockLoaded(sheetIdx, 0),
+            Chunks.ensureBlockLoaded(sheetIdx, 256),
+            Chunks.ensureBlockLoaded(sheetIdx, 512),
+            Chunks.ensureBlockLoaded(sheetIdx, 768)
+          ]).then(() => {
+            // Set cells ke HF
+            const loadedCells = Chunks.getLoadedCells(sheetIdx);
+            if (hf && Object.keys(loadedCells).length > 0) {
+              const matrix = [];
+              for (const [addr, cell] of Object.entries(loadedCells)) {
+                const p = parseAddr(addr);
+                if (!p) continue;
+                const val = cell.f || cell.v || null;
+                try {
+                  hf.setCellContents({ sheet: id, row: p.r, col: p.c }, [[val]]);
+                } catch {}
+              }
+              // Force re-render
+              window._lastRenderKey = null;
+              setTimeout(() => renderVirtual(false), 100);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Cannot add sheet:', e.message);
+    }
+  }
+
+  if (id === undefined || id === null) {
+    try { resetHF(); id = hf.getSheetId(sheetName); } catch {}
+  }
+
+  return (id === undefined || id === null) ? null : id;
+}
+
+/* ✅ hfGet — pakai numeric sheet ID */
+function hfGet(r, c, sheetIdx = activeSheetIdx) {
+  if (!hf) return '';
+  const sheetId = getSheetIdSafe(sheetIdx);
+  if (sheetId === null) return '';
+  try {
+    return hf.getCellValue({ sheet: sheetId, row: r, col: c });
+  } catch {
+    return '';
+  }
+}
+
+/* ✅ hfSet — pakai numeric sheet ID */
+function hfSet(r, c, val, sheetIdx = activeSheetIdx) {
+  if (!hf) return false;
+  const sheetId = getSheetIdSafe(sheetIdx);
+  if (sheetId === null) {
+    console.warn('hfSet: sheet not found for index', sheetIdx);
+    return false;
+  }
+  try {
+    hf.setCellContents({ sheet: sheetId, row: r, col: c }, [[val]]);
+    return true;
+  } catch (e) {
+    console.warn('hfSet failed (id=' + sheetId + '):', e.message);
+    return false;
+  }
+}
+
 async function resetHFLazy(reason = 'Menyiapkan formula engine…') {
-  if (hf) hf.destroy();
+  if (hf) { try { hf.destroy(); } catch {} hf = null; }
 
   const cellCount = Object.keys(sheet().cells || {}).length;
+  console.log('🔧 Building HF for', cellCount, 'cells');
 
-  if (cellCount < 2000) {
+  // Data kecil — langsung build
+  if (cellCount < 5000) {
     resetHF();
     return;
   }
 
+  // Data besar — pakai spinner + yield
   showLoading(reason);
   await yieldToUI();
-  updateLoading('Membangun formula engine…');
+  updateLoading(`Membangun formula engine (${cellCount.toLocaleString('id-ID')} sel)…`);
   await yieldToUI();
 
+  const t0 = performance.now();
   try {
     resetHF();
+    const t1 = performance.now();
+    console.log(`✅ HF built in ${(t1 - t0).toFixed(0)}ms`);
   } catch (e) {
     console.error('HF build failed:', e);
-    hf = HyperFormulaClass.buildFromArray([[]], { licenseKey: HF_LICENSE });
+    hf = HyperFormulaClass.buildFromArray([['']], { licenseKey: HF_LICENSE });
     hf.__maxR = 50; hf.__maxC = 26;
   }
 
@@ -470,7 +714,7 @@ function autoFitColumn(c) {
     const cl = sheet().cells[addr];
     let v;
     if (cl.f) {
-      try { v = hf.getCellValue({ sheet: 0, row: p.r, col: c }); }
+    try { v = hfGet(p.r, c); }
       catch { v = ''; }
     } else {
       v = cl.v ?? '';
@@ -549,15 +793,32 @@ function createRowEl(r) {
 /* =========================================================
    VIRTUAL RENDER
    ========================================================= */
+let scrollStopTimer = null;
+
 function onGridScroll() {
   if (scrollRAF) return;
   scrollRAF = requestAnimationFrame(() => {
     scrollRAF = null;
-    renderVirtual();
+    renderVirtual(true);
+
+    clearTimeout(scrollStopTimer);
+    scrollStopTimer = setTimeout(() => {
+      renderVirtual(false);
+    }, 200);
   });
 }
 
-function renderVirtual() {
+/* =========================================================
+   HF VALUE CACHE
+   ========================================================= */
+const _hfValueCache = new Map();
+function clearHFCache() { _hfValueCache.clear(); }
+function invalidateHF(addr) { _hfValueCache.delete(addr); }
+
+/* =========================================================
+   RENDER VIRTUAL v4 — pakai HTML string, super cepat
+   ========================================================= */
+function renderVirtual(fastMode = false) {
   const gridWrapEl = document.getElementById('grid-wrap');
   const scrollTop = gridWrapEl.scrollTop;
   const viewH = gridWrapEl.clientHeight;
@@ -565,88 +826,332 @@ function renderVirtual() {
   const rowMap = getRowMap();
   const totalRows = rowMap ? rowMap.length : ROWS;
 
-  const frozenRowCount = Math.min(sheet().freezeRow || 0, 20);
-  const frozenColCount = Math.min(sheet().freezeCol || 0, 8);
+  const startRow = Math.max(0, Math.floor(scrollTop / ROW_H) - 3);
+  const endRow = Math.min(totalRows, Math.ceil((scrollTop + viewH) / ROW_H) + 3);
 
-  // Range baris yang perlu di-render
-  // Kita perlu: baris frozen + baris visible sekitar scrollTop
-  const scrollStart = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
-  const scrollEnd = Math.min(totalRows, Math.ceil((scrollTop + viewH) / ROW_H) + BUFFER);
-  
-  // Range akhir: dari min(scrollStart, 0) sampai max(scrollEnd, frozenRowCount)
-  const renderStart = 0;  // selalu mulai dari 0 supaya frozen rows ter-render
-  const renderEnd = Math.max(scrollEnd, frozenRowCount + 1);
+  const rangeKey = startRow + ':' + endRow + ':' + (fastMode ? 'F' : 'S');
+  if (rangeKey === window._lastRenderKey) return;
+  window._lastRenderKey = rangeKey;
 
-  if (renderStart === visibleStart && renderEnd === visibleEnd &&
-      frozenRowCount === window._lastFrozenRow &&
-      frozenColCount === window._lastFrozenCol) return;
-  visibleStart = renderStart;
-  visibleEnd = renderEnd;
-  window._lastFrozenRow = frozenRowCount;
-  window._lastFrozenCol = frozenColCount;
+  visibleStart = startRow;
+  visibleEnd = endRow;
 
   const tbody = document.getElementById('grid-body');
   if (!tbody) return;
-  const frag = document.createDocumentFragment();
 
-  // Kumpulkan visible merges
-  const visibleMerges = [];
-  for (const rangeStr of (sheet().merged || [])) {
-    const [s, e] = rangeParts(rangeStr);
-    const p1 = parseAddr(s), p2 = parseAddr(e);
-    if (!p1 || !p2) continue;
-    const r0 = Math.min(p1.r, p2.r), r1 = Math.max(p1.r, p2.r);
-    if (r0 < renderEnd && r1 >= renderStart) {
-      visibleMerges.push({
-        r0, r1,
-        c0: Math.min(p1.c, p2.c),
-        c1: Math.max(p1.c, p2.c)
-      });
+  // =====================================================
+  // 🎯 Load chunk untuk range visible
+  // =====================================================
+  if (window.Chunks) {
+    const blockRowsNeeded = new Set();
+    const BLOCK_ROWS = Chunks.BLOCK_ROWS;
+    for (let di = startRow; di < endRow; di++) {
+      const r = rowMap ? rowMap[di] : di;
+      blockRowsNeeded.add(Math.floor(r / BLOCK_ROWS) * BLOCK_ROWS);
     }
+
+    const needsLoad = [];
+    for (const b of blockRowsNeeded) {
+      needsLoad.push(Chunks.ensureBlockLoaded(activeSheetIdx, b));
+    }
+
+    // Kalau ada yang perlu di-load, tunggu selesai baru render
+    const allLoaded = Array.from(blockRowsNeeded).every(b => {
+      const key = activeSheetIdx + ':' + b;
+      return Chunks.getCell && Chunks.getCell(activeSheetIdx, 'A' + (b + 1)) !== undefined;
+    });
+
+    Promise.all(needsLoad).then(() => {
+      // Re-render setelah chunk loaded
+      window._lastRenderKey = null;
+      requestAnimationFrame(() => renderVirtual(fastMode));
+    });
   }
 
-  for (let di = renderStart; di < renderEnd; di++) {
+  // =====================================================
+  // Bangun HTML
+  // =====================================================
+  const parts = [];
+
+  if (startRow > 0) {
+    parts.push('<tr style="height:' + (startRow * ROW_H) + 'px"><td colspan="' + (COLS + 1) + '" style="padding:0;border:0"></td></tr>');
+  }
+
+  for (let di = startRow; di < endRow; di++) {
     const r = rowMap ? rowMap[di] : di;
-    const tr = buildRowWithMerges(r, visibleMerges);
-    
-    // Apakah baris ini di-freeze?
-    if (r < frozenRowCount) {
-      tr.classList.add('frozen-row');
-      const topOffset = 26 + r * ROW_H;  // header (26px) + offset baris
-      tr.style.position = 'sticky';
-      tr.style.top = topOffset + 'px';
-      tr.style.zIndex = '8';
-      tr.querySelectorAll('td, th').forEach(cell => {
-        cell.style.position = 'sticky';
-        cell.style.top = topOffset + 'px';
-        cell.style.background = cell.tagName === 'TH' ? '#ecfdf5' : '#fff';
-        cell.style.zIndex = '8';
-      });
-    }
-    
-    frag.appendChild(tr);
+    parts.push(buildRowHTML(r, fastMode));
   }
 
-  tbody.replaceChildren(frag);
+  if (endRow < totalRows) {
+    parts.push('<tr style="height:' + ((totalRows - endRow) * ROW_H) + 'px"><td colspan="' + (COLS + 1) + '" style="padding:0;border:0"></td></tr>');
+  }
 
+  tbody.innerHTML = parts.join('');
+
+  // Rebuild rowEls
   rowEls = {};
-  Array.from(tbody.children).forEach(tr => {
+  const trs = tbody.children;
+  for (let i = 0; i < trs.length; i++) {
+    const tr = trs[i];
     const th = tr.firstElementChild;
-    if (th && th.dataset.row !== undefined) {
+    if (th && th.dataset && th.dataset.row !== undefined) {
       rowEls[+th.dataset.row] = tr;
     }
-  });
-
-  if (frozenColCount > 0) {
-    applyFreezeCols(frozenColCount);
   }
 
-  renderVisibleCells();
-  renderCFVisible();
-  applySelectionStyles();
-  renderRowHeaderHighlight();
-  applyValidationIndicators();
-  applyCommentMarkers();
+  if (!fastMode) {
+    try { renderCFVisible(); } catch(e) {}
+    try { renderRowHeaderHighlight(); } catch(e) {}
+    try { applyValidationIndicators(); } catch(e) {}
+    try { applyCommentMarkers(); } catch(e) {}
+  }
+
+  applySelectionStylesFast();
+}
+
+function buildRowHTML(r, fastMode) {
+  const colWidths = sheet().colWidths || {};
+
+  let h = '<tr data-row="' + r + '" style="height:' + ROW_H + 'px">';
+
+  // Row header
+  h += '<th data-row="' + r + '" style="width:48px">' + (r + 1) + '</th>';
+
+  for (let c = 0; c < COLS; c++) {
+    const addr = addrOf(r, c);
+
+    // 🎯 Baca dari Chunks, fallback ke sheet().cells
+    let cl = null;
+    if (window.Chunks) {
+      cl = Chunks.getCell(activeSheetIdx, addr);
+    }
+    if (cl === null && sheet().cells && sheet().cells[addr]) {
+      cl = sheet().cells[addr];
+    }
+
+    let text = '';
+    let style = '';
+    let cls = '';
+
+    if (cl) {
+      let v;
+
+      if (cl.f) {
+        if (fastMode) {
+          const cached = _hfValueCache.get(addr);
+          v = cached !== undefined ? cached : '…';
+        } else {
+          try { v = hfGet(r, c); }
+          catch { v = '#REF!'; }
+          _hfValueCache.set(addr, v);
+        }
+      } else {
+        v = cl.v ?? '';
+      }
+
+      text = cl.s?.numFmt ? formatNumber(v, cl.s.numFmt) : displayVal(v);
+
+      if (cl.s) {
+        const s = cl.s;
+        if (s.bold) style += 'font-weight:700;';
+        if (s.italic) style += 'font-style:italic;';
+        if (s.underline) style += 'text-decoration:underline;';
+        if (s.color) style += 'color:' + s.color + ';';
+        if (s.bg) style += 'background:' + s.bg + ';';
+        if (s.align) style += 'text-align:' + s.align + ';';
+        if (s.fontFamily) style += 'font-family:' + s.fontFamily + ';';
+        if (s.fontSize) style += 'font-size:' + s.fontSize + 'px;';
+      }
+
+      if (cl.link) cls += ' cell-link';
+      if (cl.comment) cls += ' has-comment';
+    }
+
+    const width = colWidths[c] || 96;
+    const esc = escapeHtml(text);
+
+    h += '<td data-addr="' + addr + '" class="' + cls.trim() + '" style="width:' + width + 'px;' + style + '">'
+       + '<div class="cell-inner' + cls + '">' + esc + '</div>'
+       + '</td>';
+  }
+
+  h += '</tr>';
+  return h;
+}
+
+/* =========================================================
+   FAST SELECTION — pakai classList, tidak render ulang
+   ========================================================= */
+function applySelectionStylesFast() {
+  // Clear selection lama
+  const tbody = document.getElementById('grid-body');
+  if (!tbody) return;
+
+  const trs = tbody.children;
+  for (let i = 0; i < trs.length; i++) {
+    const tr = trs[i];
+    const tds = tr.children;
+    for (let j = 1; j < tds.length; j++) {
+      const td = tds[j];
+      if (td.classList.contains('active')) td.classList.remove('active');
+      if (td.classList.contains('selected')) td.classList.remove('selected');
+    }
+  }
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return;
+
+  const selR0 = Math.min(p1.r, p2.r), selR1 = Math.max(p1.r, p2.r);
+  const selC0 = Math.min(p1.c, p2.c), selC1 = Math.max(p1.c, p2.c);
+  const activeP = parseAddr(activeCell);
+
+  const rowMap = getRowMap();
+  for (let di = visibleStart; di < visibleEnd; di++) {
+    const r = rowMap ? rowMap[di] : di;
+    if (r < selR0 || r > selR1) continue;
+
+    const tr = rowEls[r];
+    if (!tr) continue;
+
+    const tds = tr.children;
+    for (let j = 1; j < tds.length; j++) {
+      const td = tds[j];
+      const p = parseAddr(td.dataset.addr);
+      if (!p) continue;
+      if (p.c < selC0 || p.c > selC1) continue;
+
+      if (activeP && p.r === activeP.r && p.c === activeP.c) {
+        td.classList.add('active');
+      } else {
+        td.classList.add('selected');
+      }
+    }
+  }
+}
+
+/* =========================================================
+   SCROLL MODE — pakai raw value, tidak ada hfGet
+   ========================================================= */
+function renderVisibleCellsScroll() {
+  const rowMap = getRowMap();
+
+  for (let di = visibleStart; di < visibleEnd; di++) {
+    const r = rowMap ? rowMap[di] : di;
+    const tr = rowEls[r];
+    if (!tr) continue;
+
+    const children = tr.children;
+    for (let i = 1; i < children.length; i++) {
+      const td = children[i];
+      if (!td.dataset || !td.dataset.addr) continue;
+
+      const p = parseAddr(td.dataset.addr);
+      if (!p) continue;
+
+      // Skip kalau sedang di-edit
+      const first = td.firstElementChild;
+      if (first && first.tagName === 'INPUT') continue;
+
+      const addr = td.dataset.addr;
+      const cl = sheet().cells[addr];
+
+      // 🎯 RAW value — NO HF CALL
+      let raw = '';
+      if (cl) {
+        // Kalau ada cache HF, pakai cache
+        const cached = _hfValueCache.get(addr);
+        if (cached !== undefined) {
+          raw = cached;
+        } else if (cl.f) {
+          // Ada formula tapi belum ada cache → tampilkan placeholder sementara
+          raw = '…';
+        } else {
+          raw = cl.v ?? '';
+        }
+      }
+
+      const displayText = cl?.s?.numFmt
+        ? formatNumber(raw, cl.s.numFmt)
+        : displayVal(raw);
+
+      let inner = first;
+      if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
+        inner = td.querySelector('.cell-inner');
+        if (!inner) {
+          inner = document.createElement('div');
+          inner.className = 'cell-inner';
+          td.insertBefore(inner, td.firstChild);
+        }
+      }
+
+      if (inner.textContent !== displayText) {
+        inner.textContent = displayText;
+      }
+    }
+  }
+}
+
+/* =========================================================
+   FULL MODE — hitung HF, update cache
+   ========================================================= */
+function renderVisibleCellsFull() {
+  const rowMap = getRowMap();
+
+  for (let di = visibleStart; di < visibleEnd; di++) {
+    const r = rowMap ? rowMap[di] : di;
+    const tr = rowEls[r];
+    if (!tr) continue;
+
+    const children = tr.children;
+    for (let i = 1; i < children.length; i++) {
+      const td = children[i];
+      if (!td.dataset || !td.dataset.addr) continue;
+
+      const p = parseAddr(td.dataset.addr);
+      if (!p) continue;
+
+      const first = td.firstElementChild;
+      if (first && first.tagName === 'INPUT') continue;
+
+      const addr = td.dataset.addr;
+      const cl = sheet().cells[addr];
+
+      let raw = '';
+      if (cl) {
+        if (cl.f) {
+          // 🎯 Panggil HF hanya untuk formula
+          try {
+            raw = hfGet(p.r, p.c);
+          } catch {
+            raw = '#REF!';
+          }
+          // Simpan ke cache
+          _hfValueCache.set(addr, raw);
+        } else {
+          raw = cl.v ?? '';
+        }
+      }
+
+      const displayText = cl?.s?.numFmt
+        ? formatNumber(raw, cl.s.numFmt)
+        : displayVal(raw);
+
+      let inner = first;
+      if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
+        inner = td.querySelector('.cell-inner');
+        if (!inner) {
+          inner = document.createElement('div');
+          inner.className = 'cell-inner';
+          td.insertBefore(inner, td.firstChild);
+        }
+      }
+
+      if (inner.textContent !== displayText) {
+        inner.textContent = displayText;
+      }
+    }
+  }
 }
 
 /* =========================================================
@@ -744,19 +1249,124 @@ function renderVisibleCells() {
   }
 }
 
+function renderVisibleCellsFast() {
+  const rowMap = getRowMap();
+
+  for (let di = visibleStart; di < visibleEnd; di++) {
+    const r = rowMap ? rowMap[di] : di;
+    const tr = rowEls[r];
+    if (!tr) continue;
+
+    // 🎯 Pakai children langsung (lebih cepat dari querySelectorAll)
+    const children = tr.children;
+    for (let i = 1; i < children.length; i++) {
+      const td = children[i];
+      if (!td.dataset || !td.dataset.addr) continue;
+      const p = parseAddr(td.dataset.addr);
+      if (p) updateCellDisplayFast(td, p.r, p.c);
+    }
+  }
+}
+
+function updateCellDisplayFast(td, r, c) {
+  if (!td) return;
+
+  // Skip kalau sedang diedit
+  const firstChild = td.firstElementChild;
+  if (firstChild && firstChild.tagName === 'INPUT') return;
+
+  const cacheKey = r + ':' + c;
+  let displayText = _valueCache.get(cacheKey);
+
+  if (displayText === undefined) {
+    const addr = td.dataset.addr;
+    const cl = sheet().cells[addr];
+    let raw = '';
+
+    if (cl && cl.f) {
+      try { raw = hfGet(r, c); }
+      catch { raw = '#REF!'; }
+    } else {
+      raw = cl?.v ?? '';
+    }
+
+    displayText = cl?.s?.numFmt
+      ? formatNumber(raw, cl.s.numFmt)
+      : displayVal(raw);
+
+    _valueCache.set(cacheKey, displayText);
+  }
+
+  // Inner element
+  let inner = firstChild;
+  if (!inner || !inner.classList.contains('cell-inner')) {
+    inner = td.querySelector('.cell-inner');
+    if (!inner) {
+      inner = document.createElement('div');
+      inner.className = 'cell-inner';
+      td.insertBefore(inner, td.firstChild);
+    }
+  }
+
+  // Update hanya kalau text beda
+  if (inner.textContent !== displayText) {
+    inner.textContent = displayText;
+  }
+}
+
+function updateCellDisplayFast(td, r, c) {
+  if (!td) return;
+  if (td.querySelector('input')) return;
+
+  const addr = td.dataset.addr;
+  const cl = sheet().cells[addr];
+
+  let raw = '';
+  // 🎯 FAST: pakai value langsung kalau bukan formula
+  if (cl && cl.f) {
+    try { raw = hfGet(r, c); }
+    catch { raw = '#REF!'; }
+  } else {
+    raw = cl?.v ?? '';
+  }
+
+  let inner = td.querySelector('.cell-inner');
+  if (!inner) {
+    inner = document.createElement('div');
+    inner.className = 'cell-inner';
+    td.insertBefore(inner, td.firstChild);
+  }
+
+  const displayText = cl?.s?.numFmt
+    ? formatNumber(raw, cl.s.numFmt)
+    : displayVal(raw);
+
+  // 🎯 OPTIMASI: skip update kalau text sama
+  if (inner.textContent !== displayText) {
+    inner.textContent = displayText;
+  }
+}
+
+
 function forceRenderCell(td, r, c) {
   if (!td) return;
   const addr = td.dataset.addr;
   const cl = sheet().cells[addr];
+
   let raw = '';
+
   if (cl && cl.f) {
-    const maxR = (hf && hf.__maxR) || ROWS;
-    const maxC = (hf && hf.__maxC) || COLS;
-    if (r < maxR && c < maxC) {
-      try { raw = hf.getCellValue({ sheet: 0, row: r, col: c }); }
-      catch { raw = '#REF!'; }
-    } else { raw = '#REF!'; }
-  } else { raw = cl?.v ?? ''; }
+    try {
+      raw = hfGet(r, c);
+      if (raw === '' || raw === null || raw === undefined) {
+        raw = '#REF!';
+      }
+    } catch {
+      raw = '#REF!';
+    }
+  } else {
+    raw = cl?.v ?? '';
+  }
 
   let inner = td.querySelector('.cell-inner');
   if (!inner) {
@@ -849,12 +1459,12 @@ function getRowMap() {
   maxR += 20;
 
   const out = [];
-  for (let r = 0; r <= maxR; r++) {
+  out.push(0);
+  for (let r = 1; r <= maxR; r++) {
     let pass = true;
     for (const [col, f] of filters) {
       const c = parseInt(col, 10);
-      const addr = addrOf(r, c);
-      const raw = sheet().cells[addr];
+      const raw = sheet().cells[addrOf(r, c)];
       const v = raw ? String(raw.v ?? '') : '';
       if (!f.values.includes(v)) { pass = false; break; }
     }
@@ -1082,6 +1692,40 @@ function getRaw(addr) {
   return c.f ?? (c.v ?? '');
 }
 
+/* =========================================================
+   CEK FORMULA LENGKAP / BELUM
+   ========================================================= */
+function isFormulaComplete(formula) {
+  if (!formula || typeof formula !== 'string') return true;
+  if (!formula.startsWith('=')) return true;
+
+  const body = formula.slice(1).trim();
+
+  // Hanya "=" kosong → belum lengkap
+  if (!body) return false;
+
+  // Berakhir dengan karakter yang butuh operand lagi
+  if (/[+\-*/^&<>=,(]$/.test(body)) return false;
+
+  // Berakhir dengan referensi belum lengkap (mis. "Sheet2!" atau "A1:")
+  if (body.endsWith('!') || body.endsWith(':')) return false;
+
+  // Cek parentheses balance
+  let open = 0;
+  for (const ch of body) {
+    if (ch === '(') open++;
+    else if (ch === ')') open--;
+    if (open < 0) return false;   // kelebihan ")"
+  }
+  if (open !== 0) return false;   // masih ada "(" yang belum ditutup
+
+  // Cek string quotes (tanda petik)
+  const dq = (body.match(/"/g) || []).length;
+  if (dq % 2 !== 0) return false;
+
+  return true;
+}
+
 function updateStatusStats() {
   const stat = document.getElementById('status-stat');
   const p1 = parseAddr(selection.start);
@@ -1099,9 +1743,7 @@ function updateStatusStats() {
   const hfC = hf.__maxC || COLS;
   for (let r = rMin; r <= rMax; r++) {
     for (let c = cMin; c <= cMax; c++) {
-      const v = (r < hfR && c < hfC)
-        ? hf.getCellValue({ sheet: 0, row: r, col: c })
-        : '';
+      const v = (r < hfR && c < hfC) ? hfGet(r, c) : '';
       const n = Number(v);
       if (!isNaN(n) && v !== '' && v !== null) { sum += n; numCount++; }
       if (v !== '' && v !== null && v !== undefined) count++;
@@ -1189,6 +1831,13 @@ function openEditor(addr, initial) {
     if (e.key === 'Enter') {
       e.preventDefault();
       const val = input.value;
+
+      // 🎯 Cegah Enter kalau formula belum lengkap
+      if (val.startsWith('=') && !isFormulaComplete(val)) {
+        toast('⚠ Formula belum lengkap — tutup tanda kurung dulu');
+        return;
+      }
+
       commit(addr, val);
       closeEditor();
       if (!editor) moveSel(1, 0);
@@ -1198,6 +1847,12 @@ function openEditor(addr, initial) {
     } else if (e.key === 'Tab') {
       e.preventDefault();
       const val = input.value;
+
+      if (val.startsWith('=') && !isFormulaComplete(val)) {
+        toast('⚠ Formula belum lengkap');
+        return;
+      }
+
       commit(addr, val);
       closeEditor();
       if (!editor) moveSel(0, e.shiftKey ? -1 : 1);
@@ -1206,7 +1861,17 @@ function openEditor(addr, initial) {
   input.addEventListener('blur', () => {
     if (insertingRefMode) return;
     if (!editor || editor.input !== input) return;
-    commit(addr, input.value);
+
+    const val = input.value;
+
+    // 🎯 Kalau ini formula belum lengkap → DISCARD, jangan commit
+    if (val.startsWith('=') && !isFormulaComplete(val)) {
+      console.log('⏭ Formula belum lengkap, discard:', val);
+      closeEditor();
+      return;
+    }
+
+    commit(addr, val);
     closeEditor();
   });
 }
@@ -1235,39 +1900,121 @@ function closeEditor() {
   selectCell(addr, false);
 }
 
+function setHFCellSafe(r, c, val) {
+  if (!hf) return;
+  // hfSet sudah handle auto-add & rebuild
+  hfSet(r, c, val, activeSheetIdx);
+}
+
 function commit(addr, value) {
-  if (currentAccessMode === 'view') {
-    toast('👁 Mode lihat saja');
-    return;
-  }
   const p = parseAddr(addr);
   if (!p) return;
   pushUndo();
   const raw = String(value);
+
+  // =====================================================
+  // 1. Build cell
+  // =====================================================
+  let newCell = null;
   if (raw === '') {
-    delete sheet().cells[addr];
-    hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[null]]);
+    newCell = null;
   } else if (raw.startsWith('=')) {
-    ensureCell(addr);
-    sheet().cells[addr].f = raw;
-    delete sheet().cells[addr].v;
-    hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[raw]]);
+    newCell = { f: raw };
   } else {
     const n = Number(raw);
     const v = raw.trim() !== '' && !isNaN(n) ? n : raw;
-    ensureCell(addr);
-    sheet().cells[addr].v = v;
-    delete sheet().cells[addr].f;
-    hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[v]]);
+    newCell = { v };
   }
+
+  // Preserve style/link/comment
+  const old = sheet().cells[addr];
+  if (old && (old.s || old.link || old.comment)) {
+    newCell = newCell || {};
+    if (old.s) newCell.s = old.s;
+    if (old.link) newCell.link = old.link;
+    if (old.comment) newCell.comment = old.comment;
+  }
+
+  // =====================================================
+  // 2. Update local state
+  // =====================================================
+  if (!sheet().cells) sheet().cells = {};
+  if (newCell) sheet().cells[addr] = newCell;
+  else delete sheet().cells[addr];
+
+  // Update chunk (kalau chunk mode aktif)
+  if (window.Chunks && Chunks.setCell && typeof wbUsesChunks !== 'undefined' && wbUsesChunks) {
+    Chunks.setCell(activeSheetIdx, addr, newCell);
+  }
+
+  // =====================================================
+  // 3. Update HF
+  // =====================================================
+  if (newCell && newCell.f) {
+    setHFCellSafe(p.r, p.c, newCell.f);
+  } else if (newCell && newCell.v !== undefined) {
+    setHFCellSafe(p.r, p.c, newCell.v);
+  } else {
+    setHFCellSafe(p.r, p.c, null);
+  }
+
   markCellDirty(addr);
-  if (raw.startsWith('=') && /:\s*[A-Z]+\d{4,}/.test(raw)) {
-    warnBigRange();
-  }
-  renderVisibleCells();
-  renderCFVisible();
-  applySelectionStyles();
+
+  // =====================================================
+  // 4. Invalidate cache & render key
+  // =====================================================
+  if (typeof clearHFCache === 'function') clearHFCache();
+  if (typeof invalidateHF === 'function') invalidateHF(addr);
+  window._lastRenderKey = null;
+
+  if (raw.startsWith('=') && /:\s*[A-Z]+\d{4,}/.test(raw)) warnBigRange();
+
+  // =====================================================
+  // 5. RE-RENDER
+  // =====================================================
+  const doRender = () => {
+    try {
+      if (typeof clearHFCache === 'function') clearHFCache();
+      window._lastRenderKey = null;
+
+      // 5a. Force render cell target langsung (bypass semua cache)
+      const tr = rowEls[p.r];
+      if (tr) {
+        const td = tr.children[p.c + 1];
+        if (td) {
+          // Hapus input editor kalau masih ada
+          td.querySelectorAll('input').forEach(inp => inp.remove());
+          if (typeof forceRenderCell === 'function') {
+            forceRenderCell(td, p.r, p.c);
+            console.log('🎯 forceRenderCell:', addr, '→',
+                        JSON.stringify(td.querySelector('.cell-inner')?.textContent));
+          }
+        }
+      } else {
+        console.warn('⚠️ rowEls tidak punya row', p.r, '— forceRenderCell skip');
+      }
+
+      // 5b. Full re-render seluruh grid
+      if (typeof renderVirtual === 'function') renderVirtual(false);
+      if (typeof renderCFVisible === 'function') renderCFVisible();
+      if (typeof applySelectionStyles === 'function') applySelectionStyles();
+    } catch (e) {
+      console.warn('doRender failed:', e);
+    }
+  };
+
+  // Render 1: langsung (sync)
+  doRender();
+
+  // Render 2: 100ms (untuk HF cross-sheet evaluate)
+  setTimeout(doRender, 100);
+
+  // Render 3: 500ms (backup)
+  setTimeout(doRender, 500);
+
   scheduleSave();
+
+  // Broadcast collab
   if (window.Collab && window.Collab.isConnected()) {
     const cur = sheet().cells[addr];
     window.Collab.sendEdit({ [addr]: cur || null }, activeSheetIdx);
@@ -1471,6 +2218,8 @@ document.addEventListener('keydown', e => {
   const inputFocused = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
   const ctrl = e.ctrlKey || e.metaKey;
 
+  if (e.target && e.target.id === 'formula-input') return;
+
   if (currentAccessMode === 'view') {
     const blockedKeys = ['Backspace', 'Delete'];
     if (blockedKeys.includes(e.key)) {
@@ -1521,7 +2270,7 @@ document.addEventListener('keydown', e => {
     for (const a of parts) {
       delete sheet().cells[a];
       const pp = parseAddr(a);
-      if (pp) hf.setCellContents({ sheet: 0, row: pp.r, col: pp.c }, [[null]]);
+      if (pp) hfSet(pp.r, pp.c, null);
       markCellDirty(a);
     }
     renderVisibleCells(); renderCFVisible(); applySelectionStyles();
@@ -1530,13 +2279,101 @@ document.addEventListener('keydown', e => {
   }
 });
 
-document.getElementById('formula-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') { e.preventDefault(); commit(activeCell, e.target.value); moveSel(1, 0); }
-  else if (e.key === 'Escape') e.target.value = getRaw(activeCell);
-});
-document.getElementById('formula-input').addEventListener('blur', e => {
-  if (e.target.value !== getRaw(activeCell)) commit(activeCell, e.target.value);
-});
+/* =========================================================
+   FORMULA BAR — robust handler (capture phase)
+   ========================================================= */
+(function setupFormulaBarRobust() {
+  const fi = document.getElementById('formula-input');
+  if (!fi) return;
+
+  // Pastikan editable
+  fi.removeAttribute('readonly');
+  fi.disabled = false;
+  fi.readOnly = false;
+
+  // 🎯 Handle Enter di CAPTURE phase — jalankan sebelum handler lain
+  fi.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+
+      const val = e.target.value;
+      const targetCell = activeCell;
+
+      console.log('📝 Formula bar Enter:', JSON.stringify(val), '→', targetCell);
+
+      // Commit ke cell aktif
+      commit(targetCell, val);
+
+      // 🎯 Force re-render langsung
+      if (typeof renderVirtual === 'function') {
+        window._lastRenderKey = null;
+        renderVirtual(false);
+      }
+
+      // 🎯 Re-render setelah HF evaluate (delay untuk cross-sheet)
+      setTimeout(() => {
+        if (typeof clearHFCache === 'function') clearHFCache();
+        window._lastRenderKey = null;
+        if (typeof renderVirtual === 'function') renderVirtual(false);
+      }, 100);
+
+      // Pindah ke cell bawah (seperti Excel)
+      if (typeof moveSel === 'function') {
+        moveSel(1, 0);
+      }
+
+      // Sync formula bar dengan cell baru
+      setTimeout(() => {
+        if (fi) fi.value = getRaw(activeCell);
+      }, 20);
+    }
+    else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      e.target.value = getRaw(activeCell);
+      e.target.blur();
+    }
+    else if (e.key === 'Tab') {
+      e.preventDefault();
+      e.stopPropagation();
+      const val = e.target.value;
+
+      commit(activeCell, val);
+      if (typeof renderVirtual === 'function') {
+        window._lastRenderKey = null;
+        renderVirtual(false);
+      }
+
+      // Pindah kanan
+      if (typeof moveSel === 'function') moveSel(0, e.shiftKey ? -1 : 1);
+
+      setTimeout(() => {
+        if (fi) fi.value = getRaw(activeCell);
+      }, 20);
+    }
+  }, true);   // ← capture phase
+
+  // Blur → commit
+  fi.addEventListener('blur', e => {
+    const val = e.target.value;
+    if (val !== getRaw(activeCell)) {
+      commit(activeCell, val);
+      if (typeof renderVirtual === 'function') {
+        window._lastRenderKey = null;
+        renderVirtual(false);
+      }
+    }
+  });
+
+  // Focus → select all
+  fi.addEventListener('focus', e => {
+    setTimeout(() => e.target.select(), 0);
+  });
+
+  console.log('✅ Formula bar handler installed');
+})();
 
 /* =========================================================
    CLIPBOARD
@@ -1554,7 +2391,7 @@ function doCut() {
   for (const { addr } of clipboard) {
     delete sheet().cells[addr];
     const p = parseAddr(addr);
-    if (p) hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[null]]);
+    if (p) hfSet(p.r, p.c, null);
     markCellDirty(addr);
   }
   renderVisibleCells(); renderCFVisible(); applySelectionStyles();
@@ -1581,7 +2418,7 @@ function doPaste() {
     const target = addrOf(p.r + (sp.r - origin.r), p.c + (sp.c - origin.c));
     const tp = parseAddr(target);
     const c = sheet().cells[target];
-    if (tp) hf.setCellContents({ sheet: 0, row: tp.r, col: tp.c }, [[c?.f || c?.v || null]]);
+    if (tp) hfSet(tp.r, tp.c, c?.f || c?.v || null);
   }
   renderVisibleCells(); renderCFVisible(); applySelectionStyles();
   toast('📥 pasted');
@@ -1645,7 +2482,7 @@ document.getElementById('btn-clear-all').onclick = () => {
   for (const a of expandRange(selection.start, selection.end)) {
     delete sheet().cells[a];
     const p = parseAddr(a);
-    if (p) hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[null]]);
+    if (p) hfSet(p.r, p.c, null);
     markCellDirty(a);
   }
   renderVisibleCells(); renderCFVisible(); applySelectionStyles();
@@ -1671,6 +2508,8 @@ function undo() {
   redoStack.push(snapshot());
   const prev = JSON.parse(undoStack.pop());
   wbData.sheets = prev.sheets;
+  clearHFCache();
+  window._lastRenderKey = null;
   activeSheetIdx = Math.min(prev.activeSheet, wbData.sheets.length - 1);
   resetHF(); renderSheetTabs(); renderSheet(); markDirty(); toast('↶ undo');
 }
@@ -1688,34 +2527,133 @@ document.getElementById('btn-redo').onclick = redo;
 /* =========================================================
    SHEET TABS
    ========================================================= */
+/* =========================================================
+   RENDER SHEET TABS
+   ========================================================= */
 function renderSheetTabs() {
   const cont = document.getElementById('sheet-tabs');
   cont.innerHTML = '';
+
   wbData.sheets.forEach((s, i) => {
     const btn = document.createElement('button');
     btn.className = 'sheet-tab' + (i === activeSheetIdx ? ' active' : '');
     btn.textContent = s.name;
+
+    /* 🎯 FIX UTAMA: preventDefault saat mousedown kalau editor aktif dengan formula
+       → blur tidak fire → editor tetap hidup sampai switchSheet dipanggil */
+    btn.addEventListener('mousedown', e => {
+      if (editor && editor.input && editor.input.value.startsWith('=')) {
+        e.preventDefault();   // ← KUNCI: cegah focus shift
+      }
+    }, true);   // capture phase — jalan sebelum handler lain
+
     btn.onclick = () => switchSheet(i);
+
     btn.ondblclick = async () => {
       const n = await customPrompt('Nama sheet:', s.name, { title: 'Rename Sheet' });
-      if (n && n.trim()) { s.name = n.trim(); renderSheetTabs(); markDirty(); }
+      if (n && n.trim() && n.trim() !== s.name) {
+        const oldName = s.name;
+        s.name = n.trim();
+        markDirty();
+        // ✅ Rebuild HF karena nama sheet berubah (formula cross-sheet lama invalid)
+        try { resetHF(); } catch (e) { console.error(e); }
+        renderSheetTabs();
+        renderSheet();
+        toast(`✔ Sheet di-rename: "${oldName}" → "${s.name}"`);
+      }
     };
+
     btn.oncontextmenu = async e => {
       e.preventDefault();
       if (wbData.sheets.length <= 1) return;
-      if (await customConfirm(`Hapus sheet "${s.name}"?`, { type: 'danger', okText: 'Hapus' })) {
+      if (await customConfirm(
+        `Hapus sheet "${s.name}"?`,
+        { type: 'danger', okText: 'Hapus' }
+      )) {
         wbData.sheets.splice(i, 1);
         activeSheetIdx = Math.min(i, wbData.sheets.length - 1);
-        resetHF(); renderSheetTabs(); renderSheet(); markDirty();
+        // ✅ Rebuild HF karena sheet hilang
+        try { resetHF(); } catch (err) { console.error(err); }
+        renderSheetTabs();
+        renderSheet();
+        markDirty();
       }
     };
+
     cont.appendChild(btn);
   });
 }
-async function switchSheet(i) {
+
+/* =========================================================
+   SWITCH SHEET — dengan Cross-Sheet Reference support
+   ========================================================= */
+  async function switchSheet(i) {
   if (i === activeSheetIdx) return;
 
-  if (dirty) { try { await saveWB(); } catch {} }
+  clearHFCache();
+  window._lastRenderKey = null;
+  /* ==========================================
+     🎯 Cek editor aktif
+     ========================================== */
+  if (editor) {
+    const input = editor.input;
+    const val = input.value;
+
+    if (val.startsWith('=')) {
+      /* ------------------------------------------
+         Mode cross-sheet reference
+         Simpan state, pindah sheet, tampilkan banner
+         ------------------------------------------ */
+      console.log('🎯 Cross-sheet mode aktif. Formula:', val);
+
+      crossSheetRef = {
+        originalSheetIdx: activeSheetIdx,
+        addr: editor.addr,
+        formula: val
+      };
+
+      // Tutup editor TANPA commit (formula masih disimpan di crossSheetRef)
+      editor = null;
+      try { input.remove(); } catch (e) { /* ignore */ }
+
+      // Clear selection visual
+      document.querySelectorAll('#grid td.active, #grid td.selected')
+        .forEach(td => td.classList.remove('active', 'selected'));
+
+      // Save dulu sebelum pindah sheet
+      if (dirty) {
+        try { await saveWB(); } catch (e) { console.warn(e); }
+      }
+
+      // Pindah sheet
+      activeSheetIdx = i;
+      wbData.activeSheet = i;
+      dirtyMeta.activeSheet = true;
+
+      await resetHFLazy('Membuka sheet…');
+      renderSheetTabs();
+      renderSheet();
+
+      activeCell = 'A1';
+      selection = { start: 'A1', end: 'A1' };
+      updateSelectionUI();
+
+      // Tampilkan banner cross-sheet
+      showCrossSheetBanner();
+      return;
+    } else {
+      // Bukan formula → commit normal
+      try { closeEditor(); } catch (e) { console.warn(e); }
+    }
+  }
+
+  /* ==========================================
+     Flow normal (tanpa editor aktif)
+     ========================================== */
+
+  if (dirty) {
+    try { await saveWB(); } catch (e) { console.warn(e); }
+  }
 
   destroyChartsForSheet(activeSheetIdx);
 
@@ -1845,7 +2783,7 @@ function doSort(asc) {
   // Cari rentang baris yg ada datanya
   const rows = [];
   for (let r = 0; r < ROWS; r++) {
-    const v = hf.getCellValue({ sheet: 0, row: r, col });
+    const v = hfGet(r, col);
     if (v === '' || v === null || v === undefined) continue;
     rows.push({ r, v, cells: {} });
   }
@@ -1987,7 +2925,7 @@ function renderCFVisible() {
         for (let c = cMin; c <= cMax; c++) {
           const td = tr.children[c + 1];
           if (!td) continue;
-          const v = hf.getCellValue({ sheet: 0, row: r, col: c });
+          const v = hfGet(r,c);
           const n = Number(v);
           let match = false;
           switch (rule.type) {
@@ -2014,7 +2952,7 @@ function applyVisualCF(rule, rMin, rMax, cMin, cMax) {
   const values = [];
   for (let r = rMin; r <= rMax; r++) {
     for (let c = cMin; c <= cMax; c++) {
-      const v = Number(hf.getCellValue({ sheet: 0, row: r, col: c }));
+      const v = Number(hfGet(r,c));
       if (!isNaN(v)) values.push(v);
     }
   }
@@ -2031,7 +2969,7 @@ function applyVisualCF(rule, rMin, rMax, cMin, cMax) {
     for (let c = cMin; c <= cMax; c++) {
       const td = tr.children[c + 1];
       if (!td) continue;
-      const v = Number(hf.getCellValue({ sheet: 0, row: r, col: c }));
+      const v = Number(hfGet(r,c));
       if (isNaN(v)) continue;
       const t = (v - minV) / range; // 0..1
 
@@ -2113,7 +3051,7 @@ function applyStatisticalCF(rule, p1, p2) {
   const items = [];
   for (let r = r0; r <= r1; r++) {
     for (let c = c0; c <= c1; c++) {
-      const v = hf.getCellValue({ sheet: 0, row: r, col: c });
+      const v = hfGet(r,c);
       const n = Number(v);
       if (!isNaN(n)) items.push({ r, c, v: n });
     }
@@ -2184,13 +3122,13 @@ function readChartData() {
   const labels = [], datasets = [];
   for (const r of rowsArr) {
     const p = parseAddr(addrOf(r, colsArr[0]));
-    labels.push(String(hf.getCellValue({ sheet: 0, row: p.r, col: p.c }) ?? ''));
+    labels.push(String(hfGet(p.r,p.c) ?? ''));
   }
   for (let ci = 1; ci < colsArr.length; ci++) {
     const data = [];
     for (const r of rowsArr) {
       const p = parseAddr(addrOf(r, colsArr[ci]));
-      const v = Number(hf.getCellValue({ sheet: 0, row: p.r, col: p.c }));
+      const v = Number(hfGet(p.r,p.c));
       data.push(isNaN(v) ? 0 : v);
     }
     datasets.push({ label: 'Series ' + ci, data, backgroundColor: palette(ci - 1) });
@@ -2199,7 +3137,7 @@ function readChartData() {
     const data = [];
     for (const r of rowsArr) {
       const p = parseAddr(addrOf(r, colsArr[0]));
-      const v = Number(hf.getCellValue({ sheet: 0, row: p.r, col: p.c }));
+      const v = Number(hfGet(p.r,p.c));
       data.push(isNaN(v) ? 0 : v);
     }
     datasets.push({ label: 'Data', data, backgroundColor: palette(0) });
@@ -2260,18 +3198,18 @@ function renderCharts() {
     const parts = expandRange(s, e);
     const rows = [...new Set(parts.map(a => parseAddr(a).r))].sort((a, b) => a - b);
     const cols = [...new Set(parts.map(a => parseAddr(a).c))].sort((a, b) => a - b);
-    const labels = rows.map(r => String(hf.getCellValue({ sheet: 0, row: r, col: cols[0] }) ?? ''));
+    const labels = rows.map(r => String(hfGet(r, cols[0]) ?? ''));
     const datasets = [];
     for (let ci = 1; ci < cols.length; ci++) {
       const data = rows.map(r => {
-        const v = Number(hf.getCellValue({ sheet: 0, row: r, col: cols[ci] }));
+        const v = Number(hfGet(r, cols[ci]));
         return isNaN(v) ? 0 : v;
       });
       datasets.push({ label: 'Series ' + ci, data, backgroundColor: palette(ci - 1) });
     }
     if (!datasets.length) {
       const data = rows.map(r => {
-        const v = Number(hf.getCellValue({ sheet: 0, row: r, col: cols[0] }));
+        const v = Number(hfGet(r, cols[0]));
         return isNaN(v) ? 0 : v;
       });
       datasets.push({ label: 'Data', data, backgroundColor: palette(0) });
@@ -2361,11 +3299,64 @@ document.getElementById('zoom').oninput = e => {
    ========================================================= */
 async function saveWB(forceFull = false) {
   if (!wbId) return;
-  if (saving) {
-    saveAgain = true;
+  if (saving) { saveAgain = true; return; }
+
+  const auth = { 'Authorization': 'Bearer ' + token };
+  const statusEl = document.getElementById('save-status');
+
+  // ========== MODE CHUNK ==========
+  if (wbUsesChunks && window.Chunks) {
+    const pending = Chunks.getPendingCount();
+    const hasMeta = dirtyMeta.name || dirtyMeta.activeSheet || dirtyMeta.structure;
+
+    if (!pending && !hasMeta && !forceFull) return;
+
+    saving = true;
+    if (statusEl) statusEl.textContent = '⟳ menyimpan…';
+
+    try {
+      // Save chunks
+      if (pending > 0) {
+        const r = await Chunks.flushChanges();
+        console.log('💾 Saved', r.saved, 'blocks');
+      }
+
+      // Save metadata (rename, activeSheet, structure)
+      if (hasMeta) {
+        await fetch(`/api/sheets/${wbId}/delta`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', ...auth },
+          body: JSON.stringify({
+            sheetIdx: activeSheetIdx,
+            cells: {},
+            meta: {
+              name: dirtyMeta.name ? wbName : undefined,
+              activeSheet: dirtyMeta.activeSheet ? activeSheetIdx : undefined
+            }
+          })
+        });
+      }
+
+      for (const k of Object.keys(dirtyMeta)) delete dirtyMeta[k];
+      dirty = false;
+      saveRetryCount = 0;
+
+      if (statusEl) statusEl.textContent = '✔ tersimpan';
+      setTimeout(() => {
+        if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+      }, 1800);
+    } catch (e) {
+      console.error('Chunk save failed:', e);
+      if (statusEl) statusEl.textContent = '⚠ gagal save';
+      dirty = true;
+    } finally {
+      saving = false;
+      if (saveAgain) { saveAgain = false; saveWB(); }
+    }
     return;
   }
 
+  // ========== MODE NORMAL (data kecil) ==========
   const cellsToSave = { ...dirtyCells };
   const metaToSave = { ...dirtyMeta };
 
@@ -2374,13 +3365,11 @@ async function saveWB(forceFull = false) {
   if (!hasCells && !hasMeta && !forceFull) return;
 
   saving = true;
-  const statusEl = document.getElementById('save-status');
   if (statusEl) statusEl.textContent = '⟳ menyimpan…';
 
   try {
     let res;
     const useFull = forceFull || metaToSave.structure;
-    const auth = { 'Authorization': 'Bearer ' + token };
 
     if (useFull) {
       res = await fetch(`/api/sheets/${wbId}`, {
@@ -2416,13 +3405,9 @@ async function saveWB(forceFull = false) {
     for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
     for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
 
-    const sisaCells = Object.keys(dirtyCells).length > 0;
-    const sisaMeta = Object.keys(dirtyMeta).length > 0;
-    dirty = sisaCells || sisaMeta;
+    dirty = Object.keys(dirtyCells).length > 0 || Object.keys(dirtyMeta).length > 0;
 
-    if (statusEl) {
-      statusEl.textContent = dirty ? '● masih ada perubahan…' : '✔ tersimpan';
-    }
+    if (statusEl) statusEl.textContent = dirty ? '● masih ada perubahan…' : '✔ tersimpan';
     if (!dirty) {
       setTimeout(() => {
         if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
@@ -2431,19 +3416,13 @@ async function saveWB(forceFull = false) {
     saveRetryCount = 0;
   } catch (err) {
     console.error('save failed:', err);
-    if (statusEl) statusEl.textContent = '⚠ gagal save — akan coba lagi';
+    if (statusEl) statusEl.textContent = '⚠ gagal save';
     dirty = true;
     saveRetryCount = (saveRetryCount || 0) + 1;
-    const delay = Math.min(30000, 2000 * saveRetryCount);
-    setTimeout(() => { if (dirty && wbId) saveWB(); }, delay);
+    setTimeout(() => { if (dirty && wbId) saveWB(); }, Math.min(30000, 2000 * saveRetryCount));
   } finally {
     saving = false;
-    if (saveAgain) {
-      saveAgain = false;
-      saveWB();
-    } else if (Object.keys(dirtyCells).length > 0 || Object.keys(dirtyMeta).length > 0) {
-      saveWB();
-    }
+    if (saveAgain) { saveAgain = false; saveWB(); }
   }
 }
 
@@ -2462,14 +3441,17 @@ setInterval(() => {
   if (dirty && wbId && !saving && !autosaveTimer) saveWB();
 }, 10000);
 
+/* =========================================================
+   OPEN WORKBOOK — dengan IndexedDB cache
+   ========================================================= */
 async function openWB(id) {
   document.getElementById('home-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
 
-  if (wbId && dirty) {
-    try { await saveWB(); } catch {}
-  }
+  if (editor) closeEditor();
+  if (wbId && dirty) { try { await saveWB(); } catch {} }
 
+  // Reset state
   if (hf) { try { hf.destroy(); } catch {} hf = null; }
   chartCache.forEach((map) => {
     map.forEach(c => { try { c.destroy(); } catch {} });
@@ -2478,28 +3460,81 @@ async function openWB(id) {
   rowEls = {};
   visibleStart = -1;
   visibleEnd = -1;
+  window._lastRenderKey = null;
+  if (typeof clearHFCache === 'function') clearHFCache();
   undoStack = [];
   redoStack = [];
   if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
 
-  // ---- Loading indicator ----
   showLoading('Memuat workbook…');
 
-  let data;
+  // =====================================================
+  // 🎯 STEP 1: Cek ukuran data & status chunk
+  // =====================================================
+  let status;
   try {
-    const res = await fetch(`/api/sheets/${id}`, {
+    updateLoading('Memeriksa ukuran data…');
+    const res = await fetch(`/api/sheets/${id}/chunks-status`, {
       headers: { 'Authorization': 'Bearer ' + token }
     });
-    if (!res.ok) {
-      hideLoading();
-      return toast('Gagal memuat');
+    if (res.ok) {
+      status = await res.json();
+    } else {
+      status = { shouldUseChunks: false };
     }
-    data = await res.json();
+  } catch (e) {
+    console.warn('Status check failed, fallback to normal mode:', e);
+    status = { shouldUseChunks: false };
+  }
+
+  console.log('📊 Workbook status:', status);
+
+  // =====================================================
+  // 🎯 STEP 2: Fetch data (mode sesuai status)
+  // =====================================================
+  let data = null;
+  const useChunks = status.shouldUseChunks;
+  wbUsesChunks = useChunks;
+
+  try {
+    if (useChunks) {
+      // === MODE CHUNK ===
+      console.log('📦 Using CHUNK mode (data besar)');
+      updateLoading('Memuat metadata (mode cepat)…');
+
+      const res = await fetch(`/api/sheets/${id}?light=1`, {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      data = await res.json();
+
+      // Init chunk loader
+      if (window.Chunks) {
+        updateLoading('Menyiapkan chunk loader…');
+        await Chunks.init(id, token);
+      }
+    } else {
+      // === MODE NORMAL (data kecil) ===
+      console.log('📄 Using NORMAL mode (data kecil)');
+      updateLoading('Mengunduh data lengkap…');
+
+      const res = await fetch(`/api/sheets/${id}`, {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      data = await res.json();
+
+      // Clear chunk loader state (biar tidak konflik)
+      if (window.Chunks && Chunks.clearAll) Chunks.clearAll();
+    }
   } catch (e) {
     hideLoading();
     return toast('Gagal memuat: ' + e.message);
   }
 
+  // =====================================================
+  // 🎯 STEP 3: Set state
+  // =====================================================
   updateLoading('Menyiapkan tampilan…');
   await yieldToUI();
 
@@ -2507,33 +3542,52 @@ async function openWB(id) {
   wbName = data.name;
   const wbNameEl = document.getElementById('wb-name');
   if (wbNameEl) wbNameEl.value = wbName;
+
   wbData = normalizeWB(data.data);
   activeSheetIdx = wbData.activeSheet || 0;
   clearDelta();
 
+  // Kalau chunk mode: cells dikosongkan (akan di-load per block)
+  // Kalau normal mode: cells dari data apa adanya
+  if (useChunks) {
+    wbData.sheets.forEach(s => { s.cells = {}; });
+  }
+
+  // =====================================================
+  // 🎯 STEP 4: Build HF
+  // =====================================================
   const cellCount = Object.keys(sheet().cells || {}).length;
-  if (cellCount > 2000) {
-    updateLoading('Membangun formula engine (' + cellCount.toLocaleString('id-ID') + ' sel)…');
+  if (cellCount > 5000) {
+    updateLoading(`Membangun formula engine (${cellCount.toLocaleString('id-ID')} sel)…`);
   }
   await resetHFLazy('Membangun formula engine…');
 
+  // =====================================================
+  // 🎯 STEP 5: Render
+  // =====================================================
   renderSheetTabs();
   const gridWrapEl = document.getElementById('grid-wrap');
   if (gridWrapEl) gridWrapEl.scrollTop = 0;
+
   renderSheet();
   selectCell('A1');
-
   document.getElementById('modal-sheets')?.classList.add('hidden');
   hideLoading();
 
+  // =====================================================
+  // 🎯 STEP 6: Access mode & Collab
+  // =====================================================
   currentAccessMode = data.access || 'owner';
   applyReadOnlyMode(currentAccessMode === 'view');
+
   if (data.access === 'view') {
-    toast('👁 Mode lihat saja — Anda tidak dapat mengedit');
+    toast('👁 Mode lihat saja');
+  } else if (useChunks) {
+    toast('📦 Mode chunk (data besar) — super cepat');
   }
-  if (window.Collab) {
-    window.Collab.connect(wbId, token);
-  }
+
+  if (window.Collab) window.Collab.connect(wbId, token);
+  if (typeof applySheetProtection === 'function') applySheetProtection();
 }
 
 function normalizeWB(d) {
@@ -2934,22 +3988,40 @@ document.getElementById('file-input').onchange = async e => {
   if (!f) return;
   e.target.value = '';
 
+  // Validasi
+  const MAX_SIZE = 50 * 1024 * 1024;
+  if (f.size > MAX_SIZE) {
+    return toast(`⚠ File terlalu besar (${(f.size / 1024 / 1024).toFixed(1)} MB). Maks 50 MB.`);
+  }
+
   if (!wbId) {
     await newWB();
     return;
   }
 
+  const ok = await customConfirm(
+    `Import file "${f.name}"?\n\nSemua sheet di file ini akan menggantikan data di workbook saat ini.`,
+    { type: 'warn', okText: 'Import', cancelText: 'Batal' }
+  );
+  if (!ok) return;
+
   const fd = new FormData();
   fd.append('file', f);
 
-  showLoading('Mengimpor file…');
+  showLoading(`Mengimpor "${f.name}" (${(f.size / 1024 / 1024).toFixed(1)} MB)…`);
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
     const res = await fetch(`/api/sheets/${wbId}/import`, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + token },
-      body: fd
+      body: fd,
+      signal: controller.signal
     });
+
+    clearTimeout(timeout);
 
     if (!res.ok) {
       let errMsg = 'Import gagal';
@@ -2958,20 +4030,34 @@ document.getElementById('file-input').onchange = async e => {
         errMsg = j.error || errMsg;
       } catch {}
       hideLoading();
-      toast('⚠ ' + errMsg);
-      return;
+      return toast('⚠ ' + errMsg);
     }
 
     const result = await res.json();
-    // Save dulu, baru reload
-    clearDelta();
+
+    updateLoading(`Memuat ${result.sheets} sheet…`);
+    await yieldToUI();
+
+    // 🎯 Reload workbook
     await openWB(wbId);
-    toast(`✔ Import ${result.cells} sel`);
-  } catch (err) {
-    console.error('Import client error:', err);
-    toast('⚠ Import gagal: ' + err.message);
-  } finally {
+
     hideLoading();
+
+    // Toast dengan info lengkap
+    const sheetNames = (result.sheetNames || []).slice(0, 3).join(', ');
+    const more = result.sheetNames?.length > 3 ? ` +${result.sheetNames.length - 3} lainnya` : '';
+    toast(
+      `✔ Import ${result.cells.toLocaleString('id-ID')} sel ` +
+      `dari ${result.sheets} sheet: ${sheetNames}${more}`
+    );
+  } catch (err) {
+    hideLoading();
+    if (err.name === 'AbortError') {
+      toast('⚠ Import timeout — file terlalu besar');
+    } else {
+      console.error('Import error:', err);
+      toast('⚠ ' + err.message);
+    }
   }
 };
 
@@ -3455,7 +4541,7 @@ function computeSheetValuesForPrint(sheetObj) {
   for (let r = 0; r < maxR; r++) {
     const row = [];
     for (let c = 0; c < maxC; c++) {
-      const v = tempHF.getCellValue({ sheet: 0, row: r, col: c });
+      const v = temphfGet(r,c);
       if (v === null || v === undefined) row.push('');
       else if (typeof v === 'object') row.push(v.value ?? '');
       else row.push(v);
@@ -4060,60 +5146,133 @@ openEditor = function(addr, initial) {
 };
 
 /* =========================================================
-   INSERT REFERENCE SAAT EDIT FORMULA — versi simple + highlight
+   GLOBAL GUARD — cegah blur saat formula aktif
+   Capture phase paling atas, cegah focus shift
    ========================================================= */
-let refDragState = null;   // { startAddr, curAddr }
-
-document.getElementById('grid').addEventListener('mousedown', e => {
+document.addEventListener('mousedown', e => {
   if (!editor) return;
   const input = editor.input;
-  if (!input.value.startsWith('=')) return;
+  if (!input || !input.value.startsWith('=')) return;
+
+  // Target adalah input editor sendiri → biarkan
+  if (e.target === input) return;
+
+  // 🎯 PENGECUALIAN: formula bar, input, dropdown, dialog
+  if (e.target.closest('#formula-input')) return;    // ← TAMBAHKAN
+  if (e.target.tagName === 'INPUT') return;           // ← TAMBAHKAN (semua input)
+  if (e.target.tagName === 'TEXTAREA') return;        // ← TAMBAHKAN
+  if (e.target.closest('#fx-suggest')) return;
+  if (e.target.closest('.custom-dialog-overlay')) return;
+  if (e.target.closest('.val-dropdown')) return;
+  if (e.target.closest('.modal')) return;             // ← TAMBAHKAN (modal)
+  if (e.target.closest('.sheet-tab')) return;         // ← sheet tab biarkan
+  if (e.target.closest('button')) return;             // ← tombol biarkan
+
+  // Sisanya (grid cell, dll) → preventDefault
+  e.preventDefault();
+}, true);
+
+/* =========================================================
+   INSERT REFERENCE + DRAG RANGE
+   ========================================================= */
+/* =========================================================
+   REF DRAG — support editor normal + cross-sheet mode
+   ========================================================= */
+let refDrag = null;
+
+document.getElementById('grid').addEventListener('mousedown', e => {
+  // 🎯 Cek 2 kondisi: editor normal ATAU crossSheetRef aktif
+  const isEditorMode = !!editor && editor.input?.value?.startsWith('=');
+  const isCrossMode = !!crossSheetRef;
+
+  if (!isEditorMode && !isCrossMode) return;
 
   const td = e.target.closest('td[data-addr]');
   if (!td) return;
-  if (td === input.closest('td')) return;
-  insertingRefMode = true;
+
+  // Skip kalau klik di cell yang sama dengan editor
+  if (isEditorMode && td === editor.input.closest('td')) return;
 
   e.preventDefault();
-  e.stopImmediatePropagation();
-  hideFxSuggest();
+  e.stopPropagation();
+
+  insertingRefMode = true;
+  if (typeof hideFxSuggest === 'function') hideFxSuggest();
 
   const startAddr = td.dataset.addr;
   let curAddr = startAddr;
+  const mode = isCrossMode ? 'CROSS' : 'EDITOR';
 
-  // Highlight langsung
+  console.log(`[RefDrag] START [${mode}]:`, startAddr);
+
   highlightRefRange(startAddr, startAddr);
 
-  const moveHandler = ev => {
-    const moveTd = document.elementFromPoint(ev.clientX, ev.clientY)
-      ?.closest('td[data-addr]');
-    if (!moveTd) return;
-    const newAddr = moveTd.dataset.addr;
-    if (newAddr === curAddr) return;
-    curAddr = newAddr;
-    highlightRefRange(startAddr, curAddr);
+  refDrag = { startAddr, curAddr, mode };
+
+  // RAF loop untuk track cursor
+  let lastX = e.clientX, lastY = e.clientY;
+  let rafId = null, stopped = false;
+
+  const trackCursor = () => {
+    if (stopped) return;
+    const el = document.elementFromPoint(lastX, lastY);
+    const moveTd = el?.closest('td[data-addr]');
+    if (moveTd) {
+      const newAddr = moveTd.dataset.addr;
+      if (newAddr !== curAddr) {
+        curAddr = newAddr;
+        refDrag.curAddr = curAddr;
+        console.log(`[RefDrag] DRAG [${mode}]:`, startAddr, '→', curAddr);
+        highlightRefRange(startAddr, curAddr);
+      }
+    }
+    rafId = requestAnimationFrame(trackCursor);
   };
+  rafId = requestAnimationFrame(trackCursor);
 
-  const upHandler = () => {
-    document.removeEventListener('mousemove', moveHandler);
-    document.removeEventListener('mouseup', upHandler);
+  const onMove = ev => { lastX = ev.clientX; lastY = ev.clientY; };
 
-    const refText = (startAddr === curAddr)
-      ? startAddr
-      : `${startAddr}:${curAddr}`;
-    insertRefToEditor(refText);
+  const onUp = () => {
+    stopped = true;
+    if (rafId) cancelAnimationFrame(rafId);
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+
+    const endAddr = refDrag?.curAddr || startAddr;
+    const refText = (startAddr === endAddr) ? startAddr : `${startAddr}:${endAddr}`;
+
+    console.log(`[RefDrag] END [${mode}]:`, refText);
+
+        if (isCrossMode) {
+      const rawName = wbData.sheets[activeSheetIdx].name;
+
+      // 🎯 Auto-quote kalau perlu
+      const needsQuote = /[\s\-\.\(\)]/.test(rawName) || /^[0-9]/.test(rawName);
+      const sheetName = needsQuote
+        ? "'" + rawName.replace(/'/g, "''") + "'"
+        : rawName;
+
+      const fullRef = (startAddr === endAddr)
+        ? `${sheetName}!${startAddr}`
+        : `${sheetName}!${startAddr}:${endAddr}`;
+
+      insertCrossSheetRef2(fullRef);
+    } else {
+      insertRefToEditor(refText);
+    }
+
+    refDrag = null;
     setTimeout(clearRefHighlight, 800);
-
     setTimeout(() => { insertingRefMode = false; }, 200);
   };
 
-  document.addEventListener('mousemove', moveHandler);
-  document.addEventListener('mouseup', upHandler);
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
 }, true);
 
-/* Clear saat cell diklik biasa (bukan saat insert ref) */
+/* Clear highlight saat klik biasa (bukan insert ref) */
 document.addEventListener('mousedown', e => {
-  if (editor) return;
+  if (editor) return;   // jangan clear kalau sedang edit
   if (e.target.closest('#grid')) {
     clearRefHighlight();
   }
@@ -4183,7 +5342,7 @@ document.getElementById('btn-merge')?.addEventListener('click', () => {
       if (v !== undefined && v !== null && v !== '') parts.push(String(v));
       if (a !== tlAddr) {
         delete sheet().cells[a];
-        try { hf.setCellContents({ sheet: 0, row: r, col: c }, [[null]]); } catch {}
+        try { hfSet(r, c, raw); } catch {}
         markCellDirty(a);
       }
     }
@@ -4290,11 +5449,11 @@ function openFilterPopup(colIdx, thEl) {
   closeFilterPopup();
   const rect = thEl.getBoundingClientRect();
 
-  // Ambil unique values dari kolom
   const values = new Map();
   for (const a of Object.keys(sheet().cells || {})) {
     const p = parseAddr(a);
     if (!p || p.c !== colIdx) continue;
+    if (p.r === 0) continue;
     const v = sheet().cells[a]?.v;
     if (v === undefined || v === null || v === '') continue;
     const key = String(v);
@@ -4829,7 +5988,7 @@ function deleteSelectedRowsAndCols() {
     if (rows.includes(p.r) || cols.includes(p.c)) {
       delete sheet().cells[a];
       markCellDirty(a);
-      try { hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[null]]); } catch {}
+      try { hfSet(p.r, p.c, null); } catch {}
     }
   }
 
@@ -4921,6 +6080,7 @@ document.querySelectorAll('#file-dropdown .fd-item').forEach(btn => {
       case 'export-csv': exportFile('csv'); break;
       case 'export-pdf': exportFile('pdf'); break;
       case 'logout': document.getElementById('btn-logout')?.click(); break;
+      case 'optimize': optimizeWorkbook(); break;
     }
   });
 });
@@ -5504,7 +6664,7 @@ function doFind() {
       } else {
         // Nilai terhitung kalau ada formula, kalau tidak pakai raw
         if (sIdx === activeSheetIdx && cell.f && hf) {
-          try { text = hf.getCellValue({ sheet: 0, row: p.r, col: p.c }); }
+          try { text = hfGet(p.r,p.c); }
           catch { text = cell.v; }
         } else {
           text = cell.v;
@@ -5684,7 +6844,7 @@ function replaceOne() {
   if (sIdx === activeSheetIdx) {
     const p = parseAddr(m.addr);
     try {
-      hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[cell.f || cell.v]]);
+      hfSet(p.r, p.c, cell.f || cell.v);
     } catch {}
   }
 
@@ -5731,7 +6891,7 @@ function replaceAll() {
       }
       if (sIdx === activeSheetIdx) {
         const p = parseAddr(m.addr);
-        try { hf.setCellContents({ sheet: 0, row: p.r, col: p.c }, [[cell.f || cell.v]]); } catch {}
+        try { hfSet(p.r, p.c, cell.f || cell.v); } catch {}
       }
       markCellDirty(m.addr);
       replaced++;
@@ -6040,7 +7200,7 @@ function applyMultiSort(keys, hasHeader) {
       let v;
       const cell = item.cells[k.c];
       if (cell?.f) {
-        try { v = hf.getCellValue({ sheet: 0, row: item.r, col: k.c }); }
+        try { v = hfGet(item.r, k.c); }
         catch { v = cell.v ?? ''; }
       } else {
         v = cell?.v ?? '';
@@ -6156,7 +7316,7 @@ document.getElementById('btn-dup-apply')?.addEventListener('click', () => {
       const cell = sheet().cells[addrOf(r, c)];
       let v;
       if (cell?.f) {
-        try { v = hf.getCellValue({ sheet: 0, row: r, col: c }); }
+        try { v = hfGet(r,c); }
         catch { v = cell.v ?? ''; }
       } else {
         v = cell?.v ?? '';
@@ -6407,18 +7567,22 @@ switchSheet = async function (i) {
    ========================================================= */
 function freezeTopRow() {
   sheet().freezeRow = 1;
+  sheet().freezeCol = 0;
   markMetaDirty('structure');
   visibleStart = -1;
+  visibleEnd = -1;
   renderSheet();
-  toast('❄️ Baris atas di-freeze');
+  toast('Baris 1 di-freeze');
 }
 
 function freezeFirstCol() {
+  sheet().freezeRow = 0;
   sheet().freezeCol = 1;
   markMetaDirty('structure');
   visibleStart = -1;
+  visibleEnd = -1;
   renderSheet();
-  toast('❄️ Kolom pertama di-freeze');
+  toast('Kolom A di-freeze');
 }
 
 function freezeHere() {
@@ -6428,21 +7592,22 @@ function freezeHere() {
     return toast('Pilih sel di luar A1');
   }
 
-  // Freeze sampai DENGAN sel aktif (include)
-  sheet().freezeRow = p.r + 1;
-  sheet().freezeCol = p.c + 1;
+  const MAX_FREEZE_ROW = 4;
+  const MAX_FREEZE_COL = 3;
+  const fr = Math.min(p.r, MAX_FREEZE_ROW);
+  const fc = Math.min(p.c, MAX_FREEZE_COL);
 
-  // Batasi maksimal agar tidak bikin UI kacau
-  const MAX_FREEZE_ROW = 20;
-  const MAX_FREEZE_COL = 8;
-  if (sheet().freezeRow > MAX_FREEZE_ROW) sheet().freezeRow = MAX_FREEZE_ROW;
-  if (sheet().freezeCol > MAX_FREEZE_COL) sheet().freezeCol = MAX_FREEZE_COL;
+  if (fr === 0 && fc === 0) {
+    return toast('Pilih sel yang lebih jauh dari A1');
+  }
 
+  sheet().freezeRow = fr;
+  sheet().freezeCol = fc;
   markMetaDirty('structure');
   visibleStart = -1;
   visibleEnd = -1;
   renderSheet();
-  toast(`Freeze sampai baris ${sheet().freezeRow}, kolom ${colName(sheet().freezeCol - 1)}`);
+  toast(`Freeze ${fr} baris + ${fc} kolom`);
 }
 
 function unfreezeAll() {
@@ -6450,8 +7615,9 @@ function unfreezeAll() {
   sheet().freezeCol = 0;
   markMetaDirty('structure');
   visibleStart = -1;
+  visibleEnd = -1;
   renderSheet();
-  toast('❄️ Freeze dihapus');
+  toast('Freeze dihapus');
 }
 
 document.getElementById('btn-freeze-top')?.addEventListener('click', freezeTopRow);
@@ -6611,11 +7777,8 @@ function applyFreezeCols(frozenColCount) {
   }
 
   document.querySelectorAll('#grid tbody tr').forEach(tr => {
-    const th = tr.firstElementChild;
-    if (th) {
-      th.style.left = '0';
-      th.style.zIndex = '7';
-    }
+    const isFrozenRow = tr.classList.contains('frozen-row');
+
     tr.querySelectorAll('td[data-addr]').forEach(td => {
       const p = parseAddr(td.dataset.addr);
       if (!p) return;
@@ -6623,7 +7786,7 @@ function applyFreezeCols(frozenColCount) {
         td.classList.add('freeze-col');
         td.style.position = 'sticky';
         td.style.left = colOffsets[p.c] + 'px';
-        td.style.zIndex = tr.classList.contains('frozen-row') ? '9' : '6';
+        td.style.zIndex = isFrozenRow ? '9' : '6';
       } else {
         td.classList.remove('freeze-col');
         td.style.position = '';
@@ -7239,3 +8402,217 @@ document.addEventListener('keydown', e => {
     }
   }
 }, true);
+/* =========================================================
+   CROSS-SHEET REFERENCE (Excel-like)
+   ========================================================= */
+function showCrossSheetBanner() {
+  if (!crossSheetRef) return;
+  const banner = document.getElementById('cross-sheet-banner');
+  const target = document.getElementById('cs-target');
+  const formula = document.getElementById('cs-formula');
+  if (!banner) return;
+
+  const originalSheet = wbData.sheets[crossSheetRef.originalSheetIdx];
+  target.textContent = `Menyunting rumus untuk ${originalSheet.name}!${crossSheetRef.addr}`;
+  formula.textContent = crossSheetRef.formula;
+  banner.classList.remove('hidden');
+
+  // Highlight cell target di sheet asli (tidak terlihat, tapi state)
+  console.log('🎯 Cross-sheet mode:', crossSheetRef);
+}
+
+function hideCrossSheetBanner() {
+  const banner = document.getElementById('cross-sheet-banner');
+  if (banner) banner.classList.add('hidden');
+}
+
+// function insertCrossSheetRef(sheetName, addr) {
+//   if (!crossSheetRef) return;
+//   const ref = `${sheetName}!${addr}`;
+//   crossSheetRef.formula += ref;
+
+//   const formula = document.getElementById('cs-formula');
+//   if (formula) formula.textContent = crossSheetRef.formula;
+// }
+
+/* Insert cross-sheet ref langsung (dengan prefix sheet name) */
+/* =========================================================
+   INSERT CROSS-SHEET REF — dengan auto-quote
+   ========================================================= */
+function insertCrossSheetRef2(fullRef) {
+  if (!crossSheetRef) return;
+
+  // 🎯 Auto-quote nama sheet kalau ada spasi / karakter spesial
+  // fullRef format: "SheetName!A1" atau "SheetName!A1:B5"
+  const m = /^(.+?)!(.+)$/.exec(fullRef);
+  if (m) {
+    const [, sheetName, refPart] = m;
+
+    // Cek apakah perlu quote: ada spasi, tanda hubung, titik, atau mulai dengan angka
+    const needsQuote = /[\s\-\.\(\)]/.test(sheetName) || /^[0-9]/.test(sheetName);
+
+    let safeSheetName = sheetName;
+    if (needsQuote && !sheetName.startsWith("'")) {
+      // Escape single quote dalam nama sheet ('' = escaped)
+      safeSheetName = "'" + sheetName.replace(/'/g, "''") + "'";
+    }
+
+    fullRef = safeSheetName + '!' + refPart;
+  }
+
+  crossSheetRef.formula += fullRef;
+
+  const formula = document.getElementById('cs-formula');
+  if (formula) formula.textContent = crossSheetRef.formula;
+
+  console.log('✍ Cross-sheet ref ditambahkan:', fullRef);
+  console.log('   Formula sekarang:', crossSheetRef.formula);
+
+  if (typeof toast === 'function') toast('✔ ' + fullRef);
+}
+
+function insertCrossSheetRange(sheetName, startAddr, endAddr) {
+  if (!crossSheetRef) return;
+  const ref = `${sheetName}!${startAddr}:${endAddr}`;
+  crossSheetRef.formula += ref;
+
+  const formula = document.getElementById('cs-formula');
+  if (formula) formula.textContent = crossSheetRef.formula;
+}
+
+async function finishCrossSheetEdit() {
+  if (!crossSheetRef) return;
+  const { originalSheetIdx, addr, formula } = crossSheetRef;
+
+  // Simpan dulu reference
+  const refBackup = crossSheetRef;
+
+  // Switch ke sheet asli
+  crossSheetRef = null;
+  hideCrossSheetBanner();
+
+  // Cek formula lengkap
+  if (!isFormulaComplete(formula)) {
+    toast('⚠ Formula belum lengkap');
+    crossSheetRef = refBackup;
+    showCrossSheetBanner();
+    return;
+  }
+
+  // Switch ke sheet asli
+  await switchSheet(originalSheetIdx);
+
+  // Commit formula di cell target
+  const p = parseAddr(addr);
+  if (p) {
+    ensureCell(addr);
+    sheet().cells[addr].f = formula;
+    delete sheet().cells[addr].v;
+    setHFCellSafe(p.r, p.c, formula);
+    markCellDirty(addr);
+    renderVisibleCells();
+    renderCFVisible();
+    toast('✔ Formula disimpan');
+  }
+}
+
+function cancelCrossSheetEdit() {
+  if (!crossSheetRef) return;
+  const originalIdx = crossSheetRef.originalSheetIdx;
+  crossSheetRef = null;
+  hideCrossSheetBanner();
+  // Kembali ke sheet asli tanpa commit
+  switchSheet(originalIdx);
+  toast('Dibatalkan');
+}
+
+// Bind tombol
+document.getElementById('cs-finish')?.addEventListener('click', finishCrossSheetEdit);
+document.getElementById('cs-cancel')?.addEventListener('click', cancelCrossSheetEdit);
+
+// Enter di banner → finish
+document.addEventListener('keydown', e => {
+  if (!crossSheetRef) return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    finishCrossSheetEdit();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelCrossSheetEdit();
+  }
+}, true);
+
+/* =========================================================
+   INDEXEDDB CACHE
+   ========================================================= */
+const IDB = {
+  db: null,
+  async open() {
+    if (this.db) return this.db;
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('tabelin-cache', 1);
+      req.onupgradeneeded = e => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('workbooks')) {
+          db.createObjectStore('workbooks', { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => { this.db = req.result; resolve(this.db); };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async set(id, data) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('workbooks', 'readwrite');
+      tx.objectStore('workbooks').put({ id, data, ts: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  async get(id) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('workbooks', 'readonly');
+      const req = tx.objectStore('workbooks').get(id);
+      req.onsuccess = () => resolve(req.result?.data || null);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async clear() {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('workbooks', 'readwrite');
+      tx.objectStore('workbooks').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+};
+async function optimizeWorkbook() {
+  if (!wbId) return toast('Buka workbook dulu');
+  if (wbUsesChunks) return toast('Sudah dalam mode chunk');
+
+  const ok = await customConfirm(
+    'Optimize workbook? Data akan dipindah ke format chunk untuk loading lebih cepat.\n\nData asli tetap tersimpan.',
+    { type: 'question', okText: 'Optimize' }
+  );
+  if (!ok) return;
+
+  showLoading('Mengoptimasi…');
+  try {
+    const res = await fetch(`/api/sheets/${wbId}/chunk-migrate`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Gagal');
+
+    hideLoading();
+    toast(`✔ ${result.blocks} block dibuat`);
+    await openWB(wbId);   // reload dengan chunk mode
+  } catch (e) {
+    hideLoading();
+    toast('⚠ ' + e.message);
+  }
+}
