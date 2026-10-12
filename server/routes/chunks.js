@@ -119,7 +119,7 @@ router.post('/:id/chunk-migrate', wrap(async (req, res) => {
   if (!a) return res.status(404).json({ error: 'Not found' });
   if (a.access === 'view') return res.status(403).json({ error: 'Read-only' });
 
-  const BLOCK_ROWS = 256;
+  const BLOCK_ROWS = 1000;
   const sid = parseInt(req.params.id, 10);
 
   const { rows } = await pool.query(
@@ -196,6 +196,24 @@ router.get('/:id/chunks-status', wrap(async (req, res) => {
     shouldUseChunks,
     threshold: THRESHOLD
   });
+}));
+
+/* =========================================================
+   GET /:id/full — ambil semua cells langsung (untuk data kecil)
+   Lebih cepat dari chunk untuk data < 20 MB
+   ========================================================= */
+router.get('/:id/full', wrap(async (req, res) => {
+  const a = await checkAccess(req.params.id, req.user.id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+
+  const { rows } = await pool.query(
+    `SELECT data FROM sheets WHERE id = $1::int`,
+    [req.params.id]
+  );
+
+  if (!rows.length) return res.status(404).json({ error: 'Not found' });
+
+  res.json(rows[0].data || {});
 }));
 
 export default router;

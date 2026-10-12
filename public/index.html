@@ -348,17 +348,84 @@
       </div>
       <div class="ribbon-group-label">Number</div>
     </div>
-    <div class="ribbon-group">
+        <div class="ribbon-group">
       <div class="ribbon-group-body">
-        <select id="border-style" title="Borders">
-          <option value="">None</option>
-          <option value="all">All</option>
-          <option value="outer">Outer</option>
-          <option value="top">Top</option>
-          <option value="bottom">Bottom</option>
-          <option value="left">Left</option>
-          <option value="right">Right</option>
-        </select>
+        <!-- Tombol dropdown border -->
+        <div class="border-dropdown-wrap">
+          <button class="rib" id="btn-border-menu" title="Border">
+            <i class="fa-solid fa-border-all"></i>
+            <i class="fa-solid fa-caret-down" style="font-size:8px;margin-left:2px"></i>
+          </button>
+          <div class="border-dropdown-menu hidden" id="border-menu">
+            <div class="bdm-section">
+              <div class="bdm-label">Preset</div>
+              <div class="bdm-grid">
+                <button data-border="all" title="All Borders">
+                  <i class="fa-solid fa-border-all"></i>
+                </button>
+                <button data-border="outer" title="Outer Borders">
+                  <i class="fa-solid fa-border-none"></i>
+                </button>
+                <button data-border="inner" title="Inner Borders">
+                  <i class="fa-solid fa-table-cells"></i>
+                </button>
+                <button data-border="top" title="Top Border">
+                  <i class="fa-solid fa-arrow-up-long"></i>
+                </button>
+                <button data-border="bottom" title="Bottom Border">
+                  <i class="fa-solid fa-arrow-down-long"></i>
+                </button>
+                <button data-border="left" title="Left Border">
+                  <i class="fa-solid fa-arrow-left-long"></i>
+                </button>
+                <button data-border="right" title="Right Border">
+                  <i class="fa-solid fa-arrow-right-long"></i>
+                </button>
+                <button data-border="none" title="No Border">
+                  <i class="fa-solid fa-ban"></i>
+                </button>
+              </div>
+            </div>
+
+            <div class="bdm-section">
+              <div class="bdm-label">Style</div>
+              <div class="bdm-grid bdm-styles" id="border-style-list">
+                <button data-style="thin" class="active">
+                  <span style="border-bottom:1px solid #111;width:24px;display:block"></span>
+                </button>
+                <button data-style="medium">
+                  <span style="border-bottom:2px solid #111;width:24px;display:block"></span>
+                </button>
+                <button data-style="thick">
+                  <span style="border-bottom:3px solid #111;width:24px;display:block"></span>
+                </button>
+                <button data-style="dashed">
+                  <span style="border-bottom:1px dashed #111;width:24px;display:block"></span>
+                </button>
+                <button data-style="dotted">
+                  <span style="border-bottom:1px dotted #111;width:24px;display:block"></span>
+                </button>
+                <button data-style="double">
+                  <span style="border-bottom:3px double #111;width:24px;display:block"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="bdm-section">
+              <div class="bdm-label">Color</div>
+              <div class="bdm-colors" id="border-color-list">
+                <button data-color="#000000" class="active" style="background:#000000"></button>
+                <button data-color="#dc2626" style="background:#dc2626"></button>
+                <button data-color="#059669" style="background:#059669"></button>
+                <button data-color="#2563eb" style="background:#2563eb"></button>
+                <button data-color="#f59e0b" style="background:#f59e0b"></button>
+                <button data-color="#7c3aed" style="background:#7c3aed"></button>
+                <button data-color="#64748b" style="background:#64748b"></button>
+                <button data-color="#ffffff" style="background:#ffffff;border:1px solid #ddd"></button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="ribbon-group-label">Borders</div>
     </div>

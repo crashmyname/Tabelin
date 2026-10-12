@@ -842,7 +842,7 @@ function renderVirtual(fastMode = false) {
   // =====================================================
   // 🎯 Load chunk untuk range visible
   // =====================================================
-  if (window.Chunks) {
+    if (window.Chunks) {
     const blockRowsNeeded = new Set();
     const BLOCK_ROWS = Chunks.BLOCK_ROWS;
     for (let di = startRow; di < endRow; di++) {
@@ -855,16 +855,19 @@ function renderVirtual(fastMode = false) {
       needsLoad.push(Chunks.ensureBlockLoaded(activeSheetIdx, b));
     }
 
-    // Kalau ada yang perlu di-load, tunggu selesai baru render
-    const allLoaded = Array.from(blockRowsNeeded).every(b => {
-      const key = activeSheetIdx + ':' + b;
-      return Chunks.getCell && Chunks.getCell(activeSheetIdx, 'A' + (b + 1)) !== undefined;
-    });
-
+    // 🎯 Setelah block yang visible ke-load, load berikutnya di background
     Promise.all(needsLoad).then(() => {
-      // Re-render setelah chunk loaded
+      // Re-render cepat
       window._lastRenderKey = null;
       requestAnimationFrame(() => renderVirtual(fastMode));
+
+      // 🎯 Background: load 3 block berikutnya untuk smooth scroll
+      const nextBlocks = [];
+      for (let i = 1; i <= 3; i++) {
+        const nextBlock = Math.max(...blockRowsNeeded) + i * BLOCK_ROWS;
+        nextBlocks.push(Chunks.ensureBlockLoaded(activeSheetIdx, nextBlock));
+      }
+      Promise.all(nextBlocks).catch(() => {});
     });
   }
 
@@ -1514,6 +1517,83 @@ function computeMergePixelSize(merge) {
   return { totalW, totalH };
 }
 
+/* =========================================================
+   BORDER STYLE MAP
+   ========================================================= */
+const BORDER_STYLE_MAP = {
+  thin:    '1px',
+  medium:  '2px',
+  thick:   '3px',
+  dashed:  '1px',
+  dotted:  '1px',
+  double:  '3px'
+};
+
+const BORDER_TYPE_MAP = {
+  thin:   'solid',
+  medium: 'solid',
+  thick:  'solid',
+  dashed: 'dashed',
+  dotted: 'dotted',
+  double: 'double'
+};
+
+/* Format 1 sisi border → CSS value */
+function formatBorderValue(styleKey, color) {
+  if (!styleKey) return '';
+  const width = BORDER_STYLE_MAP[styleKey] || '1px';
+  const type = BORDER_TYPE_MAP[styleKey] || 'solid';
+  const c = color || '#111111';
+  return `${width} ${type} ${c}`;
+}
+
+/* Terapkan border dinamis ke td */
+function applyBorder(td, s) {
+  const defaultBorder = '1px solid #e9eef4';
+  const b = s.borders || {};
+  const style = b.style || 'thin';
+  const color = b.color || '#111111';
+
+  // Reset ke default dulu
+  td.style.borderTop = defaultBorder;
+  td.style.borderBottom = defaultBorder;
+  td.style.borderLeft = defaultBorder;
+  td.style.borderRight = defaultBorder;
+
+  const borderVal = formatBorderValue(style, color);
+
+  // Preset: all, outer, inner, top, bottom, left, right, none
+  const preset = b.preset || (b.all ? 'all' : null);
+
+  if (preset === 'none') {
+    td.style.borderTop = '1px solid #e9eef4';
+    td.style.borderBottom = '1px solid #e9eef4';
+    td.style.borderLeft = '1px solid #e9eef4';
+    td.style.borderRight = '1px solid #e9eef4';
+    return;
+  }
+
+  if (preset === 'all' || b.all) {
+    td.style.borderTop = borderVal;
+    td.style.borderBottom = borderVal;
+    td.style.borderLeft = borderVal;
+    td.style.borderRight = borderVal;
+  } else if (preset === 'outer') {
+    // Cek posisi di selection — kalau di border, apply
+    // Sederhananya: apply ke semua, tapi tandai outer
+    // (Detail: nanti ada flag khusus dari handler)
+    td.style.borderTop = b.top ? borderVal : '1px solid #e9eef4';
+    td.style.borderBottom = b.bottom ? borderVal : '1px solid #e9eef4';
+    td.style.borderLeft = b.left ? borderVal : '1px solid #e9eef4';
+    td.style.borderRight = b.right ? borderVal : '1px solid #e9eef4';
+  } else {
+    if (b.top) td.style.borderTop = borderVal;
+    if (b.bottom) td.style.borderBottom = borderVal;
+    if (b.left) td.style.borderLeft = borderVal;
+    if (b.right) td.style.borderRight = borderVal;
+  }
+}
+
 function applyFormat(td, s) {
   td.style.fontWeight = s.bold ? '700' : '';
   td.style.fontStyle = s.italic ? 'italic' : '';
@@ -1527,17 +1607,8 @@ function applyFormat(td, s) {
   td.style.textAlign = s.align || '';
   td.classList.toggle('wrap', !!s.wrap);
 
-  td.style.borderTop = td.style.borderBottom =
-    td.style.borderLeft = td.style.borderRight = '1px solid #e9eef4';
-  const b = s.borders || {};
-  if (b.top) td.style.borderTop = '2px solid #333';
-  if (b.bottom) td.style.borderBottom = '2px solid #333';
-  if (b.left) td.style.borderLeft = '2px solid #333';
-  if (b.right) td.style.borderRight = '2px solid #333';
-  if (b.all) {
-    td.style.borderTop = td.style.borderBottom = '2px solid #333';
-    td.style.borderLeft = td.style.borderRight = '2px solid #333';
-  }
+  // 🎯 Border dinamis
+  applyBorder(td, s);
 }
 
 function formatNumber(v, fmt) {
@@ -2467,15 +2538,121 @@ document.getElementById('btn-wrap').onclick = () => toggleFmt('wrap');
 document.getElementById('font-family').onchange = e => applyToSelection(s => s.fontFamily = e.target.value);
 document.getElementById('font-size').onchange = e => applyToSelection(s => s.fontSize = +e.target.value);
 document.getElementById('num-format').onchange = e => applyToSelection(s => s.numFmt = e.target.value);
-document.getElementById('border-style').onchange = e => {
-  const v = e.target.value;
-  applyToSelection(s => {
-    if (!v) s.borders = {};
-    else if (v === 'all') s.borders = { all: true };
-    else s.borders = { [v]: true };
+/* =========================================================
+   BORDER DROPDOWN HANDLER
+   ========================================================= */
+const borderMenu = document.getElementById('border-menu');
+const borderMenuBtn = document.getElementById('btn-border-menu');
+
+// State border saat ini
+let currentBorderStyle = 'thin';
+let currentBorderColor = '#000000';
+
+// Toggle menu
+borderMenuBtn?.addEventListener('click', e => {
+  e.stopPropagation();
+  borderMenu.classList.toggle('hidden');
+});
+
+// Close on click outside
+document.addEventListener('mousedown', e => {
+  if (borderMenu && !borderMenu.classList.contains('hidden')) {
+    if (!borderMenu.contains(e.target) && !borderMenuBtn.contains(e.target)) {
+      borderMenu.classList.add('hidden');
+    }
+  }
+});
+
+// Style picker
+document.querySelectorAll('#border-style-list button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#border-style-list button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentBorderStyle = btn.dataset.style;
   });
-  e.target.value = '';
-};
+});
+
+// Color picker
+document.querySelectorAll('#border-color-list button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#border-color-list button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentBorderColor = btn.dataset.color;
+  });
+});
+
+/* Apply preset border ke selection */
+function applyBorderPreset(preset) {
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  pushUndo();
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return;
+
+  const r0 = Math.min(p1.r, p2.r), r1 = Math.max(p1.r, p2.r);
+  const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const addr = addrOf(r, c);
+      ensureCell(addr);
+      const s = sheet().cells[addr].s || (sheet().cells[addr].s = {});
+
+      if (preset === 'none') {
+        s.borders = {};
+      } else if (preset === 'all') {
+        s.borders = {
+          preset: 'all',
+          style: currentBorderStyle,
+          color: currentBorderColor
+        };
+      } else if (preset === 'outer') {
+        // Apply outer border — cek apakah cell di pinggir selection
+        s.borders = s.borders || {};
+        s.borders.preset = 'outer';
+        s.borders.style = currentBorderStyle;
+        s.borders.color = currentBorderColor;
+        s.borders.top = (r === r0);
+        s.borders.bottom = (r === r1);
+        s.borders.left = (c === c0);
+        s.borders.right = (c === c1);
+      } else if (preset === 'inner') {
+        // Apply inner border — cek apakah cell di tengah
+        s.borders = s.borders || {};
+        s.borders.preset = 'inner';
+        s.borders.style = currentBorderStyle;
+        s.borders.color = currentBorderColor;
+        // Inner = semua sisi KECUALI border luar selection
+        s.borders.top = (r > r0) ? true : s.borders.top || false;
+        s.borders.bottom = (r < r1) ? true : s.borders.bottom || false;
+        s.borders.left = (c > c0) ? true : s.borders.left || false;
+        s.borders.right = (c < c1) ? true : s.borders.right || false;
+      } else {
+        // top, bottom, left, right
+        s.borders = s.borders || {};
+        s.borders.style = currentBorderStyle;
+        s.borders.color = currentBorderColor;
+        s.borders.preset = null;
+        s.borders[preset] = true;
+      }
+
+      markCellDirty(addr);
+    }
+  }
+
+  renderVisibleCells();
+  borderMenu.classList.add('hidden');
+  toast(`✔ Border ${preset} diterapkan`);
+}
+
+// Bind preset buttons
+document.querySelectorAll('[data-border]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    applyBorderPreset(btn.dataset.border);
+  });
+});
 document.getElementById('btn-clear-all').onclick = () => {
   if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
   pushUndo();
@@ -3508,10 +3685,60 @@ async function openWB(id) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       data = await res.json();
 
-      // Init chunk loader
-      if (window.Chunks) {
+        // Init chunk loader
+      if (window.Chunks && useChunks) {
         updateLoading('Menyiapkan chunk loader…');
         await Chunks.init(id, token);
+
+        // 🎯 Auto-load semua chunks kalau jumlahnya sedikit
+        const totalBlocks = Chunks.getBlockCount(activeSheetIdx);
+
+        if (totalBlocks > 0 && totalBlocks <= 30) {
+          // Data kecil/medium → load semua sekaligus
+          updateLoading(`Memuat ${totalBlocks} block data…`);
+          await Chunks.loadAllBlocks(activeSheetIdx, (loaded, total) => {
+            updateLoading(`Memuat data: ${loaded}/${total} block…`);
+          });
+          console.log(`✅ Loaded all ${totalBlocks} blocks`);
+
+          // Sync cells ke HF
+          const loadedCells = Chunks.getLoadedCells(activeSheetIdx);
+          const sheetId = getSheetIdSafe(activeSheetIdx);
+          if (sheetId !== null && Object.keys(loadedCells).length > 0) {
+            for (const [addr, cell] of Object.entries(loadedCells)) {
+              const p = parseAddr(addr);
+              if (!p) continue;
+              const val = cell.f || cell.v || null;
+              try {
+                hf.setCellContents({ sheet: sheetId, row: p.r, col: p.c }, [[val]]);
+              } catch {}
+            }
+          }
+        } else if (totalBlocks > 30) {
+          // Data besar → load block pertama + block selanjutnya via scroll
+          updateLoading(`Data besar (${totalBlocks} blocks) — lazy load`);
+
+          // Pre-load 3 block pertama
+          await Promise.all([
+            Chunks.ensureBlockLoaded(activeSheetIdx, 0),
+            Chunks.ensureBlockLoaded(activeSheetIdx, 256),
+            Chunks.ensureBlockLoaded(activeSheetIdx, 512)
+          ]);
+
+          // Sync ke HF
+          const loadedCells = Chunks.getLoadedCells(activeSheetIdx);
+          const sheetId = getSheetIdSafe(activeSheetIdx);
+          if (sheetId !== null && Object.keys(loadedCells).length > 0) {
+            for (const [addr, cell] of Object.entries(loadedCells)) {
+              const p = parseAddr(addr);
+              if (!p) continue;
+              const val = cell.f || cell.v || null;
+              try {
+                hf.setCellContents({ sheet: sheetId, row: p.r, col: p.c }, [[val]]);
+              } catch {}
+            }
+          }
+        }
       }
     } else {
       // === MODE NORMAL (data kecil) ===
