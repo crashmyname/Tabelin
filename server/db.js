@@ -7,7 +7,8 @@ export const pool = new pg.Pool({
   max: 20,
   idleTimeoutMillis: 30000,
   statement_timeout: 60000,
-  query_timeout: 60000
+  query_timeout: 60000,
+  connectionTimeoutMillis: 10000
 });
 
 export async function initDb() {

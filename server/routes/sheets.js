@@ -173,85 +173,133 @@ router.delete('/:id', async (req, res) => {
   res.status(204).end();
 });
 
-/* =========================================================
-   DELTA UPDATE (PATCH)
-   Kirim hanya sel yang berubah → payload ~KB bukan MB
-   ========================================================= */
 router.patch('/:id/delta', async (req, res) => {
-  const a = await checkAccess(req.params.id, req.user.id);
-  if (!a) return res.status(404).json({ error: 'Not found' });
-  if (a.access === 'view') return res.status(403).json({ error: 'Read-only' });
+  try {
+    const a = await checkAccess(req.params.id, req.user.id);
+    if (!a) return res.status(404).json({ error: 'Not found' });
+    if (a.access === 'view') return res.status(403).json({ error: 'Read-only' });
 
-  const { sheetIdx, cells = {}, meta = {} } = req.body || {};
-  const sid = parseInt(req.params.id, 10);
-  const sIdx = parseInt(sheetIdx, 10);
-  if (isNaN(sid) || isNaN(sIdx)) {
-    return res.status(400).json({ error: 'Invalid id or sheetIdx' });
-  }
+    const { sheetIdx, cells = {}, meta = {} } = req.body || {};
+    const sid = parseInt(req.params.id, 10);
+    const sIdx = parseInt(sheetIdx, 10);
 
-  const MAX_DELTA = 4 * 1024 * 1024;
-  const deltaSize = JSON.stringify(cells).length;
-  if (deltaSize > MAX_DELTA) {
-    return res.status(413).json({
-      error: `Delta terlalu besar: ${(deltaSize/1024).toFixed(0)} KB. Coba save bertahap.`
-    });
-  }
+    if (isNaN(sid) || isNaN(sIdx)) {
+      return res.status(400).json({ error: 'Invalid id or sheetIdx' });
+    }
 
-  /* ---- 1. Meta (name / activeSheet) ---- */
-  if (meta.name !== undefined || meta.activeSheet !== undefined) {
-    await pool.query(
-      `UPDATE sheets
-          SET name = COALESCE($2::text, name),
-              data = CASE
-                WHEN $3::int IS NOT NULL
-                THEN jsonb_set(
-                       COALESCE(data, '{}'::jsonb),
-                       '{activeSheet}',
-                       to_jsonb($3::int)
-                     )
-                ELSE data
-              END,
-              updated_at = NOW()
-        WHERE id = $1::int`,
-      [sid, meta.name ?? null, meta.activeSheet ?? null]
-    );
-  }
+    // =====================================================
+    // 1. Meta (name/activeSheet)
+    // =====================================================
+    if (meta.name !== undefined || meta.activeSheet !== undefined) {
+      await pool.query(
+        `UPDATE sheets
+            SET name = COALESCE($2::text, name),
+                data = CASE
+                  WHEN $3::int IS NOT NULL
+                  THEN jsonb_set(
+                         COALESCE(data, '{}'::jsonb),
+                         '{activeSheet}',
+                         to_jsonb($3::int)
+                       )
+                  ELSE data
+                END,
+                updated_at = NOW()
+          WHERE id = $1::int`,
+        [sid, meta.name ?? null, meta.activeSheet ?? null]
+      );
+    }
 
-  /* ---- 2. Delta cells ---- */
-  const addrs = Object.keys(cells);
-  if (addrs.length) {
-    let expr = 'data';
-    const params = [sid];   // $1 = sheetId  (satu-satunya param tetap)
-    let pIdx = 2;           // param berikutnya mulai dari $2
+    // =====================================================
+    // 2. Pisahkan set vs delete
+    // =====================================================
+    const toSet = {};
+    const toDelete = [];
 
-    for (const addr of addrs) {
+    for (const [addr, cell] of Object.entries(cells)) {
       if (!/^[A-Z]+\d+$/.test(addr)) continue;
-      const val = cells[addr];
-      const path = `'{sheets,${sIdx},cells,${addr}}'`;
-
-      if (val === null) {
-        // Hapus key: operator #-
-        expr = `(${expr} #- ${path}::text[])`;
+      if (cell === null || cell === undefined) {
+        toDelete.push(addr);
       } else {
-        // Set / replace: jsonb_set(target, path, value)
-        expr = `jsonb_set(COALESCE(${expr}, '{}'::jsonb), ${path}::text[], $${pIdx}::jsonb)`;
-        params.push(JSON.stringify(val));
-        pIdx++;
+        toSet[addr] = cell;
       }
     }
 
-    if (expr !== 'data') {
-      await pool.query(
-        `UPDATE sheets
-            SET data = ${expr},
-                updated_at = NOW()
-          WHERE id = $1::int`,
-        params
-      );
+    const cellCount = Object.keys(toSet).length + toDelete.length;
+    const payloadSize = JSON.stringify(cells).length;
+
+    console.log(`📥 Delta save: sheet ${sid}, ${cellCount} cells (${Object.keys(toSet).length} set, ${toDelete.length} del), ${(payloadSize / 1024).toFixed(1)} KB`);
+
+    // =====================================================
+    // 3. SET cells — pakai MERGE operator `||`
+    // =====================================================
+    if (Object.keys(toSet).length > 0) {
+      const BATCH_SIZE = 1000;
+      const addrs = Object.keys(toSet);
+      const batches = [];
+      for (let i = 0; i < addrs.length; i += BATCH_SIZE) {
+        batches.push(addrs.slice(i, i + BATCH_SIZE));
+      }
+
+      for (const batchAddrs of batches) {
+        const batchObj = {};
+        for (const addr of batchAddrs) batchObj[addr] = toSet[addr];
+
+        await pool.query(
+          `UPDATE sheets
+              SET data = jsonb_set(
+                    COALESCE(data, '{}'::jsonb),
+                    ARRAY['sheets', $2::text, 'cells'],
+                    COALESCE(data->'sheets'->$2::int->'cells', '{}'::jsonb) || $3::jsonb
+                  ),
+                  updated_at = NOW()
+            WHERE id = $1::int`,
+          [sid, String(sIdx), JSON.stringify(batchObj)]
+        );
+      }
+
+      console.log(`✅ Delta SET: ${Object.keys(toSet).length} cells in ${batches.length} query`);
+    }
+
+    // =====================================================
+    // 4. DELETE cells
+    // =====================================================
+    if (toDelete.length > 0) {
+      const BATCH_SIZE = 1000;
+      const batches = [];
+      for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
+        batches.push(toDelete.slice(i, i + BATCH_SIZE));
+      }
+
+      for (const batch of batches) {
+        await pool.query(
+          `UPDATE sheets
+              SET data = jsonb_set(
+                    COALESCE(data, '{}'::jsonb),
+                    ARRAY['sheets', $2::text, 'cells'],
+                    COALESCE(data->'sheets'->$2::int->'cells', '{}'::jsonb) - $3::text[]
+                  ),
+                  updated_at = NOW()
+            WHERE id = $1::int`,
+          [sid, String(sIdx), batch]
+        );
+      }
+
+      console.log(`✅ Delta DELETE: ${toDelete.length} cells in ${batches.length} query`);
+    }
+
+    res.json({
+      ok: true,
+      applied: cellCount,
+      set: Object.keys(toSet).length,
+      deleted: toDelete.length
+    });
+
+  } catch (e) {
+    console.error('❌ Delta error:', e);
+    if (!res.headersSent) {
+      res.status(500).json({ error: e.message || 'Save failed' });
     }
   }
-
-  res.json({ ok: true, applied: addrs.length });
 });
 
 export default router;

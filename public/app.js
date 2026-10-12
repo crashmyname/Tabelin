@@ -3474,6 +3474,9 @@ document.getElementById('zoom').oninput = e => {
 /* =========================================================
    SAVE / LOAD — dengan queue & snapshot untuk hindari race
    ========================================================= */
+/* =========================================================
+   SAVE WORKBOOK — dengan batching untuk hindari OOM
+   ========================================================= */
 async function saveWB(forceFull = false) {
   if (!wbId) return;
   if (saving) { saveAgain = true; return; }
@@ -3481,7 +3484,9 @@ async function saveWB(forceFull = false) {
   const auth = { 'Authorization': 'Bearer ' + token };
   const statusEl = document.getElementById('save-status');
 
-  // ========== MODE CHUNK ==========
+  // =====================================================
+  // MODE CHUNK
+  // =====================================================
   if (wbUsesChunks && window.Chunks) {
     const pending = Chunks.getPendingCount();
     const hasMeta = dirtyMeta.name || dirtyMeta.activeSheet || dirtyMeta.structure;
@@ -3492,13 +3497,11 @@ async function saveWB(forceFull = false) {
     if (statusEl) statusEl.textContent = '⟳ menyimpan…';
 
     try {
-      // Save chunks
       if (pending > 0) {
         const r = await Chunks.flushChanges();
-        console.log('💾 Saved', r.saved, 'blocks');
+        console.log('💾 Chunk saved:', r.saved, 'blocks');
       }
 
-      // Save metadata (rename, activeSheet, structure)
       if (hasMeta) {
         await fetch(`/api/sheets/${wbId}/delta`, {
           method: 'PATCH',
@@ -3533,7 +3536,9 @@ async function saveWB(forceFull = false) {
     return;
   }
 
-  // ========== MODE NORMAL (data kecil) ==========
+  // =====================================================
+  // MODE NORMAL — dengan BATCHING
+  // =====================================================
   const cellsToSave = { ...dirtyCells };
   const metaToSave = { ...dirtyMeta };
 
@@ -3544,62 +3549,167 @@ async function saveWB(forceFull = false) {
   saving = true;
   if (statusEl) statusEl.textContent = '⟳ menyimpan…';
 
+  // 🎯 Helper untuk error response
+  const getErrorText = async (res) => {
+    try {
+      const j = await res.json();
+      return j.error || ('HTTP ' + res.status);
+    } catch {
+      return 'HTTP ' + res.status;
+    }
+  };
+
   try {
-    let res;
     const useFull = forceFull || metaToSave.structure;
 
+    // =====================================================
+    // FULL SAVE (data ganti total, e.g. struktur berubah)
+    // =====================================================
     if (useFull) {
-      res = await fetch(`/api/sheets/${wbId}`, {
+      const res = await fetch(`/api/sheets/${wbId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', ...auth },
         body: JSON.stringify({ name: wbName, data: wbData })
       });
-    } else {
-      res = await fetch(`/api/sheets/${wbId}/delta`, {
+
+      if (!res.ok) throw new Error(await getErrorText(res));
+
+      for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
+      for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
+      dirty = false;
+
+      if (statusEl) statusEl.textContent = '✔ tersimpan';
+      setTimeout(() => {
+        if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+      }, 1800);
+      saveRetryCount = 0;
+      return;
+    }
+
+    // =====================================================
+    // DELTA SAVE — batching per 500 cell
+    // =====================================================
+    const addrs = Object.keys(cellsToSave);
+    const BATCH_SIZE = 500;
+    const batches = [];
+
+    for (let i = 0; i < addrs.length; i += BATCH_SIZE) {
+      batches.push(addrs.slice(i, i + BATCH_SIZE));
+    }
+
+    console.log(`📤 Save: ${addrs.length} cells, ${batches.length} batches`);
+
+    // Kalau tidak ada cell (cuma meta), kirim 1 request meta saja
+    if (batches.length === 0) {
+      const res = await fetch(`/api/sheets/${wbId}/delta`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...auth },
         body: JSON.stringify({
           sheetIdx: activeSheetIdx,
-          cells: cellsToSave,
+          cells: {},
           meta: {
             name: metaToSave.name ? wbName : undefined,
             activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined
           }
         })
       });
+      if (!res.ok && res.status !== 404) throw new Error(await getErrorText(res));
+    } else {
+      // Loop batches
+      for (let i = 0; i < batches.length; i++) {
+        const batchAddrs = batches[i];
+        const batchCells = {};
+        for (const addr of batchAddrs) {
+          batchCells[addr] = cellsToSave[addr];
+        }
 
-      if (res.status === 404) {
-        res = await fetch(`/api/sheets/${wbId}`, {
-          method: 'PUT',
+        const body = {
+          sheetIdx: activeSheetIdx,
+          cells: batchCells,
+          meta: {}
+        };
+
+        // Meta hanya di batch pertama
+        if (i === 0) {
+          body.meta = {
+            name: metaToSave.name ? wbName : undefined,
+            activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined
+          };
+        }
+
+        const res = await fetch(`/api/sheets/${wbId}/delta`, {
+          method: 'PATCH',
           headers: { 'Content-Type': 'application/json', ...auth },
-          body: JSON.stringify({ name: wbName, data: wbData })
+          body: JSON.stringify(body)
         });
+
+        // Fallback ke PUT kalau endpoint delta tidak ada
+        if (res.status === 404 && i === 0) {
+          const putRes = await fetch(`/api/sheets/${wbId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', ...auth },
+            body: JSON.stringify({ name: wbName, data: wbData })
+          });
+          if (!putRes.ok) throw new Error(await getErrorText(putRes));
+
+          // Kalau PUT berhasil, clear semua dan selesai
+          for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
+          for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
+          dirty = false;
+          if (statusEl) statusEl.textContent = '✔ tersimpan';
+          setTimeout(() => {
+            if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+          }, 1800);
+          saveRetryCount = 0;
+          return;
+        }
+
+        if (!res.ok) {
+          throw new Error(`Batch ${i + 1}/${batches.length}: ${await getErrorText(res)}`);
+        }
+
+        // Progress indicator
+        if (statusEl && batches.length > 1) {
+          statusEl.textContent = `⟳ menyimpan ${i + 1}/${batches.length}…`;
+        }
       }
     }
 
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-
+    // =====================================================
+    // Sukses — clear dirty
+    // =====================================================
     for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
     for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
 
     dirty = Object.keys(dirtyCells).length > 0 || Object.keys(dirtyMeta).length > 0;
 
-    if (statusEl) statusEl.textContent = dirty ? '● masih ada perubahan…' : '✔ tersimpan';
+    if (statusEl) {
+      statusEl.textContent = dirty ? '● masih ada perubahan…' : '✔ tersimpan';
+    }
     if (!dirty) {
       setTimeout(() => {
         if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
       }, 1800);
     }
     saveRetryCount = 0;
+
   } catch (err) {
-    console.error('save failed:', err);
-    if (statusEl) statusEl.textContent = '⚠ gagal save';
+    console.error('❌ Save failed:', err.message);
+    if (statusEl) statusEl.textContent = '⚠ gagal save — retry…';
     dirty = true;
     saveRetryCount = (saveRetryCount || 0) + 1;
-    setTimeout(() => { if (dirty && wbId) saveWB(); }, Math.min(30000, 2000 * saveRetryCount));
+
+    // Exponential backoff
+    const delay = Math.min(30000, 2000 * saveRetryCount);
+    setTimeout(() => {
+      if (dirty && wbId) saveWB();
+    }, delay);
   } finally {
     saving = false;
-    if (saveAgain) { saveAgain = false; saveWB(); }
+    if (saveAgain) {
+      saveAgain = false;
+      saveWB();
+    }
   }
 }
 
