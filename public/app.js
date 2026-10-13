@@ -5106,7 +5106,7 @@ async function loadApiKeys() {
         </div>
       `;
       row.querySelector('[data-copy]').onclick = () => {
-        navigator.clipboard.writeText(k.key);
+        copyToClipboard(k.key);
         toast('✔ Kunci dicopy');
       };
       row.querySelector('[data-rotate]').onclick = async () => {
@@ -5154,13 +5154,13 @@ document.getElementById('btn-api-create')?.addEventListener('click', async () =>
   const data = await res.json();
   document.getElementById('api-label').value = '';
   await loadApiKeys();
-  navigator.clipboard.writeText(data.key).catch(() => {});
+  copyToClipboard(data.key).catch(() => {});
   toast('✔ Kunci dibuat & dicopy ke clipboard');
 });
 
 document.getElementById('btn-api-copy')?.addEventListener('click', () => {
   const txt = document.getElementById('api-sample')?.textContent || '';
-  navigator.clipboard.writeText(txt);
+  copyToClipboard(txt);
   toast('✔ Contoh dicopy');
 });
 
@@ -6772,7 +6772,7 @@ async function renderViewLinks() {
         <button class="danger" data-del>Hapus</button>
       `;
       row.querySelector('[data-copy]').onclick = () => {
-        navigator.clipboard.writeText(url);
+        copyToClipboard(url);
         toast('✔ Link dicopy');
       };
       row.querySelector('[data-open]').onclick = () => {
@@ -6795,18 +6795,69 @@ async function renderViewLinks() {
 
 document.getElementById('btn-create-view-link')?.addEventListener('click', async () => {
   if (!wbId) return;
+
   const res = await fetch(`/api/sheets/${wbId}/view-links`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
     body: JSON.stringify({ label: 'View Link' })
   });
+
   if (!res.ok) return toast('Gagal buat link');
+
   const data = await res.json();
   const url = `${location.origin}/view.html?token=${data.token}`;
-  navigator.clipboard.writeText(url).catch(() => {});
-  toast('✔ Link dibuat & dicopy');
+
+  const ok = await copyToClipboard(url);
+  toast(ok ? '✔ Link dibuat & dicopy' : '✔ Link dibuat — copy dari list di bawah');
+
   renderViewLinks();
 });
+
+/* =========================================================
+   CLIPBOARD HELPER — bekerja di HTTP & HTTPS
+   ========================================================= */
+async function copyToClipboard(text) {
+  if (!text) return false;
+
+  // 1. Modern API (butuh HTTPS / localhost)
+  if (navigator.clipboard && copyToClipboard) {
+    try {
+      await copyToClipboard(text);
+      return true;
+    } catch (e) {
+      console.warn('Clipboard API failed, fallback...', e);
+    }
+  }
+
+  // 2. Fallback: textarea + execCommand
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    ta.style.opacity = '0';
+    ta.setAttribute('readonly', '');
+    document.body.appendChild(ta);
+
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    const ok = document.execCommand('copy');
+
+    document.body.removeChild(ta);
+    if (ok) return true;
+  } catch (e) {
+    console.warn('execCommand failed:', e);
+  }
+
+  // 3. Fallback terakhir: prompt manual
+  try {
+    window.prompt('Salin manual (Ctrl+C):', text);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /* Panggil saat share modal dibuka */
 const _origRenderShareList = renderShareList;
