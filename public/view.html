@@ -49,6 +49,28 @@
 
   <div class="v-sep"></div>
 
+  <!-- SEARCH BAR -->
+  <div class="v-search-wrap">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <input id="v-search-input" placeholder="Cari…" autocomplete="off" />
+    <button class="v-search-nav" id="v-search-prev" title="Sebelumnya (Shift+Enter)">
+      <i class="fa-solid fa-chevron-up"></i>
+    </button>
+    <button class="v-search-nav" id="v-search-next" title="Selanjutnya (Enter)">
+      <i class="fa-solid fa-chevron-down"></i>
+    </button>
+    <span id="v-search-count" class="v-search-count"></span>
+  </div>
+
+  <div class="v-sep"></div>
+
+  <button class="v-btn" id="btn-goto" title="Go To (Ctrl+G)">
+    <i class="fa-solid fa-location-crosshairs"></i>
+    <span>Go To</span>
+  </button>
+
+  <div class="v-sep"></div>
+
   <div class="v-group v-zoom-group">
     <i class="fa-solid fa-magnifying-glass-minus"></i>
     <input type="range" id="zoom" min="60" max="150" value="100" />
@@ -70,6 +92,17 @@
 <!-- ============ GRID ============ -->
 <div class="v-grid-wrap" id="grid-wrap">
   <table id="grid"></table>
+</div>
+
+<!-- ============ SHEET TABS (read-only) ============ -->
+<div class="v-sheet-tabs-bar" id="v-sheet-tabs-bar">
+  <button class="v-tab-nav" id="v-tab-prev" title="Sebelumnya">
+    <i class="fa-solid fa-chevron-left"></i>
+  </button>
+  <div class="v-sheet-tabs" id="v-sheet-tabs"></div>
+  <button class="v-tab-nav" id="v-tab-next" title="Berikutnya">
+    <i class="fa-solid fa-chevron-right"></i>
+  </button>
 </div>
 
 <!-- ============ STATUS BAR ============ -->
@@ -96,6 +129,28 @@
     <i class="fa-solid fa-triangle-exclamation"></i>
     <h2>Link Tidak Valid</h2>
     <p id="error-message">Link sudah kadaluarsa atau tidak ditemukan.</p>
+  </div>
+</div>
+
+<!-- ============ MODAL: GO TO ============ -->
+<div id="modal-goto" class="modal hidden">
+  <div class="modal-card" style="min-width:400px;max-width:460px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-location-crosshairs"></i> Go To Cell</h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Alamat Cell</span>
+        <input id="goto-input" placeholder="Contoh: B10 atau A1:C20" autocomplete="off" />
+        <small class="field-hint">Ketik alamat lalu Enter</small>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-goto-apply">
+        <i class="fa-solid fa-arrow-right"></i> Go
+      </button>
+      <button class="btn ghost" id="btn-goto-cancel">Batal</button>
+    </div>
   </div>
 </div>
 

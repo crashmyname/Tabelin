@@ -1,5 +1,6 @@
 /* =========================================================
    VIEW MODE — read-only viewer dengan filter + realtime
+   + Sheet tabs + Search + Go To
    ========================================================= */
 const ROWS = 10000, COLS = 50;
 let ROW_H = 26;
@@ -18,12 +19,23 @@ let cachedRowMap = null;
 let filterMode = false;
 let filterPopupEl = null;
 
+/* Selection state (untuk search & goto) */
+let activeCell = 'A1';
+let selection = { start: 'A1', end: 'A1' };
+
 /* Realtime state */
 let viewerWs = null;
 let viewerWsReconnectTimer = null;
 let viewerPingTimer = null;
 let viewerUpdateFlashTimer = null;
 let viewerWsConnected = false;
+
+/* Search state */
+let _searchState = {
+  query: '',
+  matches: [],
+  currentIdx: -1
+};
 
 const colName = c => { let s='', n=c+1; while(n>0){const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; };
 const addrOf = (r, c) => colName(c) + (r + 1);
@@ -33,7 +45,9 @@ const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&l
 
 function sheet() { return wbData.sheets[activeSheetIdx]; }
 
-/* ---------- FILTER HELPERS ---------- */
+/* =========================================================
+   FILTER HELPERS
+   ========================================================= */
 function getActiveFilters() {
   const f = sheet().filters || {};
   return Object.entries(f).filter(([_, v]) => v && Array.isArray(v.values) && v.values.length);
@@ -64,7 +78,9 @@ function getRowMap() {
   return out;
 }
 
-/* ---------- HF ---------- */
+/* =========================================================
+   HYPERFORMULA
+   ========================================================= */
 function resetHF() {
   if (hf) { try { hf.destroy(); } catch {} hf = null; }
   let maxR = 50, maxC = 26;
@@ -92,7 +108,9 @@ function resetHF() {
   }
 }
 
-/* ---------- RENDER ---------- */
+/* =========================================================
+   BUILD GRID
+   ========================================================= */
 function buildGrid() {
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
@@ -121,10 +139,18 @@ function buildGrid() {
   tbody.id = 'grid-body';
   grid.appendChild(tbody);
 
+  // Scroll handler
   gridWrap.addEventListener('scroll', () => {
     if (scrollRAF) return;
     scrollRAF = requestAnimationFrame(() => { scrollRAF = null; renderVirtual(); });
   }, { passive: true });
+
+  // Click handler untuk select cell
+  grid.addEventListener('click', (e) => {
+    const td = e.target.closest('td[data-addr]');
+    if (!td) return;
+    selectCell(td.dataset.addr);
+  });
 }
 
 function recalcTableWidth() {
@@ -192,6 +218,8 @@ function renderVirtual() {
     if (th && th.dataset.row !== undefined) rowEls[+th.dataset.row] = tr;
   });
   renderVisibleCells();
+  applySelectionStyles();
+  highlightAllMatches();
 }
 
 function buildRow(r, visibleMerges) {
@@ -295,11 +323,62 @@ function formatNumber(v, fmt) {
   }
 }
 
-/* ---------- FILTER UI ---------- */
+/* =========================================================
+   SELECTION (read-only visual)
+   ========================================================= */
+function selectCell(addr) {
+  activeCell = addr;
+  selection = { start: addr, end: addr };
+
+  // Update formula bar
+  const ca = document.getElementById('cell-address');
+  if (ca) ca.textContent = addr;
+
+  const fi = document.getElementById('formula-input');
+  if (fi) {
+    const cl = sheet().cells[addr];
+    fi.value = cl?.f || cl?.v || '';
+  }
+
+  applySelectionStyles();
+}
+
+function applySelectionStyles() {
+  // Clear
+  document.querySelectorAll('#grid tbody td.active, #grid tbody td.selected')
+    .forEach(td => td.classList.remove('active', 'selected'));
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return;
+
+  const selR0 = Math.min(p1.r, p2.r), selR1 = Math.max(p1.r, p2.r);
+  const selC0 = Math.min(p1.c, p2.c), selC1 = Math.max(p1.c, p2.c);
+  const activeP = parseAddr(activeCell);
+
+  document.querySelectorAll('#grid tbody td[data-addr]').forEach(td => {
+    const p = parseAddr(td.dataset.addr);
+    if (!p) return;
+    const tdR1 = p.r + (td.rowSpan || 1) - 1;
+    const tdC1 = p.c + (td.colSpan || 1) - 1;
+    const overlap = !(tdR1 < selR0 || p.r > selR1 || tdC1 < selC0 || p.c > selC1);
+    if (!overlap) return;
+    if (activeP && p.r === activeP.r && p.c === activeP.c) {
+      td.classList.add('active');
+    } else {
+      td.classList.add('selected');
+    }
+  });
+}
+
+/* =========================================================
+   FILTER UI
+   ========================================================= */
 document.getElementById('btn-filter-toggle')?.addEventListener('click', () => {
   filterMode = !filterMode;
   const btn = document.getElementById('btn-filter-toggle');
   if (btn) {
+    btn.classList.toggle('active', filterMode);
     btn.style.background = filterMode ? 'linear-gradient(135deg,#10b981,#059669)' : '';
     btn.style.color = filterMode ? '#fff' : '';
   }
@@ -444,8 +523,20 @@ function renderSheet() {
   visibleStart = -1; visibleEnd = -1;
   rowEls = {};
   renderVirtual();
+  renderViewSheetTabs();
+  updateSheetInfo();
 }
 
+function updateSheetInfo() {
+  const info = document.getElementById('v-info');
+  if (!info) return;
+  const cellCount = Object.keys(sheet().cells || {}).length;
+  info.innerHTML = `<i class="fa-solid fa-table"></i> ${wbData.sheets.length} sheet · ${cellCount.toLocaleString('id-ID')} sel`;
+}
+
+/* =========================================================
+   ZOOM
+   ========================================================= */
 document.getElementById('zoom')?.addEventListener('input', e => {
   const z = e.target.value;
   document.getElementById('zoom-label').textContent = z + '%';
@@ -453,6 +544,328 @@ document.getElementById('zoom')?.addEventListener('input', e => {
   grid.style.transform = `scale(${z / 100})`;
   grid.style.transformOrigin = 'top left';
 });
+
+/* =========================================================
+   SHEET TABS
+   ========================================================= */
+function renderViewSheetTabs() {
+  const cont = document.getElementById('v-sheet-tabs');
+  if (!cont) return;
+
+  cont.innerHTML = '';
+
+  wbData.sheets.forEach((s, i) => {
+    if (s.hidden && i !== activeSheetIdx) return;
+
+    const btn = document.createElement('button');
+    btn.className = 'v-sheet-tab' + (i === activeSheetIdx ? ' active' : '');
+    btn.textContent = s.name || `Sheet${i + 1}`;
+    btn.dataset.idx = i;
+    if (s.tabColor) btn.dataset.color = s.tabColor;
+
+    btn.addEventListener('click', () => switchViewSheet(i));
+
+    cont.appendChild(btn);
+  });
+}
+
+function switchViewSheet(idx) {
+  if (idx === activeSheetIdx) return;
+  if (!wbData.sheets[idx]) return;
+
+  activeSheetIdx = idx;
+  activeCell = 'A1';
+  selection = { start: 'A1', end: 'A1' };
+
+  // Reset filter mode
+  filterMode = false;
+  const btn = document.getElementById('btn-filter-toggle');
+  if (btn) {
+    btn.classList.remove('active');
+    btn.style.background = '';
+    btn.style.color = '';
+  }
+
+  // Reset HF
+  resetHF();
+
+  // Reset cache
+  cachedRowMap = null;
+
+  // Scroll ke atas
+  gridWrap.scrollTop = 0;
+
+  // Re-render
+  renderSheet();
+  renderFilterHeaders();
+
+  // Update search — clear
+  clearSearch();
+
+  // Update formula bar
+  const ca = document.getElementById('cell-address');
+  if (ca) ca.textContent = 'A1';
+  const fi = document.getElementById('formula-input');
+  if (fi) fi.value = '';
+}
+
+document.getElementById('v-tab-prev')?.addEventListener('click', () => {
+  const visibleIdxs = wbData.sheets
+    .map((s, i) => ({ s, i }))
+    .filter(x => !x.s.hidden || x.i === activeSheetIdx)
+    .map(x => x.i);
+  const pos = visibleIdxs.indexOf(activeSheetIdx);
+  if (pos > 0) switchViewSheet(visibleIdxs[pos - 1]);
+});
+
+document.getElementById('v-tab-next')?.addEventListener('click', () => {
+  const visibleIdxs = wbData.sheets
+    .map((s, i) => ({ s, i }))
+    .filter(x => !x.s.hidden || x.i === activeSheetIdx)
+    .map(x => x.i);
+  const pos = visibleIdxs.indexOf(activeSheetIdx);
+  if (pos >= 0 && pos < visibleIdxs.length - 1) {
+    switchViewSheet(visibleIdxs[pos + 1]);
+  }
+});
+
+/* =========================================================
+   SEARCH
+   ========================================================= */
+function clearSearch() {
+  _searchState = { query: '', matches: [], currentIdx: -1 };
+  const input = document.getElementById('v-search-input');
+  if (input) input.value = '';
+  updateSearchCount();
+  document.querySelectorAll('#grid td.find-match, #grid td.find-current')
+    .forEach(td => td.classList.remove('find-match', 'find-current'));
+}
+
+function performSearch(query) {
+  _searchState.query = String(query || '').trim();
+  _searchState.matches = [];
+  _searchState.currentIdx = -1;
+
+  document.querySelectorAll('#grid td.find-match, #grid td.find-current')
+    .forEach(td => td.classList.remove('find-match', 'find-current'));
+
+  if (!_searchState.query) {
+    updateSearchCount();
+    return;
+  }
+
+  const q = _searchState.query.toLowerCase();
+  const cells = sheet().cells || {};
+
+  for (const [addr, cl] of Object.entries(cells)) {
+    if (!cl) continue;
+
+    let val = '';
+    if (cl.f) {
+      const p = parseAddr(addr);
+      if (p) {
+        try {
+          const maxR = hf.__maxR || ROWS;
+          const maxC = hf.__maxC || COLS;
+          if (p.r < maxR && p.c < maxC) {
+            val = String(hf.getCellValue({ sheet: 0, row: p.r, col: p.c }) ?? '');
+          }
+        } catch { val = ''; }
+      }
+    } else {
+      val = String(cl.v ?? '');
+    }
+
+    if (val.toLowerCase().includes(q)) {
+      const p = parseAddr(addr);
+      if (p) _searchState.matches.push({ addr, r: p.r, c: p.c });
+    }
+  }
+
+  _searchState.matches.sort((a, b) => a.r - b.r || a.c - b.c);
+
+  if (_searchState.matches.length > 0) {
+    _searchState.currentIdx = 0;
+    gotoSearchMatch(0);
+  }
+
+  updateSearchCount();
+  highlightAllMatches();
+}
+
+function gotoSearchMatch(idx) {
+  if (idx < 0 || idx >= _searchState.matches.length) return;
+  const m = _searchState.matches[idx];
+  scrollViewAddrIntoView(m.addr);
+  selectCell(m.addr);
+  highlightAllMatches();
+  updateSearchCount();
+}
+
+function nextSearchMatch() {
+  if (!_searchState.matches.length) return;
+  _searchState.currentIdx = (_searchState.currentIdx + 1) % _searchState.matches.length;
+  gotoSearchMatch(_searchState.currentIdx);
+}
+
+function prevSearchMatch() {
+  if (!_searchState.matches.length) return;
+  _searchState.currentIdx = (_searchState.currentIdx - 1 + _searchState.matches.length) % _searchState.matches.length;
+  gotoSearchMatch(_searchState.currentIdx);
+}
+
+function highlightAllMatches() {
+  document.querySelectorAll('#grid td.find-match, #grid td.find-current')
+    .forEach(td => td.classList.remove('find-match', 'find-current'));
+
+  if (!_searchState.matches.length) return;
+
+  for (let i = 0; i < _searchState.matches.length; i++) {
+    const m = _searchState.matches[i];
+    const td = document.querySelector(`#grid td[data-addr="${m.addr}"]`);
+    if (!td) continue;
+    if (i === _searchState.currentIdx) {
+      td.classList.add('find-current');
+    } else {
+      td.classList.add('find-match');
+    }
+  }
+}
+
+function updateSearchCount() {
+  const el = document.getElementById('v-search-count');
+  if (!el) return;
+
+  if (!_searchState.query) {
+    el.textContent = '';
+    return;
+  }
+  if (!_searchState.matches.length) {
+    el.textContent = '0/0';
+    el.style.color = '#dc2626';
+    return;
+  }
+  el.textContent = `${_searchState.currentIdx + 1}/${_searchState.matches.length}`;
+  el.style.color = '#64748b';
+}
+
+function scrollViewAddrIntoView(addr) {
+  const p = parseAddr(addr);
+  if (!p) return;
+  const targetTop = p.r * ROW_H;
+  const viewTop = gridWrap.scrollTop;
+  const viewBottom = viewTop + gridWrap.clientHeight;
+
+  if (targetTop < viewTop + ROW_H * 2) {
+    gridWrap.scrollTop = Math.max(0, targetTop - ROW_H * 2);
+  } else if (targetTop + ROW_H > viewBottom - ROW_H * 2) {
+    gridWrap.scrollTop = targetTop - gridWrap.clientHeight + ROW_H * 3;
+  }
+}
+
+/* Bind search */
+(function initSearch() {
+  const input = document.getElementById('v-search-input');
+  const prevBtn = document.getElementById('v-search-prev');
+  const nextBtn = document.getElementById('v-search-next');
+  if (!input) return;
+
+  let timer = null;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => performSearch(input.value), 200);
+  });
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) prevSearchMatch(); else nextSearchMatch();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      clearSearch();
+      input.blur();
+    }
+  });
+
+  prevBtn?.addEventListener('click', prevSearchMatch);
+  nextBtn?.addEventListener('click', nextSearchMatch);
+
+  document.addEventListener('keydown', e => {
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (ctrl && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      input.focus();
+      input.select();
+    }
+  }, true);
+})();
+
+/* =========================================================
+   GO TO
+   ========================================================= */
+function openGoToModal() {
+  const modal = document.getElementById('modal-goto');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  const input = document.getElementById('goto-input');
+  if (input) {
+    input.value = '';
+    setTimeout(() => input.focus(), 50);
+  }
+}
+
+function closeGoToModal() {
+  document.getElementById('modal-goto')?.classList.add('hidden');
+}
+
+function applyGoTo() {
+  const raw = document.getElementById('goto-input')?.value.trim() || '';
+  if (!raw) return;
+
+  const parts = raw.split(':');
+  const startAddr = parts[0].toUpperCase();
+  const endAddr = (parts[1] || parts[0]).toUpperCase();
+
+  if (!parseAddr(startAddr) || !parseAddr(endAddr)) {
+    return alert('Alamat tidak valid');
+  }
+
+  closeGoToModal();
+
+  selection = { start: startAddr, end: endAddr };
+  activeCell = startAddr;
+  scrollViewAddrIntoView(startAddr);
+  applySelectionStyles();
+
+  const ca = document.getElementById('cell-address');
+  if (ca) ca.textContent = startAddr;
+  const fi = document.getElementById('formula-input');
+  if (fi) {
+    const cl = sheet().cells[startAddr];
+    fi.value = cl?.f || cl?.v || '';
+  }
+}
+
+document.getElementById('btn-goto')?.addEventListener('click', openGoToModal);
+document.getElementById('btn-goto-cancel')?.addEventListener('click', closeGoToModal);
+document.getElementById('btn-goto-apply')?.addEventListener('click', applyGoTo);
+
+document.getElementById('goto-input')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); applyGoTo(); }
+  if (e.key === 'Escape') { e.preventDefault(); closeGoToModal(); }
+});
+
+document.getElementById('modal-goto')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-goto') closeGoToModal();
+});
+
+document.addEventListener('keydown', e => {
+  const ctrl = e.ctrlKey || e.metaKey;
+  if (ctrl && e.key.toLowerCase() === 'g') {
+    e.preventDefault();
+    openGoToModal();
+  }
+}, true);
 
 /* =========================================================
    REALTIME VIEWER — WebSocket
@@ -499,9 +912,7 @@ function connectViewerWS(token, sheetId) {
     }, 3000);
   });
 
-  viewerWs.addEventListener('error', () => {
-    // Error akan diikuti close
-  });
+  viewerWs.addEventListener('error', () => {});
 }
 
 function handleViewerMessage(msg) {
@@ -524,7 +935,6 @@ function handleViewerMessage(msg) {
         changed++;
       }
 
-      // Update HF kalau sheet aktif
       if (sheetIdx === activeSheetIdx && hf) {
         const p = parseAddr(addr);
         if (p) {
@@ -535,7 +945,6 @@ function handleViewerMessage(msg) {
               hf.setCellContents({ sheet: 0, row: p.r, col: p.c },
                 [[cell?.f || cell?.v || null]]);
             } else {
-              // Out of HF bounds — rebuild
               resetHF();
             }
           } catch (e) {
@@ -546,7 +955,6 @@ function handleViewerMessage(msg) {
       }
     }
 
-    // Refresh tampilan kalau sheet aktif & ada perubahan
     if (sheetIdx === activeSheetIdx && changed) {
       renderVisibleCells();
       flashUpdate(changed);
@@ -595,12 +1003,10 @@ function stopViewerPing() {
   if (viewerPingTimer) { clearInterval(viewerPingTimer); viewerPingTimer = null; }
 }
 
-/* Cleanup saat tab close */
 window.addEventListener('beforeunload', () => {
   if (viewerWs) try { viewerWs.close(); } catch {}
 });
 
-/* Reconnect kalau tab kembali aktif (misal setelah sleep) */
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && !viewerWsConnected) {
     if (window._viewToken && window._viewSheetId) {
@@ -609,7 +1015,9 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-/* ---------- LOAD ---------- */
+/* =========================================================
+   LOAD
+   ========================================================= */
 async function load() {
   const params = new URLSearchParams(location.search);
   const token = params.get('token');
@@ -642,7 +1050,6 @@ async function load() {
       if (!s.filters) s.filters = {};
     });
 
-    // Simpan untuk WS
     window._viewToken = token;
     window._viewSheetId = data.id;
 
@@ -652,16 +1059,7 @@ async function load() {
     renderFilterHeaders();
     document.getElementById('loading-overlay').classList.add('hidden');
 
-    const info = document.getElementById('v-info');
-    if (info) {
-      const totalCells = (wbData.sheets || []).reduce((sum, s) => sum + Object.keys(s.cells || {}).length, 0);
-      info.innerHTML = `<i class="fa-solid fa-table"></i> ${wbData.sheets.length} sheet · ${totalCells.toLocaleString('id-ID')} sel`;
-    }
-
-    // Set status awal
     setViewerStatus('offline');
-
-    // Connect realtime
     connectViewerWS(token, data.id);
   } catch (e) {
     showError('Gagal memuat: ' + e.message);
