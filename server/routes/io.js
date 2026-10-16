@@ -267,100 +267,282 @@ function hasStyle(style) {
     style.font?.strike ||
     style.font?.color?.argb ||
     style.font?.size ||
+    style.font?.name ||
     style.fill?.fgColor?.argb ||
-    style.alignment?.horizontal
+    style.alignment?.horizontal ||
+    style.alignment?.wrapText ||
+    style.border?.top?.style ||
+    style.border?.bottom?.style ||
+    style.border?.left?.style ||
+    style.border?.right?.style
   );
 }
 
 function extractStyle(style) {
   const s = {};
-  if (style.font?.bold) s.bold = true;
-  if (style.font?.italic) s.italic = true;
-  if (style.font?.underline) s.underline = true;
-  if (style.font?.strike) s.strike = true;
 
-  // Font color
+  /* ---------- FONT ---------- */
+  if (style.font?.bold)      s.bold = true;
+  if (style.font?.italic)    s.italic = true;
+  if (style.font?.underline) s.underline = true;
+  if (style.font?.strike)    s.strike = true;
+
+  if (style.font?.name) {
+    s.fontFamily = style.font.name;
+  }
+
   if (style.font?.color?.argb) {
     const argb = style.font.color.argb;
     if (argb && argb.length === 8) {
-      s.color = '#' + argb.slice(2);
+      const hex = argb.slice(2);
+      // skip hitam default biar tidak overwrite
+      if (hex.toUpperCase() !== '000000') {
+        s.color = '#' + hex;
+      }
     }
   }
 
-  // Font size
   if (style.font?.size) {
     s.fontSize = style.font.size;
   }
 
-  // Fill color
-  if (style.fill?.type === 'pattern' && style.fill.fgColor?.argb) {
-    const argb = style.fill.fgColor.argb;
-    if (argb && argb.length === 8 && argb !== 'FFFFFFFF') {
-      s.bg = '#' + argb.slice(2);
+  /* ---------- FILL ---------- */
+  if (style.fill) {
+    if (
+      (style.fill.type === 'pattern' || style.fill.type === 'solid') &&
+      style.fill.fgColor?.argb
+    ) {
+      const argb = style.fill.fgColor.argb;
+      if (argb && argb.length === 8) {
+        const hex = argb.slice(2);
+        // skip putih default
+        if (hex.toUpperCase() !== 'FFFFFF') {
+          s.bg = '#' + hex;
+        }
+      }
     }
   }
 
-  // Alignment
+  /* ---------- ALIGNMENT ---------- */
   if (style.alignment?.horizontal) {
-    s.align = style.alignment.horizontal; // 'left' | 'center' | 'right'
+    const h = style.alignment.horizontal;
+    s.align = h === 'centerContinuous' ? 'center' : h;
   }
 
-  // Wrap
   if (style.alignment?.wrapText) {
     s.wrap = true;
+  }
+
+  /* ---------- BORDER ---------- */
+  if (style.border) {
+    const b = {};
+    let hasBorder = false;
+    let borderStyle = null;
+    let borderColor = null;
+
+    ['top', 'bottom', 'left', 'right'].forEach(side => {
+      const bd = style.border[side];
+      if (bd && bd.style) {
+        b[side] = true;
+        hasBorder = true;
+        if (!borderStyle) {
+          // map Excel style → app style
+          switch (bd.style) {
+            case 'medium': borderStyle = 'medium'; break;
+            case 'thick':  borderStyle = 'thick';  break;
+            case 'dashed': borderStyle = 'dashed'; break;
+            case 'dotted': borderStyle = 'dotted'; break;
+            case 'double': borderStyle = 'double'; break;
+            default:       borderStyle = 'thin';
+          }
+          if (bd.color?.argb && bd.color.argb.length === 8) {
+            const hex = bd.color.argb.slice(2);
+            borderColor = hex.toUpperCase() === '000000' ? '#111111' : '#' + hex;
+          } else {
+            borderColor = '#111111';
+          }
+        }
+      }
+    });
+
+    if (hasBorder) {
+      b.style = borderStyle || 'thin';
+      b.color = borderColor || '#111111';
+      s.borders = b;
+    }
   }
 
   return s;
 }
 
 /* ---------- XLSX ---------- */
+/* server/routes/io.js — GANTI route /export/xlsx dengan ini */
 router.get('/:id/export/xlsx', async (req, res) => {
   const sheet = await getSheet(req.params.id, req.user.id);
   if (!sheet) return res.status(404).json({ error: 'Not found' });
 
   const wbData = normalize(sheet.data);
-  const wb = new ExcelJS.Workbook();
-  for (const s of wbData.sheets) {
-    const { values } = computeSheet(s.cells || {});
-    const ws = wb.addWorksheet((s.name || 'Sheet').slice(0, 30));
-    values.forEach(row => ws.addRow(row));
-    ws.columns.forEach(c => (c.width = 18));
-    // formatting ringan
-    for (const [addr, cell] of Object.entries(s.cells || {})) {
-      if (!cell.s) continue;
-      const m = /^([A-Z]+)(\d+)$/.exec(addr);
-      if (!m) continue;
-      let col = 0; for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
-      const excelCell = ws.getCell(addr);
-      const st = cell.s;
-      if (st.bold) excelCell.font = { ...excelCell.font, bold: true };
-      if (st.italic) excelCell.font = { ...excelCell.font, italic: true };
-      if (st.color) excelCell.font = { ...excelCell.font, color: { argb: 'FF' + st.color.replace('#', '').toUpperCase() } };
-      if (st.bg) excelCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + st.bg.replace('#', '').toUpperCase() } };
-      if (st.align) excelCell.alignment = { horizontal: st.align };
-    }
-  }
-  const buf = await wb.xlsx.writeBuffer();
+  const fname = (sheet.name || 'workbook').replace(/[^\w\d-]+/g, '_');
+
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(sheet.name)}.xlsx"`);
-  res.send(Buffer.from(buf));
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fname)}.xlsx"`);
+  res.setHeader('Cache-Control', 'no-cache');
+
+  // 🎯 STREAMING writer — hemat memory
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
+    stream: res,
+    useStyles: true,
+    useSharedStrings: false   // ← penting: hemat RAM besar
+  });
+
+  try {
+    for (const s of wbData.sheets) {
+      const ws = workbook.addWorksheet((s.name || 'Sheet').slice(0, 30));
+
+      // Column widths
+      if (s.colWidths) {
+        for (const [i, w] of Object.entries(s.colWidths)) {
+          ws.getColumn(+i + 1).width = Math.max(8, (w - 5) / 7.5);
+        }
+      }
+
+      // Cari max row/col
+      const cells = s.cells || {};
+      let maxR = 0, maxC = 0;
+      for (const addr of Object.keys(cells)) {
+        const m = /^([A-Z]+)(\d+)$/.exec(addr);
+        if (!m) continue;
+        let c = 0;
+        for (const ch of m[1]) c = c * 26 + (ch.charCodeAt(0) - 64);
+        const r = parseInt(m[2], 10);
+        if (r > maxR) maxR = r;
+        if (c > maxC) maxC = c;
+      }
+
+      // 🎯 Streaming: tulis per baris, langsung flush
+      for (let r = 1; r <= maxR; r++) {
+        const row = ws.getRow(r);
+
+        for (let c = 1; c <= maxC; c++) {
+          const addr = colLetter(c) + r;
+          const cl = cells[addr];
+          if (!cl) continue;
+
+          const excelCell = row.getCell(c);
+          // Value: pakai v mentah (bukan HF-evaluated — biar cepat)
+          // Kalau perlu HF-eval, batasi 10.000 baris pertama saja
+          if (cl.f) {
+            excelCell.value = {
+              formula: cl.f.slice(1),  // buang '='
+              result: cl.v ?? ''       // pakai cached result kalau ada
+            };
+          } else if (cl.v !== undefined) {
+            excelCell.value = cl.v;
+          }
+
+          // Style — light: cuma font bold + bg
+          if (cl.s) {
+            if (cl.s.bold) excelCell.font = { bold: true };
+            if (cl.s.bg) {
+              const hex = cl.s.bg.replace('#', '').toUpperCase();
+              excelCell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FF' + hex }
+              };
+            }
+          }
+        }
+
+        // Commit row → flush ke stream
+        row.commit();
+      }
+
+      // Merges
+      (s.merged || []).forEach(range => {
+        try { ws.mergeCells(range); } catch {}
+      });
+
+      ws.commit();
+    }
+
+    await workbook.commit();
+  } catch (e) {
+    console.error('XLSX stream error:', e);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
 });
 
+function colLetter(n) {
+  let s = '';
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
 /* ---------- CSV (sheet aktif) ---------- */
+/* server/routes/io.js — GANTI route /export/csv */
 router.get('/:id/export/csv', async (req, res) => {
   const sheet = await getSheet(req.params.id, req.user.id);
   if (!sheet) return res.status(404).json({ error: 'Not found' });
-  const wb = normalize(sheet.data);
-  const activeIdx = wb.activeSheet || 0;
-  const s = wb.sheets[activeIdx] || wb.sheets[0] || { cells: {} };
-  const { values } = computeSheet(s.cells || {});
-  const csv = values.map(row => row.map(v => {
-    const t = v === null || v === undefined ? '' : String(v);
-    return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
-  }).join(',')).join('\r\n');
+
+  const wbData = normalize(sheet.data);
+  const activeIdx = wbData.activeSheet || 0;
+  const s = wbData.sheets[activeIdx] || wbData.sheets[0] || { cells: {} };
+
+  const fname = (sheet.name || 'export').replace(/[^\w\d-]+/g, '_');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(sheet.name)}.csv"`);
-  res.send('\uFEFF' + csv);
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fname)}.csv"`);
+
+  // 🎯 BOM untuk Excel
+  res.write('\uFEFF');
+
+  // Cari max
+  const cells = s.cells || {};
+  let maxR = 0, maxC = 0;
+  for (const addr of Object.keys(cells)) {
+    const m = /^([A-Z]+)(\d+)$/.exec(addr);
+    if (!m) continue;
+    let c = 0;
+    for (const ch of m[1]) c = c * 26 + (ch.charCodeAt(0) - 64);
+    const r = parseInt(m[2], 10);
+    if (r > maxR) maxR = r;
+    if (c > maxC) maxC = c;
+  }
+
+  // 🎯 Streaming per baris — no HF, no computeSheet
+  const BATCH = 5000;
+  const esc = (t) => {
+    t = t == null ? '' : String(t);
+    return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+
+  for (let startR = 1; startR <= maxR; startR += BATCH) {
+    const endR = Math.min(startR + BATCH - 1, maxR);
+    const lines = [];
+
+    for (let r = startR; r <= endR; r++) {
+      const row = [];
+      for (let c = 1; c <= maxC; c++) {
+        const addr = colLetter(c) + r;
+        const cl = cells[addr];
+        row.push(cl ? esc(cl.v ?? '') : '');
+      }
+      lines.push(row.join(','));
+    }
+
+    res.write(lines.join('\r\n') + '\r\n');
+
+    // Backpressure — tunggu drain kalau buffer penuh
+    if (!res.write('')) {
+      await new Promise(r => res.once('drain', r));
+    }
+  }
+
+  res.end();
 });
 
 /* ---------- PDF (sheet aktif) ---------- */

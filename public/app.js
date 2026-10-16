@@ -2,8 +2,10 @@
    WEB EXCEL — Frontend v4
    Virtual Scroll + Delta Save + Autosave
    ========================================================= */
-const ROWS = 10000;
+let ROWS = 10000;
 const COLS = 50;
+const MIN_ROWS = 10000;
+const ROWS_BUFFER = 100;
 let ROW_H = 26;
 const BUFFER = 3;
 const HF_LICENSE = 'gpl-v3';
@@ -57,12 +59,15 @@ let formulaWarningShown = false;
 let cachedRowMap = null;
 let filterPopupEl = null;
 let filterMode = false;
+let filterHeaderRow = null;
 let currentAccessMode = 'owner';
 /* Row/Col Selection */
 let selectedRows = new Set();
 let selectedCols = new Set();
 let shareUserSuggestList = [];
 let shareUserSuggestIdx = -1;
+
+let _wbHasPassword = false;
 /* =========================================================
    CUSTOM DIALOG (ganti alert/confirm/prompt native)
    ========================================================= */
@@ -214,6 +219,93 @@ function sheet() { return wbData.sheets[activeSheetIdx]; }
 function ensureCell(addr) { return (sheet().cells[addr] ||= {}); }
 
 /* =========================================================
+   AUTO-SCALE ROWS — deteksi dari data + chunks + merges
+   ========================================================= */
+async function recalcRowsLimit(silent = false) {
+  const sheetId = wbId;
+  const sheetIdx = activeSheetIdx;
+  let maxRow = MIN_ROWS;
+
+  // 1️⃣ Cek dari cells (yang sudah di-load)
+  const cells = sheet().cells || {};
+  for (const addr of Object.keys(cells)) {
+    const m = /^([A-Z]+)(\d+)$/.exec(addr);
+    if (!m) continue;
+    const r = parseInt(m[2], 10);
+    if (r > maxRow) maxRow = r;
+  }
+
+  // 2️⃣ Cek dari chunks metadata (kalau chunk mode)
+  if (wbUsesChunks && window.Chunks && sheetId) {
+    try {
+      // Cek apakah Chunks punya method getMaxBlockRow
+      if (typeof Chunks.getMaxBlockRow === 'function') {
+        const maxBlockRow = Chunks.getMaxBlockRow(sheetIdx);
+        if (maxBlockRow && maxBlockRow + Chunks.BLOCK_ROWS > maxRow) {
+          maxRow = maxBlockRow + Chunks.BLOCK_ROWS;
+        }
+      } else {
+        // Fallback: fetch dari server
+        const res = await fetch(`/api/sheets/${sheetId}/blocks`, {
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const blocks = data.blocks?.[sheetIdx] || [];
+          for (const b of blocks) {
+            const endRow = (b.row || 0) + 1000; // BLOCK_ROWS default
+            if (endRow > maxRow) maxRow = endRow;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Chunk blocks check failed:', e);
+    }
+  }
+
+  // 3️⃣ Cek dari merges
+  for (const mergeStr of (sheet().merged || [])) {
+    const [s, e] = rangeParts(mergeStr);
+    const p2 = parseAddr(e || s);
+    if (p2 && p2.r + 1 > maxRow) maxRow = p2.r + 1;
+  }
+
+  // 4️⃣ Tambah buffer
+  const newRows = Math.max(MIN_ROWS, maxRow + ROWS_BUFFER);
+
+  // Cek kalau sudah cukup
+  if (newRows <= ROWS) {
+    if (!silent) console.log(`📏 ROWS sudah cukup: ${ROWS} (max data: ${maxRow})`);
+    return ROWS;
+  }
+
+  // 🎯 Naikkan ROWS
+  const oldRows = ROWS;
+  ROWS = newRows;
+  console.log(`📏 ROWS auto-scale: ${oldRows} → ${ROWS} (max data: ${maxRow})`);
+
+  // Update UI
+  if (typeof recalcTableWidth === 'function') recalcTableWidth();
+  window._lastRenderKey = null;
+  if (typeof renderVirtual === 'function') renderVirtual(false);
+
+  if (!silent && typeof toast === 'function') {
+    toast(`📏 Grid diperluas ke ${ROWS.toLocaleString('id-ID')} baris`);
+  }
+
+  return ROWS;
+}
+
+/* Helper: pastikan row tertentu ada di dalam ROWS */
+function ensureRowCapacity(r) {
+  if (r + ROWS_BUFFER <= ROWS) return false;
+  const oldRows = ROWS;
+  ROWS = r + ROWS_BUFFER;
+  console.log(`📏 ROWS grow: ${oldRows} → ${ROWS} (butuh row ${r + 1})`);
+  return true;
+}
+
+/* =========================================================
    UTILS
    ========================================================= */
 const colName = c => {
@@ -312,7 +404,7 @@ function computeUsedRangeForSheet(s) {
 
   // ⚡ BATASI: HF hanya build sampai 2000 baris × 50 kolom (= 100k sel)
   // Sisanya di-render on-the-fly tanpa HF
-  const HF_MAX_R = 2000;
+  const HF_MAX_R = 500;
   const HF_MAX_C = COLS;
 
   maxR = Math.min(maxR + 20, HF_MAX_R);
@@ -323,8 +415,6 @@ function computeUsedRangeForSheet(s) {
 function buildSheetMatrix(s) {
   const { maxR, maxC } = computeUsedRangeForSheet(s);
   const cells = s?.cells || {};
-
-  // Paksa minimal 1×1 supaya HF tidak error
   const R = Math.max(maxR, 1);
   const C = Math.max(maxC, 1);
 
@@ -332,8 +422,14 @@ function buildSheetMatrix(s) {
   for (const [a, c] of Object.entries(cells)) {
     const p = parseAddr(a);
     if (!p || p.r >= R || p.c >= C) continue;
-    if (c.f) matrix[p.r][p.c] = c.f;
-    else if (c.v !== undefined && c.v !== null && c.v !== '') matrix[p.r][p.c] = c.v;
+
+    if (c.f) {
+      // 🎯 Pakai helper yang sama
+      matrix[p.r][p.c] = resolveNamedRanges(c.f);
+    }
+    else if (c.v !== undefined && c.v !== null && c.v !== '') {
+      matrix[p.r][p.c] = c.v;
+    }
   }
   return matrix;
 }
@@ -454,11 +550,34 @@ function attachHFListener() {
   }
 }
 
+/* =========================================================
+   FILTER STATE PER-SHEET
+   ========================================================= */
+function saveFilterStateToSheet() {
+  const sh = sheet();
+  if (!sh) return;
+  sh._filterMode = filterMode;
+  sh._filterHeaderRow = filterHeaderRow;
+}
+
+function loadFilterStateFromSheet() {
+  const sh = sheet();
+  filterMode = !!sh?._filterMode;
+  filterHeaderRow = sh?._filterHeaderRow ?? null;
+  if (typeof invalidateRowMap === 'function') invalidateRowMap();
+}
+
 /* 🎯 Cache sheetId — hindari lookup HF tiap sel */
 let _sheetIdCache = new Map();
 
 function getSheetIdSafe(sheetIdx = activeSheetIdx) {
   if (!hf) return null;
+
+  // 🎯 Cek cache dulu
+  const cacheKey = sheetIdx + ':' + (wbData.sheets[sheetIdx]?.name || '');
+  const cached = _sheetIdCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const sh = wbData.sheets[sheetIdx];
   if (!sh) return null;
   const sheetName = sh.name;
@@ -473,23 +592,17 @@ function getSheetIdSafe(sheetIdx = activeSheetIdx) {
       id = hf.getSheetId(sheetName);
       console.log('➕ Auto-added sheet:', sheetName, '→ ID:', id);
 
-      // 🎯 Kalau sheet baru di-add, load chunks & set cells-nya
       if (window.Chunks && hf) {
         const shData = wbData.sheets[sheetIdx];
-        // Kalau pakai chunk, trigger load blocks pertama
         if (wbUsesChunks && shData.cells && Object.keys(shData.cells).length === 0) {
-          console.log('📦 Pre-loading blocks untuk', sheetName);
-          // Load 4 block pertama (baris 0-1024)
           Promise.all([
             Chunks.ensureBlockLoaded(sheetIdx, 0),
             Chunks.ensureBlockLoaded(sheetIdx, 256),
             Chunks.ensureBlockLoaded(sheetIdx, 512),
             Chunks.ensureBlockLoaded(sheetIdx, 768)
           ]).then(() => {
-            // Set cells ke HF
             const loadedCells = Chunks.getLoadedCells(sheetIdx);
             if (hf && Object.keys(loadedCells).length > 0) {
-              const matrix = [];
               for (const [addr, cell] of Object.entries(loadedCells)) {
                 const p = parseAddr(addr);
                 if (!p) continue;
@@ -498,7 +611,6 @@ function getSheetIdSafe(sheetIdx = activeSheetIdx) {
                   hf.setCellContents({ sheet: id, row: p.r, col: p.c }, [[val]]);
                 } catch {}
               }
-              // Force re-render
               window._lastRenderKey = null;
               setTimeout(() => renderVirtual(false), 100);
             }
@@ -511,10 +623,15 @@ function getSheetIdSafe(sheetIdx = activeSheetIdx) {
   }
 
   if (id === undefined || id === null) {
-    try { resetHF(); id = hf.getSheetId(sheetName); } catch {}
+    try {
+      resetHF();
+      id = hf.getSheetId(sheetName);
+    } catch {}
   }
 
-  return (id === undefined || id === null) ? null : id;
+  const finalId = (id === undefined || id === null) ? null : id;
+  _sheetIdCache.set(cacheKey, finalId);
+  return finalId;
 }
 
 /* ✅ hfGet — pakai numeric sheet ID */
@@ -538,7 +655,9 @@ function hfSet(r, c, val, sheetIdx = activeSheetIdx) {
     return false;
   }
   try {
-    hf.setCellContents({ sheet: sheetId, row: r, col: c }, [[val]]);
+    // 🎯 Resolve named ranges sebelum kirim ke HF
+    const resolved = resolveNamedRanges(val);
+    hf.setCellContents({ sheet: sheetId, row: r, col: c }, [[resolved]]);
     return true;
   } catch (e) {
     console.warn('hfSet failed (id=' + sheetId + '):', e.message);
@@ -587,7 +706,11 @@ function buildGrid() {
 
   /* ---- COLGROUP: sumber kebenaran untuk lebar kolom ---- */
   const cg = document.createElement('colgroup');
-  cg.appendChild(document.createElement('col')); // row header
+  const colHeader = document.createElement('col');
+  colHeader.style.width = '48px';
+  colHeader.style.minWidth = '48px';
+  colHeader.style.maxWidth = '48px';
+  cg.appendChild(colHeader);
   for (let c = 0; c < COLS; c++) {
     const col = document.createElement('col');
     col.dataset.col = c;
@@ -799,12 +922,12 @@ function onGridScroll() {
   if (scrollRAF) return;
   scrollRAF = requestAnimationFrame(() => {
     scrollRAF = null;
-    renderVirtual(true);
+    renderVirtual(true);   // fast mode saat scroll
 
     clearTimeout(scrollStopTimer);
     scrollStopTimer = setTimeout(() => {
-      renderVirtual(false);
-    }, 200);
+      renderVirtual(false);   // full render setelah stop 400ms
+    }, 400);   // ← naikkan dari 200ms ke 400ms
   });
 }
 
@@ -822,6 +945,12 @@ function renderVirtual(fastMode = false) {
   const gridWrapEl = document.getElementById('grid-wrap');
   const scrollTop = gridWrapEl.scrollTop;
   const viewH = gridWrapEl.clientHeight;
+
+  const neededRows = Math.ceil(scrollTop / ROW_H) + 10;
+  if (neededRows > ROWS) {
+    ROWS = neededRows;
+    console.log(`📏 ROWS auto-grow dari scroll: ${ROWS}`);
+  }
 
   const rowMap = getRowMap();
   const totalRows = rowMap ? rowMap.length : ROWS;
@@ -914,11 +1043,26 @@ function renderVirtual(fastMode = false) {
 
 function buildRowHTML(r, fastMode) {
   const colWidths = sheet().colWidths || {};
+  const headerRow = getFilterHeaderRow();
+  const isHeaderRow = filterMode && (r === headerRow);
+  const filters = sheet().filters || {};
 
   let h = '<tr data-row="' + r + '" style="height:' + ROW_H + 'px">';
 
   // Row header
-  h += '<th data-row="' + r + '" style="width:48px">' + (r + 1) + '</th>';
+  const rowHeaderClass = isHeaderRow ? ' class="filter-header-row"' : '';
+  const summaryGroup = getGroupSummaryAt(r);
+  const insideGroup = getRowGroupAt(r);
+
+  let thExtra = '';
+  if (summaryGroup) {
+    const label = summaryGroup.collapsed ? '+' : '−';
+    const title = summaryGroup.collapsed ? 'Expand' : 'Collapse';
+    thExtra = `<button class="row-group-btn${summaryGroup.collapsed ? '' : ' expanded'}" data-group-from="${summaryGroup.from}" title="${title}" type="button">${label}</button>`;
+  }
+
+  const thClass = (rowHeaderClass || '') + (insideGroup && !summaryGroup ? ' row-group-line' : '');
+  h += '<th data-row="' + r + '" style="width:48px"' + thClass + '>' + (r + 1) + thExtra + '</th>';
 
   for (let c = 0; c < COLS; c++) {
     const addr = addrOf(r, c);
@@ -938,7 +1082,6 @@ function buildRowHTML(r, fastMode) {
 
     if (cl) {
       let v;
-
       if (cl.f) {
         if (fastMode) {
           const cached = _hfValueCache.get(addr);
@@ -952,7 +1095,15 @@ function buildRowHTML(r, fastMode) {
         v = cl.v ?? '';
       }
 
-      text = cl.s?.numFmt ? formatNumber(v, cl.s.numFmt) : displayVal(v);
+      if (_showFormulas && cl.f) {
+        text = cl.f;
+      } else {
+        text = cl.s?.numFmt ? formatNumber(v, cl.s.numFmt) : displayVal(v);
+      }
+      // 🎯 Handle line break dalam HTML
+      if (text && typeof text === 'string' && text.includes('\n')) {
+        text = text.replace(/\n/g, '\n');   // biarkan \n, CSS white-space: pre-wrap yang render
+      }
 
       if (cl.s) {
         const s = cl.s;
@@ -968,19 +1119,56 @@ function buildRowHTML(r, fastMode) {
 
       if (cl.link) cls += ' cell-link';
       if (cl.comment) cls += ' has-comment';
+      // 🎯 Lock indicator
+      const shRow = sheet();
+      if (shRow.protected) {
+        if (cl?.s?.locked === false) cls += ' cell-unlocked';
+        else cls += ' cell-locked';
+      }
+      if (_highlightFormulas && cl.f) cls += ' has-formula';
+      if (isErr(v) || (typeof v === 'string' && v.startsWith('#'))) cls += ' has-error';
+    }
+
+    // 🎯 Kalau baris header filter, tambahkan tombol filter & class
+    let filterBtn = '';
+    let headerCls = '';
+    if (isHeaderRow) {
+      headerCls = ' filter-header-cell';
+      const isActive = filters[c]?.values?.length > 0;
+      if (isActive) cls += ' filtered-cell';
+      filterBtn = `<button class="fx-filter-btn-inline${isActive ? ' active' : ''}" data-filter-col="${c}" title="Filter ${colName(c)}">▼</button>`;
     }
 
     const width = colWidths[c] || 96;
     const esc = escapeHtml(text);
 
-    h += '<td data-addr="' + addr + '" class="' + cls.trim() + '" style="width:' + width + 'px;' + style + '">'
+    h += '<td data-addr="' + addr + '" data-col="' + c + '" class="' + (cls + headerCls).trim() + '" style="width:' + width + 'px;' + style + '">'
        + '<div class="cell-inner' + cls + '">' + esc + '</div>'
+       + filterBtn
        + '</td>';
   }
 
   h += '</tr>';
   return h;
 }
+
+/* =========================================================
+   FILTER BUTTON CLICK — event delegation
+   ========================================================= */
+document.getElementById('grid')?.addEventListener('mousedown', e => {
+  const btn = e.target.closest('.fx-filter-btn-inline');
+  if (!btn) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  const colIdx = +btn.dataset.filterCol;
+  const td = btn.closest('td');
+
+  console.log(`🔽 Filter click: col=${colIdx} (${colName(colIdx)})`);
+  openFilterPopupAtCell(colIdx, td);
+}, true);   // capture phase — mencegah handler lain
 
 /* =========================================================
    FAST SELECTION — pakai classList, tidak render ulang
@@ -1036,138 +1224,171 @@ function applySelectionStylesFast() {
 /* =========================================================
    SCROLL MODE — pakai raw value, tidak ada hfGet
    ========================================================= */
-function renderVisibleCellsScroll() {
-  const rowMap = getRowMap();
+// function renderVisibleCellsScroll() {
+//   const rowMap = getRowMap();
 
-  for (let di = visibleStart; di < visibleEnd; di++) {
-    const r = rowMap ? rowMap[di] : di;
-    const tr = rowEls[r];
-    if (!tr) continue;
+//   for (let di = visibleStart; di < visibleEnd; di++) {
+//     const r = rowMap ? rowMap[di] : di;
+//     const tr = rowEls[r];
+//     if (!tr) continue;
 
-    const children = tr.children;
-    for (let i = 1; i < children.length; i++) {
-      const td = children[i];
-      if (!td.dataset || !td.dataset.addr) continue;
+//     const children = tr.children;
+//     for (let i = 1; i < children.length; i++) {
+//       const td = children[i];
+//       if (!td.dataset || !td.dataset.addr) continue;
 
-      const p = parseAddr(td.dataset.addr);
-      if (!p) continue;
+//       const p = parseAddr(td.dataset.addr);
+//       if (!p) continue;
 
-      // Skip kalau sedang di-edit
-      const first = td.firstElementChild;
-      if (first && first.tagName === 'INPUT') continue;
+//       // Skip kalau sedang di-edit
+//       const first = td.firstElementChild;
+//       if (first && first.tagName === 'INPUT') continue;
 
-      const addr = td.dataset.addr;
-      const cl = sheet().cells[addr];
+//       const addr = td.dataset.addr;
+//       const cl = sheet().cells[addr];
 
-      // 🎯 RAW value — NO HF CALL
-      let raw = '';
-      if (cl) {
-        // Kalau ada cache HF, pakai cache
-        const cached = _hfValueCache.get(addr);
-        if (cached !== undefined) {
-          raw = cached;
-        } else if (cl.f) {
-          // Ada formula tapi belum ada cache → tampilkan placeholder sementara
-          raw = '…';
-        } else {
-          raw = cl.v ?? '';
-        }
-      }
+//       // 🎯 RAW value — NO HF CALL
+//       let raw = '';
+//       if (cl) {
+//         // Kalau ada cache HF, pakai cache
+//         const cached = _hfValueCache.get(addr);
+//         if (cached !== undefined) {
+//           raw = cached;
+//         } else if (cl.f) {
+//           // Ada formula tapi belum ada cache → tampilkan placeholder sementara
+//           raw = '…';
+//         } else {
+//           raw = cl.v ?? '';
+//         }
+//       }
 
-      const displayText = cl?.s?.numFmt
-        ? formatNumber(raw, cl.s.numFmt)
-        : displayVal(raw);
+//       const displayText = cl?.s?.numFmt
+//         ? formatNumber(raw, cl.s.numFmt)
+//         : displayVal(raw);
 
-      let inner = first;
-      if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
-        inner = td.querySelector('.cell-inner');
-        if (!inner) {
-          inner = document.createElement('div');
-          inner.className = 'cell-inner';
-          td.insertBefore(inner, td.firstChild);
-        }
-      }
+//       let inner = first;
+//       if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
+//         inner = td.querySelector('.cell-inner');
+//         if (!inner) {
+//           inner = document.createElement('div');
+//           inner.className = 'cell-inner';
+//           td.insertBefore(inner, td.firstChild);
+//         }
+//       }
 
-      if (inner.textContent !== displayText) {
-        inner.textContent = displayText;
-      }
-    }
-  }
-}
+//       if (inner.textContent !== displayText) {
+//         inner.textContent = displayText;
+//       }
+//     }
+//   }
+// }
 
 /* =========================================================
    FULL MODE — hitung HF, update cache
    ========================================================= */
-function renderVisibleCellsFull() {
-  const rowMap = getRowMap();
+// function renderVisibleCellsFull() {
+//   const rowMap = getRowMap();
 
-  for (let di = visibleStart; di < visibleEnd; di++) {
-    const r = rowMap ? rowMap[di] : di;
-    const tr = rowEls[r];
-    if (!tr) continue;
+//   for (let di = visibleStart; di < visibleEnd; di++) {
+//     const r = rowMap ? rowMap[di] : di;
+//     const tr = rowEls[r];
+//     if (!tr) continue;
 
-    const children = tr.children;
-    for (let i = 1; i < children.length; i++) {
-      const td = children[i];
-      if (!td.dataset || !td.dataset.addr) continue;
+//     const children = tr.children;
+//     for (let i = 1; i < children.length; i++) {
+//       const td = children[i];
+//       if (!td.dataset || !td.dataset.addr) continue;
 
-      const p = parseAddr(td.dataset.addr);
-      if (!p) continue;
+//       const p = parseAddr(td.dataset.addr);
+//       if (!p) continue;
 
-      const first = td.firstElementChild;
-      if (first && first.tagName === 'INPUT') continue;
+//       const first = td.firstElementChild;
+//       if (first && first.tagName === 'INPUT') continue;
 
-      const addr = td.dataset.addr;
-      const cl = sheet().cells[addr];
+//       const addr = td.dataset.addr;
+//       const cl = sheet().cells[addr];
 
-      let raw = '';
-      if (cl) {
-        if (cl.f) {
-          // 🎯 Panggil HF hanya untuk formula
-          try {
-            raw = hfGet(p.r, p.c);
-          } catch {
-            raw = '#REF!';
-          }
-          // Simpan ke cache
-          _hfValueCache.set(addr, raw);
-        } else {
-          raw = cl.v ?? '';
-        }
-      }
+//       let raw = '';
+//       if (cl) {
+//         if (cl.f) {
+//           // 🎯 Panggil HF hanya untuk formula
+//           try {
+//             raw = hfGet(p.r, p.c);
+//           } catch {
+//             raw = '#REF!';
+//           }
+//           // Simpan ke cache
+//           _hfValueCache.set(addr, raw);
+//         } else {
+//           raw = cl.v ?? '';
+//         }
+//       }
 
-      const displayText = cl?.s?.numFmt
-        ? formatNumber(raw, cl.s.numFmt)
-        : displayVal(raw);
+//       const displayText = cl?.s?.numFmt
+//         ? formatNumber(raw, cl.s.numFmt)
+//         : displayVal(raw);
 
-      let inner = first;
-      if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
-        inner = td.querySelector('.cell-inner');
-        if (!inner) {
-          inner = document.createElement('div');
-          inner.className = 'cell-inner';
-          td.insertBefore(inner, td.firstChild);
-        }
-      }
+//       let inner = first;
+//       if (!inner || !inner.classList || !inner.classList.contains('cell-inner')) {
+//         inner = td.querySelector('.cell-inner');
+//         if (!inner) {
+//           inner = document.createElement('div');
+//           inner.className = 'cell-inner';
+//           td.insertBefore(inner, td.firstChild);
+//         }
+//       }
 
-      if (inner.textContent !== displayText) {
-        inner.textContent = displayText;
-      }
-    }
-  }
-}
+//       if (inner.textContent !== displayText) {
+//         inner.textContent = displayText;
+//       }
+//     }
+//   }
+// }
 
 /* =========================================================
-   BUILD ROW — dengan colSpan & rowSpan native
+   BUILD ROW — dengan colSpan & rowSpan native + FILTER HEADER
    ========================================================= */
 function buildRowWithMerges(r, visibleMerges) {
   const tr = document.createElement('tr');
-  tr.style.height = ROW_H + 'px';
+  const sheetRowH = sheet().rowHeights?.[r] || sheet().rowHeight || ROW_H;
+  tr.style.height = sheetRowH + 'px';
+  tr.dataset.row = r;
 
+  // 🎯 Cek apakah baris ini = header filter
+  const headerRow = getFilterHeaderRow();
+  const isHeaderRow = filterMode && (r === headerRow);
+  const filters = sheet().filters || {};
+
+  if (isHeaderRow) tr.classList.add('filter-header-row');
+
+  /* ---------- ROW HEADER (th) ---------- */
   const th = document.createElement('th');
   th.textContent = r + 1;
   th.dataset.row = r;
-  // Grip resize — INLINE STYLE
+  th.style.width = '48px';
+  th.style.minWidth = '48px';
+  th.style.maxWidth = '48px';
+  th.style.boxSizing = 'border-box';
+  if (isHeaderRow) th.classList.add('filter-header-row');
+
+  const summaryGroup = getGroupSummaryAt(r);
+  const insideGroup = getRowGroupAt(r);
+
+  if (summaryGroup) {
+    const btn = document.createElement('button');
+    btn.className = 'row-group-btn' + (summaryGroup.collapsed ? '' : ' expanded');
+    btn.textContent = summaryGroup.collapsed ? '+' : '−';
+    btn.title = summaryGroup.collapsed ? 'Expand' : 'Collapse';
+    btn.type = 'button';
+    btn.dataset.groupFrom = summaryGroup.from;
+    th.appendChild(btn);
+  }
+
+  if (insideGroup && !summaryGroup) {
+    th.classList.add('row-group-line');
+  }
+
+  // Grip resize
   const grip = document.createElement('div');
   grip.className = 'row-resize-grip';
   grip.dataset.row = r;
@@ -1193,6 +1414,7 @@ function buildRowWithMerges(r, visibleMerges) {
   th.appendChild(grip);
   tr.appendChild(th);
 
+  /* ---------- CELLS ---------- */
   let c = 0;
   while (c < COLS) {
     // Cari merge yang mencakup (r, c)
@@ -1206,25 +1428,44 @@ function buildRowWithMerges(r, visibleMerges) {
 
     if (found) {
       if (r === found.r0 && c === found.c0) {
-        // Top-left — emit td dengan colSpan + rowSpan
+        // -------- Top-left merged cell --------
         const td = document.createElement('td');
         td.dataset.addr = addrOf(r, c);
+        td.dataset.col = c;
         td.colSpan = found.c1 - found.c0 + 1;
         td.rowSpan = found.r1 - found.r0 + 1;
         td.classList.add('merged-tl');
+
         const inner = document.createElement('div');
         inner.className = 'cell-inner';
         td.appendChild(inner);
         tr.appendChild(td);
         c = found.c1 + 1;
       } else {
-        // Covered — skip kolom ini (ditangani colSpan/rowSpan di atas)
+        // Covered — skip kolom ini
         c = found.c1 + 1;
       }
     } else {
-      // Cell normal
+      // -------- Cell normal --------
       const td = document.createElement('td');
       td.dataset.addr = addrOf(r, c);
+      td.dataset.col = c;
+
+      // 🎯 Kalau baris ini header filter → tambah tombol ▼
+      if (isHeaderRow) {
+        td.classList.add('filter-header-cell');
+        const isActive = filters[c]?.values?.length > 0;
+        if (isActive) td.classList.add('filtered-cell');
+
+        const btn = document.createElement('button');
+        btn.className = 'fx-filter-btn-inline' + (isActive ? ' active' : '');
+        btn.dataset.filterCol = c;
+        btn.title = 'Filter ' + colName(c);
+        btn.type = 'button';
+        btn.textContent = '▼';
+        td.appendChild(btn);
+      }
+
       const inner = document.createElement('div');
       inner.className = 'cell-inner';
       td.appendChild(inner);
@@ -1238,38 +1479,57 @@ function buildRowWithMerges(r, visibleMerges) {
 
 function renderVisibleCells() {
   const rowMap = getRowMap();
-  for (let di = visibleStart; di < visibleEnd; di++) {
-    const r = rowMap ? rowMap[di] : di;
+
+  // Frozen rows dulu
+  const frozenRowCount = Math.min(sheet().freezeRow || 0, 20);
+  for (let r = 0; r < frozenRowCount; r++) {
     const tr = rowEls[r];
     if (!tr) continue;
-    // Iterasi td asli (colSpan sudah handle cell yang di-cover)
-    const tds = tr.querySelectorAll('td[data-addr]');
-    tds.forEach(td => {
-      const addr = td.dataset.addr;
-      const p = parseAddr(addr);
-      if (p) updateCellDisplay(td, p.r, p.c);
-    });
-  }
-}
-
-function renderVisibleCellsFast() {
-  const rowMap = getRowMap();
-
-  for (let di = visibleStart; di < visibleEnd; di++) {
-    const r = rowMap ? rowMap[di] : di;
-    const tr = rowEls[r];
-    if (!tr) continue;
-
-    // 🎯 Pakai children langsung (lebih cepat dari querySelectorAll)
     const children = tr.children;
     for (let i = 1; i < children.length; i++) {
       const td = children[i];
-      if (!td.dataset || !td.dataset.addr) continue;
-      const p = parseAddr(td.dataset.addr);
-      if (p) updateCellDisplayFast(td, p.r, p.c);
+      const addr = td.dataset?.addr;
+      if (!addr) continue;
+      const p = parseAddr(addr);
+      if (p) updateCellDisplay(td, p.r, p.c);
+    }
+  }
+
+  // Visible rows
+  for (let di = visibleStart; di < visibleEnd; di++) {
+    const r = rowMap ? rowMap[di] : di;
+    const tr = rowEls[r];
+    if (!tr) continue;
+
+    const children = tr.children;
+    for (let i = 1; i < children.length; i++) {
+      const td = children[i];
+      const addr = td.dataset?.addr;
+      if (!addr) continue;
+      const p = parseAddr(addr);
+      if (p) updateCellDisplay(td, p.r, p.c);
     }
   }
 }
+
+// function renderVisibleCellsFast() {
+//   const rowMap = getRowMap();
+
+//   for (let di = visibleStart; di < visibleEnd; di++) {
+//     const r = rowMap ? rowMap[di] : di;
+//     const tr = rowEls[r];
+//     if (!tr) continue;
+
+//     // 🎯 Pakai children langsung (lebih cepat dari querySelectorAll)
+//     const children = tr.children;
+//     for (let i = 1; i < children.length; i++) {
+//       const td = children[i];
+//       if (!td.dataset || !td.dataset.addr) continue;
+//       const p = parseAddr(td.dataset.addr);
+//       if (p) updateCellDisplayFast(td, p.r, p.c);
+//     }
+//   }
+// }
 
 function updateCellDisplayFast(td, r, c) {
   if (!td) return;
@@ -1359,13 +1619,16 @@ function forceRenderCell(td, r, c) {
   let raw = '';
 
   if (cl && cl.f) {
-    try {
-      raw = hfGet(r, c);
-      if (raw === '' || raw === null || raw === undefined) {
+    // 🎯 Guard: skip HF kalau di luar range
+    if (!hf || !hf.__maxR || r >= hf.__maxR || c >= hf.__maxC) {
+      raw = cl.v ?? '';
+    } else {
+      try {
+        raw = hfGet(r, c);
+        if (raw === '' || raw === null || raw === undefined) raw = '#REF!';
+      } catch {
         raw = '#REF!';
       }
-    } catch {
-      raw = '#REF!';
     }
   } else {
     raw = cl?.v ?? '';
@@ -1377,16 +1640,66 @@ function forceRenderCell(td, r, c) {
     inner.className = 'cell-inner';
     td.insertBefore(inner, td.firstChild);
   }
-  inner.textContent = cl?.s?.numFmt
-    ? formatNumber(raw, cl.s.numFmt)
-    : displayVal(raw);
+
+  let newText;
+  if (_showFormulas && cl?.f) {
+    // 🎯 Tampilkan formula mentah, bukan hasil
+    newText = cl.f;
+  } else {
+    newText = cl?.s?.numFmt
+      ? formatNumber(raw, cl.s.numFmt)
+      : displayVal(raw);
+  }
+
+  // 🎯 Hanya update kalau text beda
+  if (inner.textContent !== newText) {
+    inner.textContent = newText;
+  }
 
   const isNum = typeof raw === 'number' || (!isNaN(Number(raw)) && raw !== '');
-  td.classList.toggle('num-cell', isNum && String(inner.textContent).length > 8);
-  inner.classList.toggle('cell-link', !!cl?.link);
-
+  const wantNumCell = isNum && newText.length > 8;
+  if (td.classList.contains('num-cell') !== wantNumCell) {
+    td.classList.toggle('num-cell', wantNumCell);
+  }
+  td.classList.toggle('cell-link', !!cl?.link);
   td.classList.toggle('error', !!isErr(raw));
-  applyFormat(td, cl?.s || {});
+
+  // 🎯 Style: apply hanya kalau berubah (via styleKey)
+  const styleKey = JSON.stringify(cl?.s || {});
+  if (td.dataset.styleKey !== styleKey) {
+    td.dataset.styleKey = styleKey;
+    applyFormat(td, cl?.s || {});
+  }
+  // 🎯 Highlight formula
+  if (_highlightFormulas && cl?.f) {
+    td.classList.add('has-formula');
+  } else {
+    td.classList.remove('has-formula');
+  }
+
+  // 🎯 Highlight error
+  const isError = isErr(raw) || (typeof raw === 'string' && raw.startsWith('#'));
+  if (isError) {
+    td.classList.add('has-error');
+  } else {
+    td.classList.remove('has-error');
+  }
+  const text = String(newText || '');
+  const hasNewline = text.includes('\n');
+  td.classList.toggle('multiline', hasNewline);
+  // 🎯 Lock indicator
+  const sh = sheet();
+  if (sh.protected) {
+    if (isCellUnlocked(addr)) {
+      td.classList.add('cell-unlocked');
+      td.classList.remove('cell-locked');
+    } else {
+      td.classList.add('cell-locked');
+      td.classList.remove('cell-unlocked');
+    }
+  } else {
+    td.classList.remove('cell-locked', 'cell-unlocked');
+  }
 }
 
 function updateCellDisplay(td, r, c) {
@@ -1418,6 +1731,7 @@ function renderSheet() {
   renderVirtual();
   renderCharts();
   renderImages();
+  renderAllPivots();
 }
 
 /* Alias — banyak kode lama panggil renderAll() */
@@ -1449,30 +1763,74 @@ function invalidateRowMap() { cachedRowMap = null; }
 
 function getRowMap() {
   const filters = getActiveFilters();
-  if (!filters.length) return null;      // null = no filter → identity
+  const advFilters = getAdvancedFilters();
+  const collapsedSet = getCollapsedRowSet();
 
+  const hasBasic = filters.length > 0;
+  const hasAdv = advFilters.length > 0;
+  const hasCollapse = collapsedSet.size > 0;
+
+  // Fast path
+  if (!hasBasic && !hasAdv && !hasCollapse) return null;
   if (cachedRowMap) return cachedRowMap;
 
-  // Cari max row dengan data
-  let maxR = 100;
-  for (const a of Object.keys(sheet().cells || {})) {
-    const p = parseAddr(a);
-    if (p && p.r > maxR) maxR = p.r;
+  const headerRow = getFilterHeaderRow();
+  const sh = sheet();
+
+  let maxR = sh._cachedMaxR;
+  if (maxR === undefined) {
+    maxR = 100;
+    for (const a of Object.keys(sh.cells || {})) {
+      const p = parseAddr(a);
+      if (p && p.r > maxR) maxR = p.r;
+    }
+    sh._cachedMaxR = maxR;
   }
   maxR += 20;
 
   const out = [];
-  out.push(0);
-  for (let r = 1; r <= maxR; r++) {
-    let pass = true;
-    for (const [col, f] of filters) {
-      const c = parseInt(col, 10);
-      const raw = sheet().cells[addrOf(r, c)];
-      const v = raw ? String(raw.v ?? '') : '';
-      if (!f.values.includes(v)) { pass = false; break; }
+
+  // Header filter row
+  if (hasBasic) out.push(headerRow);
+
+  for (let r = 0; r <= maxR; r++) {
+    // Skip collapsed
+    if (collapsedSet.has(r)) continue;
+
+    // Skip header filter row (sudah di-push)
+    if (hasBasic && r === headerRow) continue;
+    if (hasBasic && r < headerRow) continue;
+
+    // Basic filter
+    if (hasBasic) {
+      let pass = true;
+      for (const [col, f] of filters) {
+        const c = parseInt(col, 10);
+        const cl = sh.cells[addrOf(r, c)];
+        let v = '';
+        if (cl) {
+          if (cl.f) {
+            try { v = String(hfGet(r, c) ?? ''); } catch { v = ''; }
+          } else {
+            v = String(cl.v ?? '');
+          }
+        }
+        if (!f.values.includes(v)) { pass = false; break; }
+      }
+      if (!pass) continue;
     }
-    if (pass) out.push(r);
+
+    // 🎯 Advanced filter
+    if (hasAdv && r > headerRow) {
+      if (!checkAdvancedFilterMatch(r, advFilters)) continue;
+    }
+    // Skip header row kalau cuma advanced filter
+    if (hasAdv && !hasBasic && r === headerRow) continue;
+    if (hasAdv && !hasBasic && r < headerRow) continue;
+
+    out.push(r);
   }
+
   cachedRowMap = out;
   return out;
 }
@@ -1595,19 +1953,23 @@ function applyBorder(td, s) {
 }
 
 function applyFormat(td, s) {
-  td.style.fontWeight = s.bold ? '700' : '';
-  td.style.fontStyle = s.italic ? 'italic' : '';
+  s = s || {};   // guard
+
+  td.style.fontWeight   = s.bold      ? '700' : '';
+  td.style.fontStyle    = s.italic    ? 'italic' : '';
   td.style.textDecoration =
     [s.underline ? 'underline' : '', s.strike ? 'line-through' : '']
       .filter(Boolean).join(' ') || '';
   td.style.fontFamily = s.fontFamily || '';
-  td.style.fontSize = s.fontSize ? s.fontSize + 'px' : '';
-  td.style.color = s.color || '';
-  td.style.background = s.bg || '';
+  td.style.fontSize   = s.fontSize ? s.fontSize + 'px' : '';
+  td.style.color      = s.color || '';
+  // 🎯 JANGAN set background kalau tidak ada bg di style
+  if (s.bg !== undefined) {
+    td.style.background = s.bg || '';
+  }
   td.style.textAlign = s.align || '';
   td.classList.toggle('wrap', !!s.wrap);
 
-  // 🎯 Border dinamis
   applyBorder(td, s);
 }
 
@@ -1632,8 +1994,9 @@ function formatNumber(v, fmt) {
    SELECTION
    ========================================================= */
 function applySelectionStyles() {
-  document.querySelectorAll('#grid td.active').forEach(td => td.classList.remove('active'));
-  document.querySelectorAll('#grid td.selected').forEach(td => td.classList.remove('selected'));
+  // Clear dulu
+  document.querySelectorAll('#grid tbody td.active, #grid tbody td.selected')
+    .forEach(td => td.classList.remove('active', 'selected'));
 
   const p1 = parseAddr(selection.start);
   const p2 = parseAddr(selection.end);
@@ -1643,28 +2006,25 @@ function applySelectionStyles() {
   const selC0 = Math.min(p1.c, p2.c), selC1 = Math.max(p1.c, p2.c);
   const activeP = parseAddr(activeCell);
 
-  const rowMap = getRowMap();
-  for (let di = visibleStart; di < visibleEnd; di++) {
-    const r = rowMap ? rowMap[di] : di;
-    const tr = rowEls[r];
-    if (!tr) continue;
-    const tds = tr.querySelectorAll('td[data-addr]');
-    tds.forEach(td => {
-      const addr = td.dataset.addr;
-      const p = parseAddr(addr);
-      if (!p) return;
-      // Td (TL atau normal) overlap dengan selection?
-      const tdR1 = p.r + (td.rowSpan || 1) - 1;
-      const tdC1 = p.c + (td.colSpan || 1) - 1;
-      const overlap = !(tdR1 < selR0 || p.r > selR1 || tdC1 < selC0 || p.c > selC1);
-      if (!overlap) return;
+  // Iterate SEMUA td di DOM (hanya ~30 baris yang ter-render karena virtual)
+  document.querySelectorAll('#grid tbody td[data-addr]').forEach(td => {
+    const p = parseAddr(td.dataset.addr);
+    if (!p) return;
 
-      if (activeP && p.r === activeP.r && p.c === activeP.c) {
-        td.classList.add('active');
-      } else {
-        td.classList.add('selected');
-      }
-    });
+    // Overlap check (akomodasi merge)
+    const tdR1 = p.r + (td.rowSpan || 1) - 1;
+    const tdC1 = p.c + (td.colSpan || 1) - 1;
+    const overlap = !(tdR1 < selR0 || p.r > selR1 || tdC1 < selC0 || p.c > selC1);
+    if (!overlap) return;
+
+    if (activeP && p.r === activeP.r && p.c === activeP.c) {
+      td.classList.add('active');
+    } else {
+      td.classList.add('selected');
+    }
+  });
+   if (typeof showFillHandle === 'function') {
+    setTimeout(showFillHandle, 0);
   }
 }
 
@@ -1829,7 +2189,14 @@ function updateStatusStats() {
    DELTA SAVE TRACKING
    ========================================================= */
 function markCellDirty(addr) {
-  const cur = sheet().cells[addr];
+  // 🎯 Invalidate semua cache
+  if (typeof invalidateCommentCache === 'function') invalidateCommentCache();
+  if (typeof invalidateValidationCache === 'function') invalidateValidationCache();
+
+  const sh = sheet();
+  if (sh) sh._cachedMaxR = undefined;   // reset cache maxR
+
+  const cur = sh?.cells?.[addr];
   dirtyCells[addr] = cur ? JSON.parse(JSON.stringify(cur)) : null;
   dirty = true;
   updateSaveIndicator();
@@ -1861,8 +2228,12 @@ function findTd(addr) {
 }
 
 function openEditor(addr, initial) {
-    if (currentAccessMode === 'view') {
+  if (currentAccessMode === 'view') {
     toast('👁 Mode lihat saja — tidak bisa edit');
+    return;
+  }
+  if (isCellLocked(addr)) {
+    toast('🔒 Cell terkunci — klik kanan → Unlock Cell untuk membuka');
     return;
   }
   if (editor) return;
@@ -1884,51 +2255,93 @@ function openEditor(addr, initial) {
   if (initial === undefined) input.select();
   else input.setSelectionRange(input.value.length, input.value.length);
 
-  autoResizeEditor();
-  input.addEventListener('input', autoResizeEditor);
-
+  let _resizeRAF = null;
   function autoResizeEditor() {
-    const len = String(input.value).length;
+    if (typeof input.style.height !== 'undefined') {
+      // Auto-height
+      input.style.height = 'auto';
+      const h = Math.max(td.offsetHeight, input.scrollHeight);
+      input.style.height = h + 'px';
+    }
+
+    const lines = String(input.value).split('\n');
+    const maxLineLen = Math.max(...lines.map(l => l.length), 1);
     const tdW = td.offsetWidth || 96;
-    // Lebar karakter rata-rata font 12px ≈ 7.5px
-    const spillW = (len + 3) * 7.5 + 14;
+    const spillW = (maxLineLen + 3) * 7.5 + 14;
     const targetW = Math.max(tdW, Math.min(spillW, 600));
     input.style.width = targetW + 'px';
   }
 
+    autoResizeEditor();
+
+    updateMultilineClass(input, td);
+
+    input.addEventListener('input', () => {
+      autoResizeEditor();
+      updateMultilineClass(input, td);
+    });
+
     input.addEventListener('keydown', e => {
-    if (insertingRefMode) return;
+      if (insertingRefMode) return;
 
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const val = input.value;
-
-      // 🎯 Cegah Enter kalau formula belum lengkap
-      if (val.startsWith('=') && !isFormulaComplete(val)) {
-        toast('⚠ Formula belum lengkap — tutup tanda kurung dulu');
+      // 🎯 ALT+ENTER = line break (bukan commit)
+      if (e.key === 'Enter' && e.altKey) {
+        e.preventDefault();
+        const pos = input.selectionStart ?? input.value.length;
+        const before = input.value.slice(0, pos);
+        const after = input.value.slice(pos);
+        input.value = before + '\n' + after;
+        input.setSelectionRange(pos + 1, pos + 1);
+        updateMultilineClass(input, td);
+        autoResizeEditor();
         return;
       }
 
-      commit(addr, val);
-      closeEditor();
-      if (!editor) moveSel(1, 0);
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      closeEditor();
-    } else if (e.key === 'Tab') {
-      e.preventDefault();
-      const val = input.value;
-
-      if (val.startsWith('=') && !isFormulaComplete(val)) {
-        toast('⚠ Formula belum lengkap');
+      // 🎯 CTRL+ENTER = line break (alternatif Mac)
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        const pos = input.selectionStart ?? input.value.length;
+        const before = input.value.slice(0, pos);
+        const after = input.value.slice(pos);
+        input.value = before + '\n' + after;
+        input.setSelectionRange(pos + 1, pos + 1);
+        updateMultilineClass(input, td);
+        autoResizeEditor();
         return;
       }
 
-      commit(addr, val);
-      closeEditor();
-      if (!editor) moveSel(0, e.shiftKey ? -1 : 1);
-    }
-  });
+      // ENTER biasa = commit & pindah bawah
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const val = input.value;
+
+        if (val.startsWith('=') && !isFormulaComplete(val)) {
+          toast('⚠ Formula belum lengkap — tutup tanda kurung dulu');
+          return;
+        }
+
+        commit(addr, val);
+        closeEditor();
+        if (!editor) moveSel(1, 0);
+      }
+      else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeEditor();
+      }
+      else if (e.key === 'Tab') {
+        e.preventDefault();
+        const val = input.value;
+
+        if (val.startsWith('=') && !isFormulaComplete(val)) {
+          toast('⚠ Formula belum lengkap');
+          return;
+        }
+
+        commit(addr, val);
+        closeEditor();
+        if (!editor) moveSel(0, e.shiftKey ? -1 : 1);
+      }
+    });
   input.addEventListener('blur', () => {
     if (insertingRefMode) return;
     if (!editor || editor.input !== input) return;
@@ -1980,6 +2393,16 @@ function setHFCellSafe(r, c, val) {
 function commit(addr, value) {
   const p = parseAddr(addr);
   if (!p) return;
+  if (currentAccessMode !== 'view' && isCellLocked(addr)) {
+    toast('🔒 Cell terkunci — tidak bisa edit');
+    return;
+  }
+  if (ensureRowCapacity(p.r)) {
+    if (typeof renderVirtual === 'function') {
+      window._lastRenderKey = null;
+      setTimeout(() => renderVirtual(false), 50);
+    }
+  }
   pushUndo();
   const raw = String(value);
 
@@ -2037,51 +2460,42 @@ function commit(addr, value) {
   if (typeof clearHFCache === 'function') clearHFCache();
   if (typeof invalidateHF === 'function') invalidateHF(addr);
   window._lastRenderKey = null;
+  window._lastFrozenKey = null;
 
   if (raw.startsWith('=') && /:\s*[A-Z]+\d{4,}/.test(raw)) warnBigRange();
 
   // =====================================================
-  // 5. RE-RENDER
+  // 5. RE-RENDER — 1x sync, + 1x delay kalau formula
   // =====================================================
-  const doRender = () => {
-    try {
+  const isFormula = newCell && newCell.f;
+
+  // 5a. Force render cell target langsung (safe remove input)
+  const tr = rowEls[p.r];
+  if (tr) {
+    const td = tr.children[p.c + 1];
+    if (td) {
+      // 🎯 Safe remove: cek parentNode dulu
+      td.querySelectorAll('input').forEach(inp => {
+        try { if (inp.parentNode) inp.parentNode.removeChild(inp); } catch {}
+      });
+      if (typeof forceRenderCell === 'function') {
+        forceRenderCell(td, p.r, p.c);
+      }
+    }
+  }
+
+  // 5b. Full re-render — sync
+  if (typeof renderVirtual === 'function') renderVirtual(false);
+
+  // 5c. Hanya kalau formula — re-render lagi setelah HF evaluate
+  if (isFormula) {
+    setTimeout(() => {
       if (typeof clearHFCache === 'function') clearHFCache();
       window._lastRenderKey = null;
-
-      // 5a. Force render cell target langsung (bypass semua cache)
-      const tr = rowEls[p.r];
-      if (tr) {
-        const td = tr.children[p.c + 1];
-        if (td) {
-          // Hapus input editor kalau masih ada
-          td.querySelectorAll('input').forEach(inp => inp.remove());
-          if (typeof forceRenderCell === 'function') {
-            forceRenderCell(td, p.r, p.c);
-            console.log('🎯 forceRenderCell:', addr, '→',
-                        JSON.stringify(td.querySelector('.cell-inner')?.textContent));
-          }
-        }
-      } else {
-        console.warn('⚠️ rowEls tidak punya row', p.r, '— forceRenderCell skip');
-      }
-
-      // 5b. Full re-render seluruh grid
+      window._lastFrozenKey = null;
       if (typeof renderVirtual === 'function') renderVirtual(false);
-      if (typeof renderCFVisible === 'function') renderCFVisible();
-      if (typeof applySelectionStyles === 'function') applySelectionStyles();
-    } catch (e) {
-      console.warn('doRender failed:', e);
-    }
-  };
-
-  // Render 1: langsung (sync)
-  doRender();
-
-  // Render 2: 100ms (untuk HF cross-sheet evaluate)
-  setTimeout(doRender, 100);
-
-  // Render 3: 500ms (backup)
-  setTimeout(doRender, 500);
+    }, 150);
+  }
 
   scheduleSave();
 
@@ -2113,9 +2527,13 @@ function scrollAddrIntoView(addr) {
 }
 
 function selectCell(addr, expandRange_ = false) {
+  // 🎯 Simpan header row LAMA (sebelum selection berubah)
+  const oldHeaderRow = filterMode ? getFilterHeaderRow() : null;
+
   if (expandRange_) selection.end = addr;
   else { selection.start = addr; selection.end = addr; }
   activeCell = expandRange_ ? selection.start : addr;
+
   scrollAddrIntoView(activeCell);
   updateSelectionUI();
 }
@@ -2284,6 +2702,7 @@ document.getElementById('grid').addEventListener('dblclick', e => {
 });
 
 document.addEventListener('keydown', e => {
+  e_shiftDown = e.shiftKey;
   if (editor) return;
   const tag = (e.target.tagName || '').toUpperCase();
   const inputFocused = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
@@ -2316,15 +2735,40 @@ document.addEventListener('keydown', e => {
   if (ctrl && e.key.toLowerCase() === 'c') { if (!inputFocused) { e.preventDefault(); doCopy(); } return; }
   if (ctrl && e.key.toLowerCase() === 'x') { if (!inputFocused) { e.preventDefault(); doCut(); } return; }
   if (ctrl && e.key.toLowerCase() === 'v') { if (!inputFocused) { e.preventDefault(); doPaste(); } return; }
+  if (ctrl && e.shiftKey && e.key.toLowerCase() === 'v') {
+    e.preventDefault();
+    doPasteSpecial('value');
+    return;
+  }
 
   if (inputFocused) return;
 
   const p = parseAddr(activeCell);
   if (!p) return;
-  if (e.key === 'ArrowUp') { e.preventDefault(); e.shiftKey ? selectCell(addrOf(Math.max(0, p.r - 1), p.c), true) : moveSel(-1, 0); }
-  else if (e.key === 'ArrowDown') { e.preventDefault(); e.shiftKey ? selectCell(addrOf(Math.min(ROWS - 1, p.r + 1), p.c), true) : moveSel(1, 0); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); e.shiftKey ? selectCell(addrOf(p.r, Math.max(0, p.c - 1)), true) : moveSel(0, -1); }
-  else if (e.key === 'ArrowRight') { e.preventDefault(); e.shiftKey ? selectCell(addrOf(p.r, Math.min(COLS - 1, p.c + 1)), true) : moveSel(0, 1); }
+  if (e.key === 'ArrowUp') {
+  e.preventDefault();
+  if (ctrl) jumpToEdge(p.r, p.c, -1, 0);
+    else if (e.shiftKey) selectCell(addrOf(Math.max(0, p.r - 1), p.c), true);
+    else moveSel(-1, 0);
+  }
+  else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (ctrl) jumpToEdge(p.r, p.c, 1, 0);
+    else if (e.shiftKey) selectCell(addrOf(Math.min(ROWS - 1, p.r + 1), p.c), true);
+    else moveSel(1, 0);
+  }
+  else if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    if (ctrl) jumpToEdge(p.r, p.c, 0, -1);
+    else if (e.shiftKey) selectCell(addrOf(p.r, Math.max(0, p.c - 1)), true);
+    else moveSel(0, -1);
+  }
+  else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    if (ctrl) jumpToEdge(p.r, p.c, 0, 1);
+    else if (e.shiftKey) selectCell(addrOf(p.r, Math.min(COLS - 1, p.c + 1)), true);
+    else moveSel(0, 1);
+  }
   else if (e.key === 'Enter') { e.preventDefault(); openEditor(activeCell); }
   else if (e.key === 'F2') { e.preventDefault(); openEditor(activeCell); }
   else if (e.key === 'Tab') { e.preventDefault(); moveSel(0, e.shiftKey ? -1 : 1); }
@@ -2338,17 +2782,83 @@ document.addEventListener('keydown', e => {
     }
 
     const parts = expandRange(selection.start, selection.end);
+    const sh = sheet();
+    let deletedCount = 0;
+    let skippedCount = 0;
+
     for (const a of parts) {
+      // 🎯 Cek lock
+      if (isCellLocked(a)) {
+        skippedCount++;
+        continue;
+      }
       delete sheet().cells[a];
       const pp = parseAddr(a);
       if (pp) hfSet(pp.r, pp.c, null);
       markCellDirty(a);
+      deletedCount++;
     }
-    renderVisibleCells(); renderCFVisible(); applySelectionStyles();
+
+    if (skippedCount > 0) {
+      toast(`⚠ ${skippedCount} cell terkunci (skip)`);
+    }
+
+    window._lastRenderKey = null;
+    window._lastFrozenKey = null;
+    renderVirtual(false);
   } else if (e.key.length === 1 && !ctrl && !e.altKey) {
     e.preventDefault(); openEditor(activeCell, e.key);
   }
 });
+
+/* =========================================================
+   CTRL+ARROW — jump ke data edge seperti Excel
+   ========================================================= */
+function jumpToEdge(r, c, dr, dc) {
+  const hasData = (row, col) => {
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return false;
+    const addr = addrOf(row, col);
+    const cell = sheet().cells[addr];
+    if (!cell) return false;
+    return (cell.v !== undefined && cell.v !== null && cell.v !== '') || !!cell.f;
+  };
+
+  let curR = r, curC = c;
+  const startHasData = hasData(r, c);
+
+  // Kalau sel sekarang kosong → cari data berikutnya
+  // Kalau sel sekarang ada data → cari data terakhir di blok yang sama
+  while (true) {
+    const nextR = curR + dr;
+    const nextC = curC + dc;
+    if (nextR < 0 || nextR >= ROWS || nextC < 0 || nextC >= COLS) break;
+
+    const nextHasData = hasData(nextR, nextC);
+
+    if (!startHasData) {
+      // Cari sampai ketemu data
+      if (nextHasData) { curR = nextR; curC = nextC; break; }
+      curR = nextR; curC = nextC;
+    } else {
+      // Cari sampai data habis (edge terakhir)
+      if (!nextHasData) break;
+      curR = nextR; curC = nextC;
+    }
+  }
+
+  const targetAddr = addrOf(curR, curC);
+  if (e_shiftDown) {
+    selection.end = targetAddr;
+    activeCell = selection.start;
+  } else {
+    selection = { start: targetAddr, end: targetAddr };
+    activeCell = targetAddr;
+  }
+  scrollAddrIntoView(targetAddr);
+  updateSelectionUI();
+}
+
+let e_shiftDown = false;  // simpan state shift
 
 /* =========================================================
    FORMULA BAR — robust handler (capture phase)
@@ -2455,17 +2965,184 @@ function doCopy() {
     addr: a,
     cell: sheet().cells[a] ? JSON.parse(JSON.stringify(sheet().cells[a])) : null
   }));
-  toast('📋 ' + parts.length + ' sel dicopy');
+
+  // 🎯 Build TSV untuk Excel/Notepad
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return;
+
+  const r0 = Math.min(p1.r, p2.r), r1 = Math.max(p1.r, p2.r);
+  const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+  const tsvRows = [];
+  const htmlRows = [];
+
+  for (let r = r0; r <= r1; r++) {
+    const tsvCols = [];
+    const htmlCols = [];
+
+    for (let c = c0; c <= c1; c++) {
+      const addr = addrOf(r, c);
+      const cl = sheet().cells[addr];
+
+      // 🎯 Nilai — pakai HF-evaluated kalau formula
+      let val = '';
+      if (cl) {
+        if (cl.f && hf) {
+          try { val = String(hfGet(r, c) ?? ''); } catch { val = ''; }
+        } else {
+          val = String(cl.v ?? '');
+        }
+      }
+
+      // Escape TSV: buang tab & newline
+      tsvCols.push(val.replace(/\t/g, ' ').replace(/\n/g, ' '));
+
+      // HTML: preserve formatting
+      htmlCols.push({
+        text: val,
+        style: cl?.s || {},
+        numFmt: cl?.s?.numFmt
+      });
+    }
+
+    tsvRows.push(tsvCols.join('\t'));
+    htmlRows.push(htmlCols);
+  }
+
+  const tsv = tsvRows.join('\r\n');
+
+  // 🎯 HTML table untuk paste ke Excel dengan format
+  const html = buildClipboardHTML(htmlRows);
+
+  // 🎯 Copy ke clipboard dengan multiple MIME types
+  copyRichClipboard(tsv, html).then(ok => {
+    if (ok) {
+      toast('📋 ' + parts.length + ' sel dicopy');
+    } else {
+      toast('📋 Copy fallback — coba lagi');
+    }
+  });
+
+  console.log('📋 Copied TSV:', tsv.slice(0, 200));
+}
+/* =========================================================
+   BUILD HTML TABLE untuk clipboard
+   ========================================================= */
+function buildClipboardHTML(htmlRows) {
+  if (!htmlRows.length) return '';
+
+  const styleForCell = (s) => {
+    if (!s) return '';
+    const parts = [];
+    if (s.bold) parts.push('font-weight:bold');
+    if (s.italic) parts.push('font-style:italic');
+    if (s.underline) parts.push('text-decoration:underline');
+    if (s.color) parts.push(`color:${s.color}`);
+    if (s.bg) parts.push(`background-color:${s.bg}`);
+    if (s.align) parts.push(`text-align:${s.align}`);
+    if (s.fontFamily) parts.push(`font-family:${s.fontFamily}`);
+    if (s.fontSize) parts.push(`font-size:${s.fontSize}px`);
+    return parts.join(';');
+  };
+
+  const escapeHtmlCell = (s) => String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+  const rows = htmlRows.map(row => {
+    const cells = row.map(c => {
+      const style = styleForCell(c.style);
+      const styleAttr = style ? ` style="${style}"` : '';
+      return `<td${styleAttr}>${escapeHtmlCell(c.text)}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><style>
+  table { border-collapse: collapse; }
+  td { padding: 2px 6px; border: 1px solid #ddd; font-family: Calibri, Arial, sans-serif; font-size: 11pt; }
+</style></head><body>
+<table>${rows}</table>
+</body></html>`;
+}
+/* =========================================================
+   COPY RICH CLIPBOARD — TSV + HTML
+   Bekerja di HTTP & HTTPS
+   ========================================================= */
+async function copyRichClipboard(tsv, html) {
+  // 1. Coba Clipboard API modern (butuh HTTPS/localhost)
+  if (navigator.clipboard && window.ClipboardItem) {
+    try {
+      const items = {
+        'text/plain': new Blob([tsv], { type: 'text/plain' }),
+      };
+      // Excel butuh text/html untuk preserve format
+      if (html) {
+        items['text/html'] = new Blob([html], { type: 'text/html' });
+      }
+      const item = new ClipboardItem(items);
+      await navigator.clipboard.write([item]);
+      return true;
+    } catch (e) {
+      console.warn('Clipboard API failed, fallback...', e);
+    }
+  }
+
+  // 2. Fallback: event listener copy + execCommand
+  try {
+    const handler = (e) => {
+      e.clipboardData.setData('text/plain', tsv);
+      if (html) e.clipboardData.setData('text/html', html);
+      e.preventDefault();
+      document.removeEventListener('copy', handler);
+    };
+    document.addEventListener('copy', handler);
+
+    // Trigger copy command
+    const ok = document.execCommand('copy');
+
+    // Cleanup
+    document.removeEventListener('copy', handler);
+
+    if (ok) return true;
+  } catch (e) {
+    console.warn('execCommand copy failed:', e);
+  }
+
+  // 3. Fallback terakhir: textarea + execCommand
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = tsv;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.setAttribute('readonly', '');
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) return true;
+  } catch (e) {
+    console.warn('Textarea copy failed:', e);
+  }
+
+  return false;
 }
 function doCut() {
-  doCopy(); pushUndo();
+  doCopy();      // sudah handle clipboard rich
+  pushUndo();
   for (const { addr } of clipboard) {
     delete sheet().cells[addr];
     const p = parseAddr(addr);
     if (p) hfSet(p.r, p.c, null);
     markCellDirty(addr);
   }
-  renderVisibleCells(); renderCFVisible(); applySelectionStyles();
+  window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  renderVirtual(false);
   toast('✂️ cut');
 }
 function doPaste() {
@@ -2671,11 +3348,18 @@ document.getElementById('btn-clear-fmt').onclick = () =>
    UNDO / REDO
    ========================================================= */
 function snapshot() {
-  return JSON.stringify({ sheets: wbData.sheets, activeSheet: activeSheetIdx });
+  return JSON.stringify({ sheets: wbData.sheets, activeSheet: activeSheetIdx,wbName: wbName });
 }
+let _undoSkipWarned = false;
 function pushUndo() {
   const snap = snapshot();
-  if (snap.length > 2_000_000) return;
+  if (snap.length > 20_000_000) {
+    if (!_undoSkipWarned) {
+      console.warn('⚠ Snapshot >20MB — undo dilewati untuk workbook besar');
+      _undoSkipWarned = true;
+    }
+    return;
+  }
   undoStack.push(snap);
   while (undoStack.length > 20) undoStack.shift();
   redoStack = [];
@@ -2685,18 +3369,81 @@ function undo() {
   redoStack.push(snapshot());
   const prev = JSON.parse(undoStack.pop());
   wbData.sheets = prev.sheets;
+
   clearHFCache();
+
+  // 🎯 RESET SEMUA CACHE RENDER
   window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  window._lastFrozenRow = null;
+  window._lastFrozenCol = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
   activeSheetIdx = Math.min(prev.activeSheet, wbData.sheets.length - 1);
-  resetHF(); renderSheetTabs(); renderSheet(); markDirty(); toast('↶ undo');
+
+  // 🎯 Restore nama workbook (kalau ada di snapshot)
+  if (prev.wbName !== undefined) {
+    wbName = prev.wbName;
+    const el = document.getElementById('wb-name');
+    if (el) el.value = wbName;
+  }
+
+  // 🎯 Load filter state dari sheet yang di-restore
+  if (typeof loadFilterStateFromSheet === 'function') {
+    try { loadFilterStateFromSheet(); } catch {}
+  }
+
+  resetHF();
+  renderSheetTabs();
+  renderSheet();
+
+  // 🎯 Paksa render ulang total
+  window._lastFrozenKey = null;
+  renderVirtual(false);
+
+  markDirty();
+  toast('↶ undo');
 }
+
 function redo() {
   if (!redoStack.length) return toast('Tidak ada redo');
   undoStack.push(snapshot());
   const next = JSON.parse(redoStack.pop());
   wbData.sheets = next.sheets;
+
+  clearHFCache();
+
+  window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  window._lastFrozenRow = null;
+  window._lastFrozenCol = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
   activeSheetIdx = Math.min(next.activeSheet, wbData.sheets.length - 1);
-  resetHF(); renderSheetTabs(); renderSheet(); markDirty(); toast('↷ redo');
+
+  if (next.wbName !== undefined) {
+    wbName = next.wbName;
+    const el = document.getElementById('wb-name');
+    if (el) el.value = wbName;
+  }
+
+  if (typeof loadFilterStateFromSheet === 'function') {
+    try { loadFilterStateFromSheet(); } catch {}
+  }
+
+  resetHF();
+  renderSheetTabs();
+  renderSheet();
+
+  window._lastFrozenKey = null;
+  renderVirtual(false);
+
+  markDirty();
+  toast('↷ redo');
 }
 document.getElementById('btn-undo').onclick = undo;
 document.getElementById('btn-redo').onclick = redo;
@@ -2704,83 +3451,139 @@ document.getElementById('btn-redo').onclick = redo;
 /* =========================================================
    SHEET TABS
    ========================================================= */
-/* =========================================================
-   RENDER SHEET TABS
-   ========================================================= */
 function renderSheetTabs() {
   const cont = document.getElementById('sheet-tabs');
   cont.innerHTML = '';
 
   wbData.sheets.forEach((s, i) => {
+    // Skip hidden sheet (kecuali active — biar user tidak bingung)
+    if (s.hidden && i !== activeSheetIdx) return;
+
     const btn = document.createElement('button');
     btn.className = 'sheet-tab' + (i === activeSheetIdx ? ' active' : '');
     btn.textContent = s.name;
+    btn.dataset.idx = i;
+    btn.draggable = true;
 
-    /* 🎯 FIX UTAMA: preventDefault saat mousedown kalau editor aktif dengan formula
-       → blur tidak fire → editor tetap hidup sampai switchSheet dipanggil */
+    // Tab color
+    if (s.tabColor) btn.dataset.color = s.tabColor;
+
+    // Prevent blur saat editor formula aktif
     btn.addEventListener('mousedown', e => {
       if (editor && editor.input && editor.input.value.startsWith('=')) {
-        e.preventDefault();   // ← KUNCI: cegah focus shift
+        e.preventDefault();
       }
-    }, true);   // capture phase — jalan sebelum handler lain
+    }, true);
 
+    // Click → switch
     btn.onclick = () => switchSheet(i);
 
+    // Double-click → rename
     btn.ondblclick = async () => {
       const n = await customPrompt('Nama sheet:', s.name, { title: 'Rename Sheet' });
       if (n && n.trim() && n.trim() !== s.name) {
         const oldName = s.name;
-        s.name = n.trim();
-        markDirty();
-        // ✅ Rebuild HF karena nama sheet berubah (formula cross-sheet lama invalid)
+        const newName = n.trim();
+
+        // 🎯 Update named ranges yang refer ke sheet ini
+        const ranges = wbData.namedRanges || {};
+        const escapedOld = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`^('?)${escapedOld}\\1!`);
+
+        for (const key in ranges) {
+          const ref = ranges[key];
+          if (re.test(ref)) {
+            const needsQuote = /[\s\-.]/.test(newName);
+            const newSheetRef = needsQuote
+              ? "'" + newName.replace(/'/g, "''") + "'!"
+              : newName + '!';
+            ranges[key] = ref.replace(re, newSheetRef);
+            console.log(`🔧 Updated named range "${key}": ${ref} → ${ranges[key]}`);
+          }
+        }
+
+        s.name = newName;
+        markMetaDirty('structure');
         try { resetHF(); } catch (e) { console.error(e); }
         renderSheetTabs();
         renderSheet();
-        toast(`✔ Sheet di-rename: "${oldName}" → "${s.name}"`);
+        scheduleSave();
+        toast(`✔ Sheet di-rename: "${oldName}" → "${newName}"`);
       }
     };
 
-    btn.oncontextmenu = async e => {
+    // Right-click → context menu
+    btn.oncontextmenu = e => {
       e.preventDefault();
-      if (wbData.sheets.length <= 1) return;
-      if (await customConfirm(
-        `Hapus sheet "${s.name}"?`,
-        { type: 'danger', okText: 'Hapus' }
-      )) {
-        wbData.sheets.splice(i, 1);
-        activeSheetIdx = Math.min(i, wbData.sheets.length - 1);
-        // ✅ Rebuild HF karena sheet hilang
-        try { resetHF(); } catch (err) { console.error(err); }
-        renderSheetTabs();
-        renderSheet();
-        markDirty();
-      }
+      e.stopPropagation();
+      openTabContextMenu(e.clientX, e.clientY, i);
     };
+
+    // Drag & drop reorder
+    btn.addEventListener('dragstart', e => {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(i));
+      btn.classList.add('dragging');
+      window._dragTabIdx = i;
+    });
+
+    btn.addEventListener('dragend', () => {
+      btn.classList.remove('dragging');
+      document.querySelectorAll('.sheet-tab').forEach(t => {
+        t.classList.remove('drag-over-left', 'drag-over-right');
+      });
+      window._dragTabIdx = null;
+    });
+
+    btn.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const rect = btn.getBoundingClientRect();
+      const isLeft = e.clientX < rect.left + rect.width / 2;
+      btn.classList.toggle('drag-over-left', isLeft);
+      btn.classList.toggle('drag-over-right', !isLeft);
+    });
+
+    btn.addEventListener('dragleave', () => {
+      btn.classList.remove('drag-over-left', 'drag-over-right');
+    });
+
+    btn.addEventListener('drop', e => {
+      e.preventDefault();
+      btn.classList.remove('drag-over-left', 'drag-over-right');
+      const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
+      if (isNaN(fromIdx) || fromIdx === i) return;
+
+      const rect = btn.getBoundingClientRect();
+      const isLeft = e.clientX < rect.left + rect.width / 2;
+      const toIdx = isLeft ? i : i + 1;
+
+      moveSheet(fromIdx, toIdx);
+    });
 
     cont.appendChild(btn);
   });
 }
 
-/* =========================================================
-   SWITCH SHEET — dengan Cross-Sheet Reference support
-   ========================================================= */
-  async function switchSheet(i) {
+async function switchSheet(i) {
+  invalidateCommentCache();
+  invalidateValidationCache();
   if (i === activeSheetIdx) return;
+
+  // 🎯 Simpan filter state sheet LAMA
+  saveFilterStateToSheet();
 
   clearHFCache();
   window._lastRenderKey = null;
-  /* ==========================================
-     🎯 Cek editor aktif
-     ========================================== */
+
+  // ==========================================
+  // Handle editor (cross-sheet mode)
+  // ==========================================
   if (editor) {
     const input = editor.input;
     const val = input.value;
 
     if (val.startsWith('=')) {
-      /* ------------------------------------------
-         Mode cross-sheet reference
-         Simpan state, pindah sheet, tampilkan banner
-         ------------------------------------------ */
       console.log('🎯 Cross-sheet mode aktif. Formula:', val);
 
       crossSheetRef = {
@@ -2789,83 +3592,247 @@ function renderSheetTabs() {
         formula: val
       };
 
-      // Tutup editor TANPA commit (formula masih disimpan di crossSheetRef)
       editor = null;
-      try { input.remove(); } catch (e) { /* ignore */ }
+      try { input.remove(); } catch {}
 
-      // Clear selection visual
       document.querySelectorAll('#grid td.active, #grid td.selected')
         .forEach(td => td.classList.remove('active', 'selected'));
 
-      // Save dulu sebelum pindah sheet
-      if (dirty) {
-        try { await saveWB(); } catch (e) { console.warn(e); }
-      }
+      if (dirty) { try { await saveWB(); } catch {} }
 
-      // Pindah sheet
+      await lazyLoadSheet(i);
+
       activeSheetIdx = i;
       wbData.activeSheet = i;
       dirtyMeta.activeSheet = true;
 
-      await resetHFLazy('Membuka sheet…');
+      loadFilterStateFromSheet();
+
+      await rebuildHFWithLoaded();
+
+      // 🎯 RENDER FINAL — semua async sudah selesai
+      forceRefreshGrid();
       renderSheetTabs();
-      renderSheet();
 
       activeCell = 'A1';
       selection = { start: 'A1', end: 'A1' };
       updateSelectionUI();
 
-      // Tampilkan banner cross-sheet
       showCrossSheetBanner();
       return;
     } else {
-      // Bukan formula → commit normal
-      try { closeEditor(); } catch (e) { console.warn(e); }
+      try { closeEditor(); } catch {}
     }
   }
 
-  /* ==========================================
-     Flow normal (tanpa editor aktif)
-     ========================================== */
-
-  if (dirty) {
-    try { await saveWB(); } catch (e) { console.warn(e); }
-  }
+  // ==========================================
+  // Normal switch
+  // ==========================================
+  if (dirty) { try { await saveWB(); } catch {} }
 
   destroyChartsForSheet(activeSheetIdx);
+
+  await lazyLoadSheet(i);
 
   activeSheetIdx = i;
   wbData.activeSheet = i;
   dirtyMeta.activeSheet = true;
 
-  await resetHFLazy('Membuka sheet…');
+  loadFilterStateFromSheet();
+
+  await rebuildHFWithLoaded();
+  await recalcRowsLimit(true);
+
+  // 🎯 RENDER FINAL — setelah semua async selesai
   renderSheetTabs();
-  renderSheet();
+  forceRefreshGrid();
 
   activeCell = 'A1';
   selection = { start: 'A1', end: 'A1' };
   updateSelectionUI();
 }
-document.getElementById('btn-add-sheet').onclick = () => {
-  wbData.sheets.push({
-    name: 'Sheet' + (wbData.sheets.length + 1),
-    cells: {},
-    colWidths: {}, rowHeight: 26,
-    cf: [], charts: [], merged: [], filters: {}
+
+/* =========================================================
+   FORCE REFRESH GRID — reset semua cache & render ulang
+   ========================================================= */
+function forceRefreshGrid() {
+  // Reset scroll ke atas
+  const gridWrapEl = document.getElementById('grid-wrap');
+  if (gridWrapEl) gridWrapEl.scrollTop = 0;
+
+  // Reset SEMUA cache
+  window._lastFrozenKey = null;
+  window._lastFrozenRow = null;
+  window._lastFrozenCol = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  if (typeof invalidateRowMap === 'function') invalidateRowMap();
+  if (typeof clearHFCache === 'function') clearHFCache();
+  if (typeof invalidateCommentCache === 'function') invalidateCommentCache();
+  if (typeof invalidateValidationCache === 'function') invalidateValidationCache();
+
+  // Render full
+  renderSheet();
+
+  // Reset cache LAGI (renderSheet internal bisa set ulang)
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  // Final render
+  renderVirtual(false);
+}
+/* =========================================================
+   LAZY LOAD SHEET — fetch sheet dari server kalau belum loaded
+   ========================================================= */
+async function lazyLoadSheet(i) {
+  if (!lazyLoadMode) return false;
+  if (loadedSheetIdxs.has(i)) {
+    console.log(`⚡ Sheet ${i} sudah loaded (skip fetch)`);
+    return false;
+  }
+
+  const sheetName = wbData.sheets[i]?.name || `Sheet${i + 1}`;
+  showLoading(`Memuat sheet "${sheetName}"…`);
+
+  try {
+    const t0 = performance.now();
+    const res = await fetch(`/api/sheets/${wbId}/sheet/${i}`, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const sheetData = await res.json();
+    wbData.sheets[i] = {
+      ...wbData.sheets[i],
+      ...sheetData,
+      cells: sheetData.cells || {}
+    };
+    loadedSheetIdxs.add(i);
+
+    const ms = (performance.now() - t0).toFixed(0);
+    const count = Object.keys(sheetData.cells || {}).length;
+    console.log(`✅ Lazy loaded sheet ${i} "${sheetName}": ${count} cells in ${ms}ms`);
+
+    hideLoading();
+    return true;
+  } catch (e) {
+    console.warn('Lazy load sheet failed:', e);
+    hideLoading();
+    toast('⚠ Gagal memuat sheet ' + sheetName);
+    return false;
+  }
+}
+
+/* =========================================================
+   REBUILD HF — hanya dengan sheet yang sudah di-load
+   ========================================================= */
+async function rebuildHFWithLoaded() {
+  if (hf) { try { hf.destroy(); } catch {} hf = null; }
+  if (typeof _sheetIdCache !== 'undefined') _sheetIdCache.clear();
+
+  const sheetsData = {};
+  let loadedCount = 0;
+
+  wbData.sheets.forEach((s, idx) => {
+    if (!loadedSheetIdxs.has(idx)) return;
+    loadedCount++;
+
+    let name = s.name || `Sheet${idx + 1}`;
+    let unique = name;
+    let n = 1;
+    while (sheetsData[unique] !== undefined) {
+      n++;
+      unique = name + '_' + n;
+    }
+    sheetsData[unique] = buildSheetMatrix(s);
   });
-  switchSheet(wbData.sheets.length - 1);
-  markDirty();
+
+  console.log(`🔧 Building HF with ${loadedCount}/${wbData.sheets.length} loaded sheets`);
+
+  if (loadedCount === 0) {
+    hf = HyperFormulaClass.buildFromArray([['']], { licenseKey: HF_LICENSE });
+    hf.__maxR = 50;
+    hf.__maxC = 26;
+    return;
+  }
+
+  try {
+    hf = HyperFormulaClass.buildFromSheets(sheetsData, { licenseKey: HF_LICENSE });
+    hf.__maxR = ROWS;
+    hf.__maxC = COLS;
+    console.log('✅ HF rebuilt. Sheets:', hf.getSheetNames());
+    attachHFListener();
+  } catch (e) {
+    console.error('HF multi-sheet build failed:', e);
+    // Fallback single sheet
+    const cur = sheet();
+    const matrix = buildSheetMatrix(cur);
+    const safeMatrix = (matrix && matrix.length && matrix[0] && matrix[0].length)
+      ? matrix : [['']];
+    hf = HyperFormulaClass.buildFromArray(safeMatrix, { licenseKey: HF_LICENSE });
+    hf.__maxR = safeMatrix.length || 50;
+    hf.__maxC = (safeMatrix[0] || []).length || 26;
+    attachHFListener();
+  }
+}
+document.getElementById('btn-add-sheet').onclick = async () => {
+  const newIdx = wbData.sheets.length;
+
+  // 🎯 Tambah dengan field lengkap
+  wbData.sheets.push({
+    name: 'Sheet' + (newIdx + 1),
+    cells: {},
+    colWidths: {},
+    rowHeight: 26,
+    cf: [],
+    charts: [],
+    merged: [],
+    filters: {},
+    images: [],
+    validations: [],
+    hidden: false,
+    tabColor: null,
+    rowGroups: [],
+    protected: false,
+    protectHash: null,
+    freezeRow: 0,
+    freezeCol: 0
+  });
+
+  // 🎯 Mark sheet baru as loaded
+  loadedSheetIdxs.add(newIdx);
+
+  // 🎯 Mark dirty SEBELUM switch (biar save tahu ada sheet baru)
+  markMetaDirty('structure');
+
+  // 🎯 Switch ke sheet baru
+  await switchSheet(newIdx);
+
+  // 🎯 Force save SEKARANG, jangan tunggu debounce
+  try { await saveWB(); } catch (e) { console.warn('Save after add sheet failed:', e); }
+
+  toast(`✔ Sheet "${wbData.sheets[newIdx].name}" dibuat`);
 };
 
 /* =========================================================
    RIBBON TABS
    ========================================================= */
 document.querySelectorAll('#ribbon-tabs button').forEach(b => {
+  if (!b.dataset.tab) return;
+
   b.onclick = () => {
     document.querySelectorAll('#ribbon-tabs button').forEach(x => x.classList.remove('active'));
     document.querySelectorAll('.ribbon-pane').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
-    document.querySelector(`.ribbon-pane[data-pane="${b.dataset.tab}"]`).classList.add('active');
+
+    const pane = document.querySelector(`.ribbon-pane[data-pane="${b.dataset.tab}"]`);
+    if (pane) pane.classList.add('active');
   };
 });
 
@@ -3060,26 +4027,19 @@ document.getElementById('btn-cf-clear').onclick = () => {
 
 function renderCF() { renderCFVisible(); }
 function renderCFVisible() {
-  // Reset semua CF
-  document.querySelectorAll('#grid td.cf').forEach(td => {
-    td.classList.remove('cf', 'cf-databar', 'cf-iconset');
-    td.style.background = '';
-    td.style.color = '';
-    td.style.backgroundImage = '';
-    // Hapus icon element
-    td.querySelectorAll('.cf-icon-el').forEach(el => el.remove());
-  });
+  // 🎯 Hanya reset CF override, JANGAN sentuh background biasa
+  document.querySelectorAll('#grid td.cf, #grid td.cf-databar, #grid td.cf-iconset')
+    .forEach(td => {
+      td.classList.remove('cf', 'cf-databar', 'cf-iconset');
+      td.style.removeProperty('background-image');
+      td.querySelectorAll('.cf-icon-el').forEach(el => el.remove());
+    });
 
-  // Re-apply format dasar dulu
-  for (let r = visibleStart; r < visibleEnd; r++) {
-    const tr = rowEls[r];
-    if (!tr) continue;
-    for (let c = 0; c < COLS; c++) {
-      const td = tr.children[c + 1];
-      if (!td) continue;
-      applyFormat(td, sheet().cells[td.dataset.addr]?.s || {});
-    }
-  }
+  // 🎯 Re-apply format dasar dari style user (pakai data-addr, bukan index)
+  document.querySelectorAll('#grid td[data-addr]').forEach(td => {
+    const cl = sheet().cells[td.dataset.addr];
+    applyFormat(td, cl?.s || {});
+  });
 
   // Apply CF rules
   for (const rule of (sheet().cf || [])) {
@@ -3092,25 +4052,26 @@ function renderCFVisible() {
 
     if (rule.type === 'colorScale' || rule.type === 'dataBar' || rule.type === 'iconSet') {
       applyVisualCF(rule, rMin, rMax, cMin, cMax);
-    } else if (rule.type === 'top' || rule.type === 'bottom' || rule.type === 'aboveAverage' || rule.type === 'belowAverage' || rule.type === 'duplicate' || rule.type === 'unique') {
+    } else if (rule.type === 'top' || rule.type === 'bottom' ||
+               rule.type === 'aboveAverage' || rule.type === 'belowAverage' ||
+               rule.type === 'duplicate' || rule.type === 'unique') {
       applyStatisticalCF(rule, p1, p2);
     } else {
-      // Basic rules (existing)
       for (let r = rMin; r <= rMax; r++) {
         const tr = rowEls[r];
         if (!tr) continue;
         for (let c = cMin; c <= cMax; c++) {
-          const td = tr.children[c + 1];
+          const td = tr.querySelector(`td[data-addr="${addrOf(r, c)}"]`);
           if (!td) continue;
-          const v = hfGet(r,c);
+          const v = hfGet(r, c);
           const n = Number(v);
           let match = false;
           switch (rule.type) {
             case 'greaterThan': match = !isNaN(n) && n > Number(rule.value); break;
-            case 'lessThan': match = !isNaN(n) && n < Number(rule.value); break;
-            case 'equal': match = String(v) === String(rule.value); break;
-            case 'between': match = !isNaN(n) && n >= Number(rule.value) && n <= Number(rule.value2); break;
-            case 'contains': match = String(v).toLowerCase().includes(String(rule.value).toLowerCase()); break;
+            case 'lessThan':    match = !isNaN(n) && n < Number(rule.value); break;
+            case 'equal':       match = String(v) === String(rule.value); break;
+            case 'between':     match = !isNaN(n) && n >= Number(rule.value) && n <= Number(rule.value2); break;
+            case 'contains':    match = String(v).toLowerCase().includes(String(rule.value).toLowerCase()); break;
           }
           if (match) {
             td.classList.add('cf');
@@ -3472,14 +4433,19 @@ document.getElementById('zoom').oninput = e => {
 };
 
 /* =========================================================
-   SAVE / LOAD — dengan queue & snapshot untuk hindari race
-   ========================================================= */
-/* =========================================================
    SAVE WORKBOOK — dengan batching untuk hindari OOM
+   + OFFLINE GUARD (stop retry saat server mati)
    ========================================================= */
 async function saveWB(forceFull = false) {
   if (!wbId) return;
   if (saving) { saveAgain = true; return; }
+
+  // 🎯 Skip total kalau offline
+  if (window._isOnline === false) {
+    const el = document.getElementById('save-status');
+    if (el) el.textContent = '⚠ offline — perubahan tersimpan lokal';
+    return;
+  }
 
   const auth = { 'Authorization': 'Bearer ' + token };
   const statusEl = document.getElementById('save-status');
@@ -3549,7 +4515,6 @@ async function saveWB(forceFull = false) {
   saving = true;
   if (statusEl) statusEl.textContent = '⟳ menyimpan…';
 
-  // 🎯 Helper untuk error response
   const getErrorText = async (res) => {
     try {
       const j = await res.json();
@@ -3563,27 +4528,38 @@ async function saveWB(forceFull = false) {
     const useFull = forceFull || metaToSave.structure;
 
     // =====================================================
-    // FULL SAVE (data ganti total, e.g. struktur berubah)
+    // FULL SAVE
     // =====================================================
     if (useFull) {
-      const res = await fetch(`/api/sheets/${wbId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...auth },
-        body: JSON.stringify({ name: wbName, data: wbData })
-      });
+      // 🎯 Cek semua sheet loaded dulu
+      const allLoaded = wbData.sheets.every((_, i) => loadedSheetIdxs.has(i));
+      
+      if (!allLoaded) {
+        console.warn(`⚠️ Full save DIBATALKAN — ${loadedSheetIdxs.size}/${wbData.sheets.length} sheet loaded`);
+        // Force delta save saja
+        // metaToSave.structure = false;
+        // Lanjut ke blok delta di bawah (kode tidak diubah)
+      } else {
+        // Aman, lanjut full save
+        const res = await fetch(`/api/sheets/${wbId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', ...auth },
+          body: JSON.stringify({ name: wbName, data: wbData })
+        });
 
-      if (!res.ok) throw new Error(await getErrorText(res));
+        if (!res.ok) throw new Error(await getErrorText(res));
 
-      for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
-      for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
-      dirty = false;
+        for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
+        for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
+        dirty = false;
 
-      if (statusEl) statusEl.textContent = '✔ tersimpan';
-      setTimeout(() => {
-        if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
-      }, 1800);
-      saveRetryCount = 0;
-      return;
+        if (statusEl) statusEl.textContent = '✔ tersimpan';
+        setTimeout(() => {
+          if (statusEl && statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+        }, 1800);
+        saveRetryCount = 0;
+        return;
+      }
     }
 
     // =====================================================
@@ -3599,23 +4575,46 @@ async function saveWB(forceFull = false) {
 
     console.log(`📤 Save: ${addrs.length} cells, ${batches.length} batches`);
 
-    // Kalau tidak ada cell (cuma meta), kirim 1 request meta saja
     if (batches.length === 0) {
+      const metaBody = {
+        name: metaToSave.name ? wbName : undefined,
+        activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined,
+        namedRanges: wbData.namedRanges || {}
+      };
+
+      // 🎯 Kirim sheetMeta / sheetOrder kalau structure berubah
+      if (metaToSave.structure) {
+        metaBody.sheetOrder = wbData.sheets.map((_, idx) => idx);
+
+        const sheetMeta = {};
+        wbData.sheets.forEach((s, idx) => {
+          sheetMeta[idx] = {
+            hidden: !!s.hidden,
+            tabColor: s.tabColor || null,
+            name: s.name,
+            rowGroups: s.rowGroups || [],
+            protected: !!s.protected,
+            protectHash: s.protectHash || null,
+            advancedFilters: s.advancedFilters || [],
+            pivots: s.pivots || []
+          };
+        });
+        metaBody.sheetMeta = sheetMeta;
+
+        console.log('📤 Sending meta (no cells):', metaBody);
+      }
+
       const res = await fetch(`/api/sheets/${wbId}/delta`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...auth },
         body: JSON.stringify({
           sheetIdx: activeSheetIdx,
           cells: {},
-          meta: {
-            name: metaToSave.name ? wbName : undefined,
-            activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined
-          }
+          meta: metaBody
         })
       });
       if (!res.ok && res.status !== 404) throw new Error(await getErrorText(res));
     } else {
-      // Loop batches
       for (let i = 0; i < batches.length; i++) {
         const batchAddrs = batches[i];
         const batchCells = {};
@@ -3629,12 +4628,31 @@ async function saveWB(forceFull = false) {
           meta: {}
         };
 
-        // Meta hanya di batch pertama
         if (i === 0) {
           body.meta = {
             name: metaToSave.name ? wbName : undefined,
-            activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined
+            activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined,
+            namedRanges: wbData.namedRanges || {}
           };
+          if (metaToSave.structure) {
+            // Reorder array sesuai urutan saat ini
+            body.meta.sheetOrder = wbData.sheets.map((_, i) => i);
+
+            // Info per-sheet (hidden, tabColor, name)
+            const sheetMeta = {};
+            wbData.sheets.forEach((s, i) => {
+              sheetMeta[i] = {
+                hidden: !!s.hidden,
+                tabColor: s.tabColor || null,
+                name: s.name,
+                protected: !!s.protected,
+                protectHash: s.protectHash || null,
+                advancedFilters: s.advancedFilters || [],
+                pivots: s.pivots || []
+              };
+            });
+            body.meta.sheetMeta = sheetMeta;
+          }
         }
 
         const res = await fetch(`/api/sheets/${wbId}/delta`, {
@@ -3643,7 +4661,6 @@ async function saveWB(forceFull = false) {
           body: JSON.stringify(body)
         });
 
-        // Fallback ke PUT kalau endpoint delta tidak ada
         if (res.status === 404 && i === 0) {
           const putRes = await fetch(`/api/sheets/${wbId}`, {
             method: 'PUT',
@@ -3652,7 +4669,6 @@ async function saveWB(forceFull = false) {
           });
           if (!putRes.ok) throw new Error(await getErrorText(putRes));
 
-          // Kalau PUT berhasil, clear semua dan selesai
           for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
           for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
           dirty = false;
@@ -3668,7 +4684,6 @@ async function saveWB(forceFull = false) {
           throw new Error(`Batch ${i + 1}/${batches.length}: ${await getErrorText(res)}`);
         }
 
-        // Progress indicator
         if (statusEl && batches.length > 1) {
           statusEl.textContent = `⟳ menyimpan ${i + 1}/${batches.length}…`;
         }
@@ -3676,7 +4691,7 @@ async function saveWB(forceFull = false) {
     }
 
     // =====================================================
-    // Sukses — clear dirty
+    // Sukses
     // =====================================================
     for (const k of Object.keys(cellsToSave)) delete dirtyCells[k];
     for (const k of Object.keys(metaToSave)) delete dirtyMeta[k];
@@ -3695,14 +4710,26 @@ async function saveWB(forceFull = false) {
 
   } catch (err) {
     console.error('❌ Save failed:', err.message);
+
+    // 🎯 DETEKSI: apakah ini network error?
+    const isNetworkError = /Failed to fetch|ERR_CONNECTION|NetworkError|fetch/i.test(err.message);
+
+    if (isNetworkError) {
+      // ❌ JANGAN retry — tunggu event 'online'
+      if (statusEl) statusEl.textContent = '⚠ offline — perubahan tersimpan lokal';
+      dirty = true;
+      saveRetryCount = 0;   // reset biar tidak numpuk
+      return;
+    }
+
+    // Error non-network (mis. 500, validasi) → retry dengan backoff
     if (statusEl) statusEl.textContent = '⚠ gagal save — retry…';
     dirty = true;
     saveRetryCount = (saveRetryCount || 0) + 1;
 
-    // Exponential backoff
     const delay = Math.min(30000, 2000 * saveRetryCount);
     setTimeout(() => {
-      if (dirty && wbId) saveWB();
+      if (dirty && wbId && window._isOnline !== false) saveWB();
     }, delay);
   } finally {
     saving = false;
@@ -3712,6 +4739,35 @@ async function saveWB(forceFull = false) {
     }
   }
 }
+
+/* =========================================================
+   ONLINE / OFFLINE DETECTION
+   ========================================================= */
+window._isOnline = navigator.onLine;
+
+window.addEventListener('online', () => {
+  console.log('🟢 Online — resume save');
+  window._isOnline = true;
+  if (dirty && wbId) saveWB();
+});
+
+window.addEventListener('offline', () => {
+  console.log('🔴 Offline — save dijeda');
+  window._isOnline = false;
+  const el = document.getElementById('save-status');
+  if (el) el.textContent = '⚠ offline — perubahan tersimpan lokal';
+});
+
+/* Debug helper */
+window.clearDirty = () => {
+  dirtyCells = {};
+  dirtyMeta = {};
+  dirty = false;
+  saveRetryCount = 0;
+  const el = document.getElementById('save-status');
+  if (el) el.textContent = '';
+  toast('✅ Dirty cleared');
+};
 
 /* =========================================================
    DEBOUNCE — letakkan persis di sini (setelah saveWB)
@@ -3729,8 +4785,11 @@ setInterval(() => {
 }, 10000);
 
 /* =========================================================
-   OPEN WORKBOOK — dengan IndexedDB cache
+   GLOBAL: track loaded sheets
    ========================================================= */
+let loadedSheetIdxs = new Set();
+let lazyLoadMode = false;
+
 async function openWB(id) {
   document.getElementById('home-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
@@ -3748,180 +4807,208 @@ async function openWB(id) {
   visibleStart = -1;
   visibleEnd = -1;
   window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  window._lastFrozenRow = null;
+  window._lastFrozenCol = null;
   if (typeof clearHFCache === 'function') clearHFCache();
+  if (typeof _sheetIdCache !== 'undefined') _sheetIdCache.clear();
+  if (typeof invalidateCommentCache === 'function') invalidateCommentCache();
+  if (typeof invalidateValidationCache === 'function') invalidateValidationCache();
   undoStack = [];
   redoStack = [];
   if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
 
+  // Reset lazy load
+  loadedSheetIdxs = new Set();
+  lazyLoadMode = true;
+  wbUsesChunks = false;   // 🎯 SELALU FALSE — jangan paksa chunk mode
+
   showLoading('Memuat workbook…');
 
   // =====================================================
-  // 🎯 STEP 1: Cek ukuran data & status chunk
+  // STEP 1: Fetch metadata
   // =====================================================
-  let status;
+  let meta;
+  let wbMetaName = null;
   try {
-    updateLoading('Memeriksa ukuran data…');
-    const res = await fetch(`/api/sheets/${id}/chunks-status`, {
+    updateLoading('Memuat metadata…');
+    const res = await fetch(`/api/sheets/${id}/sheets-meta`, {
       headers: { 'Authorization': 'Bearer ' + token }
     });
-    if (res.ok) {
-      status = await res.json();
-    } else {
-      status = { shouldUseChunks: false };
-    }
-  } catch (e) {
-    console.warn('Status check failed, fallback to normal mode:', e);
-    status = { shouldUseChunks: false };
-  }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    meta = await res.json();
 
-  console.log('📊 Workbook status:', status);
+    // 🎯 CEK PASSWORD
+    _wbHasPassword = !!meta.hasPassword;
 
-  // =====================================================
-  // 🎯 STEP 2: Fetch data (mode sesuai status)
-  // =====================================================
-  let data = null;
-  const useChunks = status.shouldUseChunks;
-  wbUsesChunks = useChunks;
+    if (meta.hasPassword) {
+      // Cek apakah user sudah pernah unlock di session ini
+      const sessionPwd = sessionStorage.getItem(`wb-pass-${id}`);
+      let isUnlocked = false;
 
-  try {
-    if (useChunks) {
-      // === MODE CHUNK ===
-      console.log('📦 Using CHUNK mode (data besar)');
-      updateLoading('Memuat metadata (mode cepat)…');
-
-      const res = await fetch(`/api/sheets/${id}?light=1`, {
-        headers: { 'Authorization': 'Bearer ' + token }
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      data = await res.json();
-
-        // Init chunk loader
-      if (window.Chunks && useChunks) {
-        updateLoading('Menyiapkan chunk loader…');
-        await Chunks.init(id, token);
-
-        // 🎯 Auto-load semua chunks kalau jumlahnya sedikit
-        const totalBlocks = Chunks.getBlockCount(activeSheetIdx);
-
-        if (totalBlocks > 0 && totalBlocks <= 30) {
-          // Data kecil/medium → load semua sekaligus
-          updateLoading(`Memuat ${totalBlocks} block data…`);
-          await Chunks.loadAllBlocks(activeSheetIdx, (loaded, total) => {
-            updateLoading(`Memuat data: ${loaded}/${total} block…`);
+      if (sessionPwd) {
+        // Verify session password
+        try {
+          const vr = await fetch(`/api/sheets/${id}/verify-password`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify({ password: sessionPwd })
           });
-          console.log(`✅ Loaded all ${totalBlocks} blocks`);
-
-          // Sync cells ke HF
-          const loadedCells = Chunks.getLoadedCells(activeSheetIdx);
-          const sheetId = getSheetIdSafe(activeSheetIdx);
-          if (sheetId !== null && Object.keys(loadedCells).length > 0) {
-            for (const [addr, cell] of Object.entries(loadedCells)) {
-              const p = parseAddr(addr);
-              if (!p) continue;
-              const val = cell.f || cell.v || null;
-              try {
-                hf.setCellContents({ sheet: sheetId, row: p.r, col: p.c }, [[val]]);
-              } catch {}
-            }
-          }
-        } else if (totalBlocks > 30) {
-          // Data besar → load block pertama + block selanjutnya via scroll
-          updateLoading(`Data besar (${totalBlocks} blocks) — lazy load`);
-
-          // Pre-load 3 block pertama
-          await Promise.all([
-            Chunks.ensureBlockLoaded(activeSheetIdx, 0),
-            Chunks.ensureBlockLoaded(activeSheetIdx, 256),
-            Chunks.ensureBlockLoaded(activeSheetIdx, 512)
-          ]);
-
-          // Sync ke HF
-          const loadedCells = Chunks.getLoadedCells(activeSheetIdx);
-          const sheetId = getSheetIdSafe(activeSheetIdx);
-          if (sheetId !== null && Object.keys(loadedCells).length > 0) {
-            for (const [addr, cell] of Object.entries(loadedCells)) {
-              const p = parseAddr(addr);
-              if (!p) continue;
-              const val = cell.f || cell.v || null;
-              try {
-                hf.setCellContents({ sheet: sheetId, row: p.r, col: p.c }, [[val]]);
-              } catch {}
-            }
-          }
-        }
+          if (vr.ok) isUnlocked = true;
+          else sessionStorage.removeItem(`wb-pass-${id}`);
+        } catch {}
       }
-    } else {
-      // === MODE NORMAL (data kecil) ===
-      console.log('📄 Using NORMAL mode (data kecil)');
-      updateLoading('Mengunduh data lengkap…');
 
-      const res = await fetch(`/api/sheets/${id}`, {
-        headers: { 'Authorization': 'Bearer ' + token }
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      data = await res.json();
+      if (!isUnlocked) {
+        hideLoading();
 
-      // Clear chunk loader state (biar tidak konflik)
-      if (window.Chunks && Chunks.clearAll) Chunks.clearAll();
+        // Tutup app dulu
+        document.getElementById('app').classList.add('hidden');
+        document.getElementById('home-screen').classList.remove('hidden');
+
+        // Prompt password
+        const ok = await promptUnlockPassword(id, meta.name);
+        if (!ok) {
+          return;   // user batal
+        }
+
+        // User berhasil unlock — lanjut buka
+        document.getElementById('home-screen').classList.add('hidden');
+        document.getElementById('app').classList.remove('hidden');
+        showLoading('Memuat workbook…');
+      }
+    }
+
+    wbMetaName = meta.name || meta.workbookName || null;
+
+    if (!wbMetaName) {
+      try {
+        // 🎯 light=1 → cells dikosongkan, hemat bandwidth
+        const wbRes = await fetch(`/api/sheets/${id}?light=1`, {
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (wbRes.ok) {
+          const wb = await wbRes.json();
+          wbMetaName = wb.name || wb.data?.name || null;
+          console.log('📥 wbName dari light fetch:', wbMetaName);
+        }
+      } catch (e) { console.warn('Gagal fetch wb name:', e); }
     }
   } catch (e) {
     hideLoading();
-    return toast('Gagal memuat: ' + e.message);
+    return toast('Gagal memuat metadata: ' + e.message);
+  }
+
+  let activeIdx = Math.max(0,
+    Math.min(meta.activeSheet || 0, (meta.sheets || []).length - 1));
+
+  // 🎯 Kalau sheet aktif ternyata hidden, cari sheet visible pertama
+  if (meta.sheets?.[activeIdx]?.hidden) {
+    const visibleIdx = meta.sheets.findIndex(s => !s.hidden);
+    if (visibleIdx >= 0) activeIdx = visibleIdx;
   }
 
   // =====================================================
-  // 🎯 STEP 3: Set state
+  // STEP 2: Fetch full sheet (SELALU — jangan skip)
   // =====================================================
-  updateLoading('Menyiapkan tampilan…');
-  await yieldToUI();
+  let activeSheetData = { cells: {}, name: 'Sheet' };
+  try {
+    updateLoading(`Memuat sheet "${meta.sheets[activeIdx]?.name || activeIdx}"…`);
+    const res = await fetch(`/api/sheets/${id}/sheet/${activeIdx}`, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    activeSheetData = await res.json();
+    console.log(`✅ Sheet ${activeIdx} loaded: ${Object.keys(activeSheetData.cells || {}).length} cells`);
+  } catch (e) {
+    hideLoading();
+    return toast('Gagal memuat sheet: ' + e.message);
+  }
 
-  wbId = data.id;
-  wbName = data.name;
+  // =====================================================
+  // STEP 3: Build wbData
+  // =====================================================
+  wbData = {
+    activeSheet: activeIdx,
+    namedRanges: meta.namedRanges || {},
+    sheets: (meta.sheets || []).map((s, idx) => ({
+      name: s.name || `Sheet${idx + 1}`,
+      colWidths: s.colWidths || {},
+      rowHeight: s.rowHeight || 26,
+      rowHeights: s.rowHeights || {},
+      cf: s.cf || [],
+      charts: s.charts || [],
+      merged: s.merged || [],
+      filters: s.filters || {},
+      images: s.images || [],
+      validations: s.validations || [],
+      freezeRow: s.freezeRow || 0,
+      freezeCol: s.freezeCol || 0,
+      protected: s.protected || false,
+      protectHash: s.protectHash || null,
+      advancedFilters: s.advancedFilters || [],
+      hidden: s.hidden || false,
+      tabColor: s.tabColor || null,
+      rowGroups: s.rowGroups || [],
+      cells: idx === activeIdx ? (activeSheetData.cells || {}) : {}
+    }))
+  };
+
+  loadedSheetIdxs.add(activeIdx);
+
+  // =====================================================
+  // STEP 4: Set state
+  // =====================================================
+  wbId = id;
+  wbName = wbMetaName || 'Untitled';
   const wbNameEl = document.getElementById('wb-name');
   if (wbNameEl) wbNameEl.value = wbName;
 
-  wbData = normalizeWB(data.data);
-  activeSheetIdx = wbData.activeSheet || 0;
+  activeSheetIdx = activeIdx;
   clearDelta();
-
-  // Kalau chunk mode: cells dikosongkan (akan di-load per block)
-  // Kalau normal mode: cells dari data apa adanya
-  if (useChunks) {
-    wbData.sheets.forEach(s => { s.cells = {}; });
-  }
+  loadFilterFromLocal(id);
 
   // =====================================================
-  // 🎯 STEP 4: Build HF
+  // STEP 5: Build HF
   // =====================================================
   const cellCount = Object.keys(sheet().cells || {}).length;
-  if (cellCount > 5000) {
-    updateLoading(`Membangun formula engine (${cellCount.toLocaleString('id-ID')} sel)…`);
+  const HF_CELL_LIMIT = 500_000;
+
+  if (cellCount > HF_CELL_LIMIT) {
+    console.warn(`⚠️ ${cellCount.toLocaleString('id-ID')} cells > ${HF_CELL_LIMIT.toLocaleString('id-ID')} — SKIP HF`);
+    if (hf) { try { hf.destroy(); } catch {} hf = null; }
+    hf = HyperFormulaClass.buildFromArray([['']], { licenseKey: HF_LICENSE });
+    hf.__maxR = 50; hf.__maxC = 26;
+    toast('⚠️ Data besar: formula tidak dievaluasi.');
+  } else {
+    if (cellCount > 5000) {
+      updateLoading(`Membangun formula engine (${cellCount.toLocaleString('id-ID')} sel)…`);
+    }
+    await rebuildHFWithLoaded();
   }
-  await resetHFLazy('Membangun formula engine…');
+
+  await recalcRowsLimit(true);
 
   // =====================================================
-  // 🎯 STEP 5: Render
+  // STEP 6: Render
   // =====================================================
   renderSheetTabs();
   const gridWrapEl = document.getElementById('grid-wrap');
   if (gridWrapEl) gridWrapEl.scrollTop = 0;
-
-  renderSheet();
+  forceRefreshGrid();
   selectCell('A1');
   document.getElementById('modal-sheets')?.classList.add('hidden');
   hideLoading();
 
   // =====================================================
-  // 🎯 STEP 6: Access mode & Collab
+  // STEP 7: Access mode & Collab
   // =====================================================
-  currentAccessMode = data.access || 'owner';
+  currentAccessMode = meta.access || 'owner';
   applyReadOnlyMode(currentAccessMode === 'view');
-
-  if (data.access === 'view') {
-    toast('👁 Mode lihat saja');
-  } else if (useChunks) {
-    toast('📦 Mode chunk (data besar) — super cepat');
-  }
+  if (currentAccessMode === 'view') toast('👁 Mode lihat saja');
 
   if (window.Collab) window.Collab.connect(wbId, token);
   if (typeof applySheetProtection === 'function') applySheetProtection();
@@ -3935,6 +5022,14 @@ function normalizeWB(d) {
       if (!s.merged) s.merged = [];
       if (!s.filters) s.filters = {};
       if (!Array.isArray(s.images)) s.images = [];
+      // 🎯 Hidden rows/cols
+      if (!Array.isArray(s.hiddenCols)) s.hiddenCols = [];
+      if (!Array.isArray(s.hiddenRows)) s.hiddenRows = [];
+      // Existing
+      if (!Array.isArray(s.validations)) s.validations = [];
+      if (typeof s.freezeRow !== 'number') s.freezeRow = 0;
+      if (typeof s.freezeCol !== 'number') s.freezeCol = 0;
+      if (typeof s.protected !== 'boolean') s.protected = false;
     });
     return d;
   }
@@ -3942,7 +5037,8 @@ function normalizeWB(d) {
     sheets: [{
       name: 'Sheet1', cells: d || {},
       colWidths: {}, rowHeight: 26,
-      cf: [], charts: [], merged: [], filters: {}
+      cf: [], charts: [], merged: [], filters: {},
+      hiddenCols: [], hiddenRows: []
     }],
     activeSheet: 0
   };
@@ -4164,7 +5260,7 @@ document.getElementById('btn-new-wb-confirm')?.addEventListener('click', async (
         // ✅ Kalau error karena duplicate, tawarkan nama unik
         if (res.status === 409) {
             const suggested = await generateUniqueName(name);
-            const ok = confirm(
+            const ok = customConfirm(
             `${errMsg}\n\nGunakan nama "${suggested}"?`
             );
             if (ok) {
@@ -4207,7 +5303,7 @@ document.getElementById('btn-new-wb-confirm')?.addEventListener('click', async (
             // ✅ Kalau error karena duplicate, tawarkan nama unik
             if (res.status === 409) {
                 const suggested = await generateUniqueName(name);
-                const ok = confirm(
+                const ok = customConfirm(
                 `${errMsg}\n\nGunakan nama "${suggested}"?`
                 );
                 if (ok) {
@@ -4726,6 +5822,3739 @@ document.getElementById('tab-next')?.addEventListener('click', () => {
 document.getElementById('btn-copy').onclick  = doCopy;
 document.getElementById('btn-cut').onclick   = doCut;
 document.getElementById('btn-paste').onclick = doPaste;
+
+/* =========================================================
+   PARSE CLIPBOARD — handle TSV/CSV
+   ========================================================= */
+function parseClipboardTable(text) {
+  if (!text) return [];
+
+  // Normalize line ending
+  let t = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Buang trailing newline
+  t = t.replace(/\n+$/, '');
+
+  // Deteksi delimiter: tab (Excel) atau comma (CSV)
+  const tabCount = (t.match(/\t/g) || []).length;
+  const commaCount = (t.match(/,/g) || []).length;
+  const delimiter = tabCount > 0 ? '\t' : (commaCount > 0 ? ',' : '\t');
+
+  // Split rows
+  const lines = t.split('\n');
+  const rows = [];
+
+  for (const line of lines) {
+    const cells = [];
+    let cur = '';
+    let inQuote = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuote && line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuote = !inQuote;
+        }
+      } else if (ch === delimiter && !inQuote) {
+        cells.push(cur);
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    cells.push(cur);
+    rows.push(cells);
+  }
+
+  return rows;
+}
+
+/* =========================================================
+   PASTE 2D ARRAY — tulis ke cells mulai dari anchor
+   ========================================================= */
+function paste2DArray(rows, anchorAddr) {
+  if (!rows.length) return false;
+  if (currentAccessMode === 'view') {
+    toast('👁 Mode lihat saja');
+    return false;
+  }
+
+  const anchor = parseAddr(anchorAddr);
+  if (!anchor) return false;
+
+  const h = rows.length;
+  const w = Math.max(...rows.map(r => r.length));
+
+  if (h === 0 || w === 0) return false;
+
+  pushUndo();
+
+  let written = 0;
+
+  for (let r = 0; r < h; r++) {
+    for (let c = 0; c < w; c++) {
+      const targetR = anchor.r + r;
+      const targetC = anchor.c + c;
+      const targetAddr = addrOf(targetR, targetC);
+      const tp = parseAddr(targetAddr);
+      if (!tp) continue;
+
+      // Ensure row capacity
+      ensureRowCapacity(targetR);
+
+      const raw = rows[r][c] ?? '';
+      const strVal = String(raw).trim();
+
+      // Preserve style lama
+      const old = sheet().cells[targetAddr];
+      let newCell = null;
+
+      if (strVal === '') {
+        newCell = null;
+      } else if (strVal.startsWith('=')) {
+        newCell = { f: strVal };
+      } else {
+        const n = Number(strVal);
+        const v = strVal !== '' && !isNaN(n) ? n : strVal;
+        newCell = { v };
+      }
+
+      // Preserve style/link/comment
+      if (old && newCell) {
+        if (old.s) newCell.s = old.s;
+        if (old.link) newCell.link = old.link;
+        if (old.comment) newCell.comment = old.comment;
+      }
+
+      if (!sheet().cells) sheet().cells = {};
+      if (newCell) {
+        sheet().cells[targetAddr] = newCell;
+        written++;
+      } else {
+        delete sheet().cells[targetAddr];
+      }
+
+      // Update HF
+      if (newCell && newCell.f) {
+        setHFCellSafe(targetR, targetC, newCell.f);
+      } else if (newCell && newCell.v !== undefined) {
+        setHFCellSafe(targetR, targetC, newCell.v);
+      } else {
+        setHFCellSafe(targetR, targetC, null);
+      }
+
+      markCellDirty(targetAddr);
+    }
+  }
+
+  // Update selection ke range hasil paste
+  const endAddr = addrOf(anchor.r + h - 1, anchor.c + w - 1);
+  selection = { start: anchorAddr, end: endAddr };
+  activeCell = anchorAddr;
+
+  // Clear cache & re-render
+  if (typeof clearHFCache === 'function') clearHFCache();
+  window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  // Full re-render
+  renderVirtual(false);
+  updateSelectionUI();
+
+  // Save
+  scheduleSave();
+
+  toast(`📥 Paste ${h}×${w} = ${written} sel`);
+  return true;
+}
+
+/* =========================================================
+   GLOBAL PASTE HANDLER — dari Excel/CSV
+   ========================================================= */
+document.addEventListener('paste', async (e) => {
+  // Skip kalau sedang edit cell
+  if (editor) return;
+
+  // Skip kalau target adalah input/textarea/modal
+  const target = e.target;
+  if (!target) return;
+  const tag = (target.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if (target.closest && target.closest('.modal')) return;
+  if (target.closest && target.closest('#formula-input')) return;
+  if (target.closest && target.closest('#cs-formula-input')) return;
+  if (target.closest && target.closest('.custom-dialog-overlay')) return;
+
+  // Skip kalau view mode
+  if (currentAccessMode === 'view') return;
+
+  // Ambil data dari clipboard
+  const cd = e.clipboardData;
+  if (!cd) return;
+
+  const text = cd.getData('text/plain');
+  if (!text || !text.trim()) return;
+
+  // Deteksi kalau cuma 1 cell (tanpa tab & newline) → biarkan default paste
+  const hasTab = text.includes('\t');
+  const hasNewline = text.includes('\n') || text.includes('\r');
+  if (!hasTab && !hasNewline) return;   // biarkan handler lama
+
+  // Parse
+  const rows = parseClipboardTable(text);
+  if (!rows.length || rows.length === 1 && rows[0].length === 1) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+
+  console.log(`📋 Paste detected: ${rows.length} rows × ${Math.max(...rows.map(r => r.length))} cols`);
+
+  paste2DArray(rows, activeCell);
+}, true);
+
+/* =========================================================
+   FORMAT PAINTER
+   ========================================================= */
+let _fpActive = false;       // sedang aktif?
+let _fpLocked = false;       // double-click = locked (multi-paste)
+let _fpSourceStyle = null;   // style yang mau diapply
+let _fpSourceAddr = null;    // address sumber (untuk debug)
+
+function startFormatPainter() {
+  if (!editor && !crossSheetRef) {
+    // Ambil style dari cell aktif
+    const cur = sheet().cells[activeCell];
+    if (!cur?.s || Object.keys(cur.s).length === 0) {
+      toast('⚠ Cell sumber tidak punya format');
+      return;
+    }
+    _fpSourceStyle = JSON.parse(JSON.stringify(cur.s));
+    _fpSourceAddr = activeCell;
+    _fpActive = true;
+    _fpLocked = false;
+  } else {
+    toast('⚠ Selesaikan edit dulu');
+    return;
+  }
+
+  // Visual feedback
+  const btn = document.getElementById('btn-format-painter');
+  if (btn) btn.classList.add('active');
+  document.body.classList.add('format-painter-active');
+
+  toast(`🖌 Format dari ${_fpSourceAddr} — klik cell target (Esc untuk batal)`);
+  console.log('🖌 Format Painter START from', _fpSourceAddr, ':', _fpSourceStyle);
+}
+
+function stopFormatPainter() {
+  _fpActive = false;
+  _fpLocked = false;
+  _fpSourceStyle = null;
+  _fpSourceAddr = null;
+
+  const btn = document.getElementById('btn-format-painter');
+  if (btn) btn.classList.remove('active');
+  document.body.classList.remove('format-painter-active');
+}
+
+function applyFormatPainterTo(addr) {
+  if (!_fpSourceStyle) return;
+
+  const parts = expandRange(selection.start, selection.end);
+  // Kalau user klik 1 cell, langsung apply ke cell itu
+  // Kalau ada selection lebih dari 1, apply ke seluruh selection
+  const targets = parts.length > 1 ? parts : [addr];
+
+  pushUndo();
+
+  for (const a of targets) {
+    const cur = sheet().cells[a];
+    if (cur) {
+      cur.s = JSON.parse(JSON.stringify(_fpSourceStyle));
+      markCellDirty(a);
+    } else {
+      // Buat cell kosong dengan style
+      ensureCell(a);
+      sheet().cells[a].s = JSON.parse(JSON.stringify(_fpSourceStyle));
+      markCellDirty(a);
+    }
+  }
+
+  // Update HF tidak perlu (cuma style)
+
+  // Force re-render
+  window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+  renderVirtual(false);
+
+  toast(`✅ Format ${targets.length} sel dari ${_fpSourceAddr}`);
+
+  // Kalau bukan locked mode, matikan
+  if (!_fpLocked) {
+    stopFormatPainter();
+  }
+}
+
+/* =========================================================
+   BIND TOMBOL
+   ========================================================= */
+(function initFormatPainter() {
+  const btn = document.getElementById('btn-format-painter');
+  if (!btn) {
+    console.warn('btn-format-painter tidak ditemukan');
+    return;
+  }
+
+  // Single click = aktif 1x
+  // Double click = aktif locked (multi-paste)
+  let _clickTimer = null;
+
+  btn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (_fpActive && !_fpLocked) {
+      // Klik lagi saat aktif → batal
+      stopFormatPainter();
+      toast('Format Painter dibatalkan');
+      return;
+    }
+
+    // Klik pertama
+    if (!_fpActive) {
+      startFormatPainter();
+    }
+
+    // Tunggu untuk deteksi double-click
+    if (_clickTimer) clearTimeout(_clickTimer);
+    _clickTimer = setTimeout(() => {
+      _clickTimer = null;
+    }, 250);
+  });
+
+  btn.addEventListener('dblclick', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (_clickTimer) {
+      clearTimeout(_clickTimer);
+      _clickTimer = null;
+    }
+    // Kalau sudah aktif, jadikan locked
+    if (_fpActive) {
+      _fpLocked = true;
+      toast('🖌 Format Painter LOCKED — multi-paste aktif');
+    } else {
+      startFormatPainter();
+      _fpLocked = true;
+      toast('🖌 Format Painter LOCKED — multi-paste aktif');
+    }
+  });
+
+  console.log('✅ Format Painter initialized');
+})();
+
+/* =========================================================
+   HANDLE CLICK DI GRID SAAT FORMAT PAINTER AKTIF
+   ========================================================= */
+document.getElementById('grid')?.addEventListener('mousedown', e => {
+  if (!_fpActive) return;
+
+  const td = e.target.closest('td[data-addr]');
+  if (!td) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  const addr = td.dataset.addr;
+  console.log('🖌 Format Painter apply to', addr);
+
+  applyFormatPainterTo(addr);
+}, true);   // capture phase — sebelum handler select cell
+
+/* =========================================================
+   ESCAPE UNTUK CANCEL
+   ========================================================= */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _fpActive) {
+    stopFormatPainter();
+    toast('Format Painter dibatalkan');
+  }
+}, true);
+
+/* =========================================================
+   MULTILINE — update class berdasarkan isi editor
+   ========================================================= */
+function updateMultilineClass(input, td) {
+  if (!input || !td) return;
+  const hasNewline = String(input.value).includes('\n');
+  input.classList.toggle('multiline-input', hasNewline);
+  td.classList.toggle('multiline', hasNewline);
+}
+
+/* =========================================================
+   SHEET TABS — Context Menu, Move, Duplicate, Delete
+   ========================================================= */
+
+let _tabCtxMenu = null;
+
+function closeTabContextMenu() {
+  if (_tabCtxMenu) {
+    _tabCtxMenu.remove();
+    _tabCtxMenu = null;
+  }
+}
+
+function openTabContextMenu(x, y, sheetIdx) {
+  closeTabContextMenu();
+
+  const sh = wbData.sheets[sheetIdx];
+  if (!sh) return;
+
+  const isHidden = !!sh.hidden;
+
+  const menu = document.createElement('div');
+  menu.className = 'tab-context-menu';
+
+  menu.innerHTML = `
+    <button data-action="duplicate">
+      <i class="fa-solid fa-copy"></i> Duplicate Sheet
+    </button>
+    <button data-action="rename">
+      <i class="fa-solid fa-pen"></i> Rename Sheet
+    </button>
+    <button data-action="toggle-hidden">
+      <i class="fa-solid ${isHidden ? 'fa-eye' : 'fa-eye-slash'}"></i>
+      ${isHidden ? 'Unhide Sheet' : 'Hide Sheet'}
+    </button>
+    <div class="ct-divider"></div>
+    <button data-action="delete" ${wbData.sheets.length <= 1 ? 'disabled' : ''}>
+      <i class="fa-solid fa-trash" style="color:#dc2626"></i>
+      <span style="color:#dc2626">Delete Sheet</span>
+    </button>
+    <div class="ct-divider"></div>
+    <div style="padding: 4px 12px; font-size: 10.5px; color: #94a3b8; text-transform: uppercase; letter-spacing: .4px; font-weight: 700;">Warna Tab</div>
+    <div class="tab-color-row">
+      ${['none','blue','green','red','yellow','purple','pink','gray']
+        .map(c => {
+          const color = c === 'none' ? '#ffffff' : {
+            blue: '#3b82f6', green: '#10b981', red: '#ef4444',
+            yellow: '#f59e0b', purple: '#8b5cf6', pink: '#ec4899',
+            gray: '#64748b'
+          }[c];
+          const active = (sh.tabColor || 'none') === c;
+          return `<div class="tab-color-swatch ${active ? 'active' : ''}"
+                       data-color="${c}"
+                       title="${c}"
+                       style="background: ${color}; ${c === 'none' ? 'border: 2px dashed #cbd5e1;' : ''}"></div>`;
+        }).join('')}
+    </div>
+  `;
+
+  document.body.appendChild(menu);
+  _tabCtxMenu = menu;
+
+  // Position
+  const rect = menu.getBoundingClientRect();
+  if (x + rect.width > window.innerWidth - 10) x = window.innerWidth - rect.width - 10;
+  if (y + rect.height > window.innerHeight - 10) y = window.innerHeight - rect.height - 10;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  // Button handlers
+  menu.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const action = btn.dataset.action;
+      closeTabContextMenu();
+
+      if (action === 'duplicate') {
+        await duplicateSheet(sheetIdx);
+      } else if (action === 'rename') {
+        const n = await customPrompt('Nama sheet baru:', sh.name, { title: 'Rename Sheet' });
+        if (n && n.trim() && n.trim() !== sh.name) {
+          const oldName = sh.name;
+          const newName = n.trim();
+
+          // 🎯 Update named ranges yang refer ke sheet ini
+          const ranges = wbData.namedRanges || {};
+          const escapedOld = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const re = new RegExp(`^('?)${escapedOld}\\1!`);
+
+          for (const key in ranges) {
+            const ref = ranges[key];
+            if (re.test(ref)) {
+              const needsQuote = /[\s\-.]/.test(newName);
+              const newSheetRef = needsQuote
+                ? "'" + newName.replace(/'/g, "''") + "'!"
+                : newName + '!';
+              ranges[key] = ref.replace(re, newSheetRef);
+            }
+          }
+
+          sh.name = newName;
+          markMetaDirty('structure');
+          try { resetHF(); } catch {}
+          renderSheetTabs();
+          renderSheet();
+          scheduleSave();
+          toast('✔ Sheet di-rename');
+        }
+      } else if (action === 'toggle-hidden') {
+        const visibleCount = wbData.sheets.filter(s => !s.hidden).length;
+        
+        if (!isHidden) {
+          // SEDANG HIDE
+          if (visibleCount <= 1) {
+            return toast('⚠ Minimal 1 sheet terlihat');
+          }
+          
+          sh.hidden = true;
+          
+          // 🎯 Kalau yang di-hide = active sheet, pindah ke sheet lain dulu
+          if (activeSheetIdx === sheetIdx) {
+            // Cari sheet lain yang tidak hidden
+            const nextIdx = wbData.sheets.findIndex((s, i) => i !== sheetIdx && !s.hidden);
+            if (nextIdx >= 0) {
+              activeSheetIdx = nextIdx;
+              wbData.activeSheet = nextIdx;
+              await switchSheet(nextIdx);
+            }
+          }
+        } else {
+          // SEDANG UNHIDE
+          sh.hidden = false;
+        }
+        
+        markMetaDirty('structure');
+        renderSheetTabs();
+        scheduleSave();
+        toast(isHidden ? '✔ Sheet ditampilkan' : '✔ Sheet disembunyikan');
+      } else if (action === 'delete') {
+        await deleteSheet(sheetIdx);
+      }
+    });
+  });
+
+  // Color swatches
+  menu.querySelectorAll('.tab-color-swatch').forEach(sw => {
+    sw.addEventListener('click', () => {
+      const color = sw.dataset.color;
+      sh.tabColor = color === 'none' ? null : color;
+      markMetaDirty('structure');
+      closeTabContextMenu();
+      renderSheetTabs();
+      scheduleSave();
+      toast(`✔ Warna tab: ${color}`);
+    });
+  });
+
+  // Close on outside
+  setTimeout(() => {
+    document.addEventListener('mousedown', function h(e) {
+      if (_tabCtxMenu && !_tabCtxMenu.contains(e.target)) {
+        closeTabContextMenu();
+        document.removeEventListener('mousedown', h, true);
+      }
+    }, true);
+  }, 0);
+}
+
+function moveSheet(fromIdx, toIdx) {
+  if (fromIdx === toIdx) return;
+  toIdx = Math.max(0, Math.min(toIdx, wbData.sheets.length));
+
+  const moved = wbData.sheets.splice(fromIdx, 1)[0];
+  if (fromIdx < toIdx) toIdx--;
+  wbData.sheets.splice(toIdx, 0, moved);
+
+  // Fix activeSheetIdx
+  if (activeSheetIdx === fromIdx) {
+    activeSheetIdx = toIdx;
+    wbData.activeSheet = toIdx;
+  } else if (fromIdx < activeSheetIdx && toIdx >= activeSheetIdx) {
+    activeSheetIdx--;
+  } else if (fromIdx > activeSheetIdx && toIdx <= activeSheetIdx) {
+    activeSheetIdx++;
+  }
+
+  loadedSheetIdxs = new Set(wbData.sheets.map((_, i) => i));
+
+  markMetaDirty('structure');
+  renderSheetTabs();
+  forceRefreshGrid();
+  scheduleSave();
+  toast('✔ Sheet dipindahkan');
+}
+
+async function duplicateSheet(idx) {
+  const sh = wbData.sheets[idx];
+  if (!sh) return;
+
+  if (!loadedSheetIdxs.has(idx)) {
+    showLoading('Memuat sheet…');
+    try { await lazyLoadSheet(idx); } catch {}
+    hideLoading();
+  }
+
+  const copy = JSON.parse(JSON.stringify(sh));
+  copy.name = `Copy of ${sh.name}`.slice(0, 30);
+  copy.hidden = false;
+  copy.protected = false;
+  delete copy.protectHash;
+
+  wbData.sheets.splice(idx + 1, 0, copy);
+  loadedSheetIdxs = new Set(wbData.sheets.map((_, i) => i));
+
+  markMetaDirty('structure');
+  try { resetHF(); } catch {}
+  renderSheetTabs();
+  scheduleSave();
+
+  await switchSheet(idx + 1);
+  toast(`✔ Sheet "${copy.name}" dibuat`);
+}
+
+async function deleteSheet(idx) {
+  if (wbData.sheets.length <= 1) {
+    return toast('Minimal harus ada 1 sheet');
+  }
+
+  const sh = wbData.sheets[idx];
+  if (!(await customConfirm(`Hapus sheet "${sh.name}"?`, { type: 'danger', okText: 'Hapus' }))) return;
+
+  showLoading('Menyiapkan…');
+  try {
+    for (let k = 0; k < wbData.sheets.length; k++) {
+      if (!loadedSheetIdxs.has(k)) {
+        updateLoading(`Memuat sheet "${wbData.sheets[k].name}"…`);
+        await lazyLoadSheet(k);
+      }
+    }
+  } catch (err) { console.warn('Gagal load semua:', err); }
+  hideLoading();
+
+  try { await saveWB(); } catch {}
+
+  // 🎯 Hapus dari array
+  wbData.sheets.splice(idx, 1);
+  loadedSheetIdxs = new Set(wbData.sheets.map((_, k) => k));
+
+  // 🎯 Fix activeSheetIdx — pastikan tidak out-of-range
+  if (idx < activeSheetIdx) {
+    // Hapus sheet sebelum active → active index geser -1
+    activeSheetIdx--;
+  } else if (idx === activeSheetIdx) {
+    // Hapus active → pindah ke sheet tetangga
+    activeSheetIdx = Math.min(idx, wbData.sheets.length - 1);
+  }
+  // Kalau idx > activeSheetIdx, tidak perlu ubah
+
+  wbData.activeSheet = activeSheetIdx;
+
+  saveFilterStateToSheet();
+  if (typeof loadFilterStateFromSheet === 'function') loadFilterStateFromSheet();
+
+  try { await rebuildHFWithLoaded(); } catch {}
+
+  // 🎯 Force refresh TOTAL — reset semua cache
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  renderSheetTabs();
+  if (typeof forceRefreshGrid === 'function') forceRefreshGrid();
+  else renderSheet();
+
+  markMetaDirty('structure');
+  scheduleSave();
+  toast(`✔ Sheet "${sh.name}" dihapus`);
+}
+
+/* =========================================================
+   UNHIDE SHEET
+   ========================================================= */
+(function initUnhideSheet() {
+  const btn = document.getElementById('btn-unhide-sheet');
+  const badge = document.getElementById('hidden-sheet-count');
+  if (!btn) return;
+
+  // Update badge count
+  function updateBadge() {
+    if (!badge) return;
+    const hiddenCount = wbData.sheets.filter(s => s.hidden).length;
+    if (hiddenCount > 0) {
+      badge.textContent = hiddenCount;
+      badge.style.display = 'flex';
+      btn.classList.add('has-hidden');
+    } else {
+      badge.style.display = 'none';
+      btn.classList.remove('has-hidden');
+    }
+  }
+
+  // Panggil setiap kali tab render
+  const _origRenderTabs = renderSheetTabs;
+  renderSheetTabs = function() {
+    _origRenderTabs();
+    updateBadge();
+  };
+
+  btn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Tutup kalau sudah terbuka
+    const existing = document.getElementById('btn-unhide-sheet-list');
+    if (existing) {
+      existing.remove();
+      return;
+    }
+
+    const hidden = wbData.sheets
+      .map((s, i) => ({ ...s, idx: i }))
+      .filter(s => s.hidden);
+
+    if (!hidden.length) {
+      return toast('Tidak ada sheet tersembunyi');
+    }
+
+    const list = document.createElement('div');
+    list.id = 'btn-unhide-sheet-list';
+    list.innerHTML = hidden.map(s => `
+      <button data-unhide-idx="${s.idx}">
+        <i class="fa-solid fa-eye"></i>
+        <span>${escapeHtml(s.name)}</span>
+      </button>
+    `).join('');
+
+    btn.parentElement.style.position = 'relative';
+    btn.parentElement.appendChild(list);
+
+    list.querySelectorAll('button[data-unhide-idx]').forEach(b => {
+      b.addEventListener('click', async () => {
+        const idx = parseInt(b.dataset.unhideIdx, 10);
+        const sh = wbData.sheets[idx];
+        if (!sh) return;
+
+        sh.hidden = false;
+        list.remove();
+
+        markMetaDirty('structure');
+        renderSheetTabs();
+        scheduleSave();
+
+        // Switch ke sheet yang di-unhide
+        await switchSheet(idx);
+        toast(`✔ Sheet "${sh.name}" ditampilkan`);
+      });
+    });
+
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener('mousedown', function h(ev) {
+        if (list && !list.contains(ev.target) && ev.target !== btn && !btn.contains(ev.target)) {
+          list.remove();
+          document.removeEventListener('mousedown', h, true);
+        }
+      }, true);
+    }, 0);
+  });
+
+  console.log('✅ Unhide sheet initialized');
+})();
+
+/* =========================================================
+   ROW GROUPING
+   ========================================================= */
+let _rowGroupCache = null;
+
+function invalidateRowGroupCache() {
+  _rowGroupCache = null;
+  cachedRowMap = null;   // filter cache juga harus invalidate
+}
+
+function getRowGroups() {
+  const sh = sheet();
+  if (!sh) return [];
+  if (!Array.isArray(sh.rowGroups)) sh.rowGroups = [];
+  return sh.rowGroups;
+}
+
+/* Cek apakah row r ada di dalam group manapun */
+function getRowGroupAt(r) {
+  const groups = getRowGroups();
+  for (const g of groups) {
+    if (r >= g.from && r <= g.to) return g;
+  }
+  return null;
+}
+
+/* Cek apakah row r adalah "summary row" dari group */
+function getGroupSummaryAt(r) {
+  const groups = getRowGroups();
+  for (const g of groups) {
+    if (r === g.from - 1) return g;
+  }
+  return null;
+}
+
+/* Tambah group baru untuk range [from, to] */
+function addRowGroup(from, to) {
+  if (from > to) [from, to] = [to, from];
+  if (from === to) {
+    toast('⚠ Minimal 2 baris untuk group');
+    return;
+  }
+
+  const sh = sheet();
+  const groups = getRowGroups();
+
+  // Cek overlap
+  for (const g of groups) {
+    const overlap = !(to < g.from || from > g.to);
+    if (overlap) {
+      toast('⚠ Range beririsan dengan group yang ada');
+      return;
+    }
+  }
+
+  pushUndo();
+  groups.push({ from, to, collapsed: false });
+
+  // Sort by from
+  groups.sort((a, b) => a.from - b.from);
+
+  invalidateRowGroupCache();
+  markMetaDirty('structure');
+  scheduleSave();
+
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  renderVirtual(false);
+
+  toast(`✔ Group dibuat (${from + 1}–${to + 1})`);
+}
+
+/* Hapus group yang mencakup row r */
+function removeRowGroup(r) {
+  const sh = sheet();
+  const groups = getRowGroups();
+  const before = groups.length;
+
+  const filtered = groups.filter(g => !(r >= g.from && r <= g.to));
+  if (filtered.length === before) {
+    toast('Tidak ada group di baris ini');
+    return;
+  }
+
+  pushUndo();
+  sh.rowGroups = filtered;
+  invalidateRowGroupCache();
+  markMetaDirty('structure');
+  scheduleSave();
+
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  renderVirtual(false);
+
+  toast('✔ Group dihapus');
+}
+
+/* Toggle collapse/expand group */
+function toggleRowGroupCollapse(groupId) {
+  const groups = getRowGroups();
+  const g = groups.find(x => x === groupId || x.id === groupId);
+  if (!g) return;
+
+  g.collapsed = !g.collapsed;
+  invalidateRowGroupCache();
+  markMetaDirty('structure');
+  scheduleSave();
+
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  renderVirtual(false);
+}
+
+/* Build set baris yang di-hide karena collapse */
+function getCollapsedRowSet() {
+  if (_rowGroupCache) return _rowGroupCache;
+
+  const set = new Set();
+  const groups = getRowGroups();
+  for (const g of groups) {
+    if (!g.collapsed) continue;
+    for (let r = g.from; r <= g.to; r++) set.add(r);
+  }
+
+  _rowGroupCache = set;
+  return set;
+}
+
+/* =========================================================
+   KEYBOARD SHORTCUTS HELP
+   ========================================================= */
+const SHORTCUTS_DATA = [
+  {
+    category: 'File & Workbook',
+    items: [
+      { keys: ['Ctrl', 'S'], desc: 'Simpan workbook' },
+      { keys: ['Ctrl', 'N'], desc: 'Workbook baru' },
+      { keys: ['Ctrl', 'P'], desc: 'Print' },
+    ]
+  },
+  {
+    category: 'Edit',
+    items: [
+      { keys: ['Ctrl', 'Z'], desc: 'Undo' },
+      { keys: ['Ctrl', 'Y'], desc: 'Redo' },
+      { keys: ['Ctrl', 'C'], desc: 'Copy' },
+      { keys: ['Ctrl', 'X'], desc: 'Cut' },
+      { keys: ['Ctrl', 'V'], desc: 'Paste' },
+      { keys: ['Ctrl', 'Shift', 'V'], desc: 'Paste value only' },
+      { keys: ['Delete'], desc: 'Hapus sel' },
+      { keys: ['Backspace'], desc: 'Hapus sel' },
+      { keys: ['F2'], desc: 'Edit sel' },
+      { keys: ['Enter'], desc: 'Commit & pindah bawah' },
+      { keys: ['Shift', 'Enter'], desc: 'Commit & pindah atas' },
+      { keys: ['Tab'], desc: 'Commit & pindah kanan' },
+      { keys: ['Shift', 'Tab'], desc: 'Commit & pindah kiri' },
+      { keys: ['Alt', 'Enter'], desc: 'Line break dalam cell' },
+      { keys: ['Escape'], desc: 'Batal edit / tutup dialog' },
+    ]
+  },
+  {
+    category: 'Navigasi',
+    items: [
+      { keys: ['↑'], desc: 'Pindah atas' },
+      { keys: ['↓'], desc: 'Pindah bawah' },
+      { keys: ['←'], desc: 'Pindah kiri' },
+      { keys: ['→'], desc: 'Pindah kanan' },
+      { keys: ['Ctrl', '↑'], desc: 'Jump ke edge atas' },
+      { keys: ['Ctrl', '↓'], desc: 'Jump ke edge bawah' },
+      { keys: ['Ctrl', '←'], desc: 'Jump ke edge kiri' },
+      { keys: ['Ctrl', '→'], desc: 'Jump ke edge kanan' },
+      { keys: ['Shift', '↑'], desc: 'Extend selection atas' },
+      { keys: ['Shift', '↓'], desc: 'Extend selection bawah' },
+      { keys: ['Shift', '←'], desc: 'Extend selection kiri' },
+      { keys: ['Shift', '→'], desc: 'Extend selection kanan' },
+      { keys: ['Ctrl', 'G'], desc: 'Go To cell' },
+      { keys: ['Page Up'], desc: 'Scroll halaman naik' },
+      { keys: ['Page Down'], desc: 'Scroll halaman turun' },
+      { keys: ['Home'], desc: 'Ke awal baris' },
+    ]
+  },
+  {
+    category: 'Format',
+    items: [
+      { keys: ['Ctrl', 'B'], desc: 'Bold' },
+      { keys: ['Ctrl', 'I'], desc: 'Italic' },
+      { keys: ['Ctrl', 'U'], desc: 'Underline' },
+      { keys: ['F4'], desc: 'Cycle absolute reference ($A$1 → A$1 → $A1 → A1)' },
+    ]
+  },
+  {
+    category: 'Formula',
+    items: [
+      { keys: ['='], desc: 'Mulai formula' },
+      { keys: ['F4'], desc: 'Toggle $ absolute ref di formula' },
+      { keys: ['Ctrl', '`'], desc: 'Show formulas / values' },
+      { keys: ['Ctrl', 'Shift', 'V'], desc: 'Paste value only' },
+    ]
+  },
+  {
+    category: 'Find & Replace',
+    items: [
+      { keys: ['Ctrl', 'F'], desc: 'Find' },
+      { keys: ['Ctrl', 'H'], desc: 'Find & Replace' },
+      { keys: ['Enter'], desc: 'Match berikutnya (dalam Find)' },
+      { keys: ['Shift', 'Enter'], desc: 'Match sebelumnya' },
+    ]
+  },
+  {
+    category: 'Insert & Insert',
+    items: [
+      { keys: ['Ctrl', 'K'], desc: 'Insert hyperlink' },
+    ]
+  },
+  {
+    category: 'Bantuan',
+    items: [
+      { keys: ['Ctrl', '/'], desc: 'Tampilkan panel shortcut ini' },
+      { keys: ['F1'], desc: 'Tampilkan panel shortcut ini' },
+    ]
+  }
+];
+
+function renderShortcuts(filter = '') {
+  const body = document.getElementById('shortcuts-body');
+  if (!body) return;
+
+  const q = filter.trim().toLowerCase();
+
+  const filtered = SHORTCUTS_DATA.map(cat => ({
+    category: cat.category,
+    items: cat.items.filter(it => {
+      if (!q) return true;
+      const keyStr = it.keys.join('+').toLowerCase();
+      return it.desc.toLowerCase().includes(q) || keyStr.includes(q);
+    })
+  })).filter(cat => cat.items.length > 0);
+
+  if (!filtered.length) {
+    body.innerHTML = `<div class="sc-empty">
+      <i class="fa-solid fa-magnifying-glass" style="font-size:32px;color:#cbd5e1;display:block;margin-bottom:12px"></i>
+      Tidak ada shortcut yang cocok
+    </div>`;
+    return;
+  }
+
+  body.innerHTML = filtered.map(cat => `
+    <div class="sc-category">
+      <i class="fa-solid fa-circle-dot" style="color:#10b981;font-size:9px"></i>
+      ${escapeHtml(cat.category)}
+    </div>
+    ${cat.items.map(it => `
+      <div class="sc-item">
+        <span class="sc-desc">${escapeHtml(it.desc)}</span>
+        <span class="sc-keys">
+          ${it.keys.map(k => `<span class="sc-key">${escapeHtml(k)}</span>`).join('<span style="color:#cbd5e1;font-size:10px">+</span>')}
+        </span>
+      </div>
+    `).join('')}
+  `).join('');
+}
+
+function openShortcutsModal() {
+  const modal = document.getElementById('modal-shortcuts');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+
+  const input = document.getElementById('shortcuts-search');
+  if (input) input.value = '';
+
+  renderShortcuts();
+
+  setTimeout(() => input?.focus(), 50);
+}
+
+function closeShortcutsModal() {
+  document.getElementById('modal-shortcuts')?.classList.add('hidden');
+}
+
+/* Bind tombol */
+document.getElementById('btn-shortcuts-close')?.addEventListener('click', closeShortcutsModal);
+document.getElementById('btn-shortcuts-close2')?.addEventListener('click', closeShortcutsModal);
+
+document.getElementById('shortcuts-search')?.addEventListener('input', e => {
+  renderShortcuts(e.target.value);
+});
+
+document.getElementById('modal-shortcuts')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-shortcuts') closeShortcutsModal();
+});
+
+/* Shortcut: Ctrl+/ atau F1 */
+document.addEventListener('keydown', e => {
+  if (editor) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+
+  // Ctrl+/ 
+  if (ctrl && e.key === '/') {
+    e.preventDefault();
+    openShortcutsModal();
+    return;
+  }
+
+  // F1
+  if (e.key === 'F1') {
+    e.preventDefault();
+    openShortcutsModal();
+    return;
+  }
+}, true);
+
+document.getElementById('btn-shortcuts-help')?.addEventListener('click', openShortcutsModal);
+document.getElementById('btn-shortcuts-help2')?.addEventListener('click', openShortcutsModal);
+console.log('✅ Keyboard Shortcuts Help initialized');
+
+/* =========================================================
+   DARK MODE
+   ========================================================= */
+const DARK_MODE_KEY = 'wex-dark-mode';
+
+function isDarkMode() {
+  return document.body.classList.contains('dark-mode');
+}
+
+function applyDarkMode(enabled) {
+  if (enabled) {
+    document.body.classList.add('dark-mode');
+    localStorage.setItem(DARK_MODE_KEY, '1');
+  } else {
+    document.body.classList.remove('dark-mode');
+    localStorage.setItem(DARK_MODE_KEY, '0');
+  }
+
+  // Update toggle UI
+  const toggle = document.getElementById('dark-mode-toggle');
+  if (toggle) {
+    toggle.checked = enabled;
+  }
+}
+
+function toggleDarkMode() {
+  applyDarkMode(!isDarkMode());
+  toast(isDarkMode() ? '🌙 Dark mode aktif' : '☀️ Light mode aktif');
+}
+
+/* Load preference saat startup */
+(function initDarkMode() {
+  const saved = localStorage.getItem(DARK_MODE_KEY);
+  
+  // Kalau user belum pernah pilih, auto-detect dari OS
+  if (saved === null) {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    applyDarkMode(prefersDark);
+  } else {
+    applyDarkMode(saved === '1');
+  }
+
+  // Listen OS preference change (kalau user belum set manual)
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+    if (localStorage.getItem(DARK_MODE_KEY) === null) {
+      applyDarkMode(e.matches);
+    }
+  });
+
+  // Bind toggle checkbox
+  const toggle = document.getElementById('dark-mode-toggle');
+  if (toggle) {
+    toggle.checked = isDarkMode();
+    toggle.addEventListener('change', e => {
+      applyDarkMode(e.target.checked);
+    });
+  }
+
+  // Bind shortcut Ctrl+Shift+D
+  document.addEventListener('keydown', e => {
+    if (editor) return;
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (ctrl && e.shiftKey && e.key.toLowerCase() === 'd') {
+      e.preventDefault();
+      toggleDarkMode();
+    }
+  }, true);
+
+  console.log('✅ Dark Mode initialized. Current:', isDarkMode() ? 'dark' : 'light');
+})();
+
+/* =========================================================
+   NAMED RANGES
+   ========================================================= */
+function getNamedRanges() {
+  if (!wbData.namedRanges) wbData.namedRanges = {};
+  return wbData.namedRanges;
+}
+
+/* =========================================================
+   RESOLVE NAMED RANGES IN FORMULA
+   ========================================================= */
+function resolveNamedRanges(formula) {
+  if (!formula || typeof formula !== 'string') return formula;
+  if (!formula.startsWith('=')) return formula;
+
+  const ranges = wbData.namedRanges || {};
+  const keys = Object.keys(ranges);
+  if (!keys.length) return formula;
+
+  let result = formula;
+  for (const name of keys) {
+    const ref = ranges[name];
+    const re = new RegExp(
+      `\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b(?!\\s*\\()`,
+      'g'
+    );
+    result = result.replace(re, ref);
+  }
+  return result;
+}
+
+function addNamedRange(name, rangeRef) {
+  if (!name || !rangeRef) {
+    toast('⚠ Nama dan range wajib diisi');
+    return false;
+  }
+
+  // Validasi nama: huruf, angka, underscore; tidak boleh mulai angka atau mirip cell ref
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    toast('⚠ Nama harus huruf/angka/underscore, tidak boleh mulai angka');
+    return false;
+  }
+
+  if (/^[A-Z]+[0-9]+$/i.test(name)) {
+    toast('⚠ Nama tidak boleh sama dengan alamat cell (A1, B2, ...)');
+    return false;
+  }
+
+  const ranges = getNamedRanges();
+  ranges[name] = rangeRef;
+  markMetaDirty('structure');
+
+  // 🎯 Rebuild HyperFormula biar named range kepakai di formula
+  try { resetHF(); } catch (e) { console.warn('resetHF failed:', e); }
+
+  scheduleSave();
+  refreshNamedRangeCache();
+
+  // 🎯 Force re-render
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  if (typeof renderVirtual === 'function') renderVirtual(false);
+
+  return true;
+}
+
+function removeNamedRange(name) {
+  const ranges = getNamedRanges();
+  if (ranges[name] === undefined) return false;
+  delete ranges[name];
+  markMetaDirty('structure');
+
+  // 🎯 Rebuild HyperFormula
+  try { resetHF(); } catch (e) { console.warn('resetHF failed:', e); }
+
+  scheduleSave();
+  refreshNamedRangeCache();
+
+  // 🎯 Force re-render
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  if (typeof renderVirtual === 'function') renderVirtual(false);
+
+  return true;
+}
+
+/* Cache — refresh saat ada perubahan */
+let _namedRangeCache = null;
+
+function refreshNamedRangeCache() {
+  _namedRangeCache = null;
+}
+
+/* Cek apakah sebuah string adalah named range */
+function isNamedRange(name) {
+  const ranges = getNamedRanges();
+  return ranges[name] !== undefined;
+}
+
+/* Convert named range reference "Sheet1!A1:B10" menjadi absolut address */
+function resolveNamedRange(ref) {
+  if (!ref) return ref;
+
+  // Kalau ref adalah named range
+  const ranges = getNamedRanges();
+  if (ranges[ref]) {
+    return resolveNamedRange(ranges[ref]);
+  }
+
+  // Kalau ref mengandung named range di dalam formula, replace
+  return ref.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (match) => {
+    // Skip function names (diikuti `(`)
+    if (ranges[match] !== undefined) {
+      return ranges[match];
+    }
+    return match;
+  });
+}
+
+/* Convert named range reference "Sheet1!A1:B10" menjadi {sheetIdx, addr} */
+function parseNamedRangeRef(ref) {
+  if (!ref) return null;
+  // Format: SheetName!A1:B10 atau SheetName!A1
+  const m = /^'?([^'!]+)'?!(.+)$/.exec(ref);
+  if (!m) return null;
+
+  const sheetName = m[1];
+  const addrPart = m[2];
+
+  // Cari sheet index
+  const sheetIdx = wbData.sheets.findIndex(s => s.name === sheetName);
+  if (sheetIdx < 0) return null;
+
+  // Parse range addr
+  const parts = addrPart.split(':');
+  const startAddr = parts[0];
+  const endAddr = parts[1] || parts[0];
+
+  return { sheetIdx, startAddr, endAddr, addrPart };
+}
+
+/* =========================================================
+   NAME MANAGER MODAL
+   ========================================================= */
+function openNameManager() {
+  const modal = document.getElementById('modal-names');
+  if (!modal) return;
+
+  // Reset form
+  document.getElementById('name-new-name').value = '';
+  document.getElementById('name-new-range').value = '';
+
+  renderNamesList();
+  modal.classList.remove('hidden');
+
+  setTimeout(() => document.getElementById('name-new-name')?.focus(), 50);
+}
+
+function closeNameManager() {
+  document.getElementById('modal-names')?.classList.add('hidden');
+}
+
+function renderNamesList() {
+  const box = document.getElementById('names-list');
+  if (!box) return;
+
+  const ranges = getNamedRanges();
+  const entries = Object.entries(ranges);
+
+  if (!entries.length) {
+    box.innerHTML = `<div style="padding:30px 20px;text-align:center;color:#94a3b8">
+      <i class="fa-solid fa-bookmark" style="font-size:32px;color:#cbd5e1;display:block;margin-bottom:12px"></i>
+      Belum ada named range
+    </div>`;
+    return;
+  }
+
+  box.innerHTML = entries.map(([name, ref]) => `
+    <div class="rev-row">
+      <div class="body">
+        <div class="name" style="font-weight:600;color:#059669">
+          <i class="fa-solid fa-bookmark" style="font-size:11px;margin-right:6px"></i>
+          ${escapeHtml(name)}
+        </div>
+        <div class="meta" style="font-family:monospace;font-size:11px;color:#64748b">
+          ${escapeHtml(ref)}
+        </div>
+      </div>
+      <button class="perm-btn danger" data-name-del="${escapeHtml(name)}" title="Hapus">
+        <i class="fa-solid fa-trash"></i>
+      </button>
+    </div>
+  `).join('');
+
+  box.querySelectorAll('[data-name-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = btn.dataset.nameDel;
+      if (!(await customConfirm(`Hapus named range "${name}"?`, { type: 'danger', okText: 'Hapus' }))) return;
+      if (removeNamedRange(name)) {
+        renderNamesList();
+        toast('✔ Named range dihapus');
+      }
+    });
+  });
+}
+
+/* Bind tombol */
+document.getElementById('btn-name-manager')?.addEventListener('click', openNameManager);
+document.getElementById('btn-names-close')?.addEventListener('click', closeNameManager);
+document.getElementById('btn-names-cancel')?.addEventListener('click', closeNameManager);
+document.getElementById('modal-names')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-names') closeNameManager();
+});
+
+/* Define Name — dari selection */
+document.getElementById('btn-name-from-selection')?.addEventListener('click', async () => {
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return toast('Pilih range dulu');
+
+  const name = await customPrompt('Nama untuk range ini:', '', {
+    title: 'Define Name',
+    okText: 'Buat'
+  });
+  if (!name || !name.trim()) return;
+
+  const sheetName = sheet().name;
+  const needsQuote = /[\s\-.]/.test(sheetName);
+  const safeSheetName = needsQuote
+    ? "'" + sheetName.replace(/'/g, "''") + "'"
+    : sheetName;
+
+  const rangeRef = `${safeSheetName}!${selection.start}:${selection.end}`;
+
+  if (addNamedRange(name.trim(), rangeRef)) {
+    toast(`✔ Named range "${name}" dibuat`);
+  }
+});
+
+/* Tambah dari modal */
+document.getElementById('btn-name-add')?.addEventListener('click', () => {
+  const name = document.getElementById('name-new-name').value.trim();
+  const ref = document.getElementById('name-new-range').value.trim();
+
+  if (!name || !ref) {
+    return toast('⚠ Isi nama dan range');
+  }
+
+  // Auto-format ref — kalau user ketik "A1:B10" saja, tambahkan sheet aktif
+  let finalRef = ref;
+  if (!ref.includes('!')) {
+    const sheetName = sheet().name;
+    const needsQuote = /[\s\-.]/.test(sheetName);
+    const safeSheetName = needsQuote
+      ? "'" + sheetName.replace(/'/g, "''") + "'"
+      : sheetName;
+    finalRef = `${safeSheetName}!${ref}`;
+  }
+
+  if (addNamedRange(name, finalRef)) {
+    document.getElementById('name-new-name').value = '';
+    document.getElementById('name-new-range').value = '';
+    renderNamesList();
+    toast(`✔ Named range "${name}" dibuat`);
+  }
+});
+
+/* Auto-fill range dari selection */
+document.getElementById('name-new-range')?.addEventListener('focus', e => {
+  if (e.target.value) return;
+  if (!selection.start || !selection.end) return;
+  const sheetName = sheet().name;
+  const needsQuote = /[\s\-.]/.test(sheetName);
+  const safeSheetName = needsQuote
+    ? "'" + sheetName.replace(/'/g, "''") + "'"
+    : sheetName;
+  e.target.value = `${safeSheetName}!${selection.start}:${selection.end}`;
+});
+
+/* Enter di input */
+document.getElementById('name-new-name')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('name-new-range')?.focus();
+  }
+});
+
+document.getElementById('name-new-range')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('btn-name-add')?.click();
+  }
+});
+
+console.log('✅ Named Ranges initialized');
+
+/* =========================================================
+   FORMULA AUDITING
+   ========================================================= */
+let _showFormulas = false;
+let _highlightFormulas = false;
+
+function toggleShowFormulas() {
+  _showFormulas = !_showFormulas;
+  document.body.classList.toggle('show-formulas', _showFormulas);
+
+  // Update button state
+  const btn = document.getElementById('btn-show-formulas');
+  if (btn) {
+    btn.classList.toggle('active', _showFormulas);
+    btn.style.background = _showFormulas
+      ? 'linear-gradient(135deg,#0369a1,#0284c7)' : '';
+    btn.style.color = _showFormulas ? '#fff' : '';
+  }
+
+  // Force re-render — bypass cache
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  // Clear HF cache supaya re-evaluate
+  if (typeof clearHFCache === 'function') clearHFCache();
+
+  renderVirtual(false);
+  toast(_showFormulas ? '👁 Tampil formula' : '👁 Tampil nilai');
+}
+
+/* =========================================================
+   HIGHLIGHT FORMULA CELLS
+   ========================================================= */
+function toggleHighlightFormulas() {
+  _highlightFormulas = !_highlightFormulas;
+
+  const btn = document.getElementById('btn-highlight-formulas');
+  if (btn) {
+    btn.classList.toggle('active', _highlightFormulas);
+    btn.style.background = _highlightFormulas
+      ? 'linear-gradient(135deg,#f59e0b,#d97706)' : '';
+    btn.style.color = _highlightFormulas ? '#fff' : '';
+  }
+
+  applyFormulaHighlight();
+  toast(_highlightFormulas ? '✨ Formula di-highlight' : 'Highlight formula off');
+}
+
+function applyFormulaHighlight() {
+  // Clear dulu
+  document.querySelectorAll('#grid td.has-formula')
+    .forEach(td => td.classList.remove('has-formula'));
+
+  if (!_highlightFormulas) return;
+
+  // Apply ke visible cells
+  document.querySelectorAll('#grid tbody td[data-addr]').forEach(td => {
+    const addr = td.dataset.addr;
+    const cl = sheet().cells[addr];
+    if (cl && cl.f) {
+      td.classList.add('has-formula');
+    }
+  });
+}
+
+/* =========================================================
+   ERROR CHECKING
+   ========================================================= */
+function runErrorCheck() {
+  const modal = document.getElementById('modal-errors');
+  const list = document.getElementById('errors-list');
+  const summary = document.getElementById('errors-summary');
+  if (!modal || !list) return;
+
+  modal.classList.remove('hidden');
+
+  // Scan sheet aktif
+  const cells = sheet().cells || {};
+  const errors = [];
+
+  for (const [addr, cl] of Object.entries(cells)) {
+    if (!cl.f) continue;   // hanya cell formula yang bisa error
+    const p = parseAddr(addr);
+    if (!p) continue;
+
+    let value;
+    try {
+      value = hfGet(p.r, p.c);
+    } catch {
+      value = '#ERROR';
+    }
+
+    let errType = null;
+    if (isErr(value)) {
+      errType = value.type || 'ERROR';
+    } else if (typeof value === 'string' && value.startsWith('#')) {
+      errType = value;
+    }
+
+    if (errType) {
+      errors.push({
+        addr,
+        formula: cl.f,
+        type: errType,
+        r: p.r,
+        c: p.c
+      });
+    }
+  }
+
+  // Render summary
+  if (summary) {
+    if (errors.length === 0) {
+      summary.innerHTML = `✅ Tidak ada error di sheet <strong>${escapeHtml(sheet().name)}</strong>`;
+    } else {
+      summary.innerHTML = `⚠️ Ditemukan <strong>${errors.length}</strong> error di sheet <strong>${escapeHtml(sheet().name)}</strong>`;
+    }
+  }
+
+  // Render list
+  if (errors.length === 0) {
+    list.innerHTML = `<div class="error-empty">
+      <i class="fa-solid fa-circle-check"></i>
+      Sheet bersih! Tidak ada error.
+    </div>`;
+    return;
+  }
+
+  // Sort by addr
+  errors.sort((a, b) => a.r - b.r || a.c - b.c);
+
+  list.innerHTML = errors.map(e => `
+    <div class="error-item" data-addr="${escapeHtml(e.addr)}">
+      <span class="addr">${escapeHtml(e.addr)}</span>
+      <span class="err-type">${escapeHtml(e.type)}</span>
+      <span class="formula">${escapeHtml(e.formula)}</span>
+      <i class="fa-solid fa-arrow-right" style="color:#94a3b8;font-size:11px"></i>
+    </div>
+  `).join('');
+
+  // Click → jump to cell
+  list.querySelectorAll('.error-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const addr = item.dataset.addr;
+      selectCell(addr);
+      scrollAddrIntoView(addr);
+      modal.classList.add('hidden');
+      toast(`🎯 Ke ${addr}`);
+    });
+  });
+}
+
+function closeErrorModal() {
+  document.getElementById('modal-errors')?.classList.add('hidden');
+}
+
+/* =========================================================
+   ADVANCED FILTER
+   ========================================================= */
+let _advFilterDraft = [];   // kondisi sementara (belum di-apply)
+
+function getAdvancedFilters() {
+  const sh = sheet();
+  if (!sh) return [];
+  if (!Array.isArray(sh.advancedFilters)) sh.advancedFilters = [];
+  return sh.advancedFilters;
+}
+
+/* Ambil header text dari kolom untuk label dropdown */
+function getColumnHeaders() {
+  const headers = [];
+  const cells = sheet().cells || {};
+  const headerRow = getFilterHeaderRow();
+
+  // Scan kolom yang punya data di header row atau 20 baris pertama
+  let maxC = 30;
+  for (const addr of Object.keys(cells)) {
+    const p = parseAddr(addr);
+    if (p && p.c > maxC) maxC = p.c;
+  }
+
+  for (let c = 0; c <= maxC; c++) {
+    let label = colName(c);
+    // Cari header text
+    for (let r = 0; r < 20; r++) {
+      const cl = cells[addrOf(r, c)];
+      if (cl && cl.v !== undefined && cl.v !== null && cl.v !== '') {
+        const text = String(cl.v).trim();
+        if (text) {
+          label = `${colName(c)} — ${text.slice(0, 25)}`;
+          break;
+        }
+      }
+    }
+    headers.push({ col: c, label });
+  }
+
+  return headers;
+}
+
+function openAdvancedFilterModal() {
+  const modal = document.getElementById('modal-adv-filter');
+  if (!modal) return;
+
+  // Load draft dari existing
+  _advFilterDraft = JSON.parse(JSON.stringify(getAdvancedFilters()));
+  if (_advFilterDraft.length === 0) {
+    // Tambah 1 baris kosong default
+    _advFilterDraft.push({ col: 0, op: 'eq', value: '', logic: 'AND' });
+  }
+
+  renderAdvConditions();
+  modal.classList.remove('hidden');
+  updateAdvPreview();
+}
+
+function closeAdvancedFilterModal() {
+  document.getElementById('modal-adv-filter')?.classList.add('hidden');
+}
+
+function renderAdvConditions() {
+  const cont = document.getElementById('advf-conditions');
+  if (!cont) return;
+
+  const headers = getColumnHeaders();
+
+  cont.innerHTML = _advFilterDraft.map((cond, i) => {
+    // Kolom options
+    const colOpts = headers.map(h =>
+      `<option value="${h.col}" ${h.col === cond.col ? 'selected' : ''}>${escapeHtml(h.label)}</option>`
+    ).join('');
+
+    // Operator options
+    const opList = [
+      { v: 'eq', l: '= sama dengan' },
+      { v: 'neq', l: '≠ tidak sama' },
+      { v: 'gt', l: '> lebih besar' },
+      { v: 'lt', l: '< lebih kecil' },
+      { v: 'gte', l: '≥ besar sama' },
+      { v: 'lte', l: '≤ kecil sama' },
+      { v: 'contains', l: 'mengandung' },
+      { v: 'startswith', l: 'diawali' },
+      { v: 'endswith', l: 'diakhiri' },
+      { v: 'between', l: 'di antara' }
+    ];
+    const opOpts = opList.map(o =>
+      `<option value="${o.v}" ${o.v === cond.op ? 'selected' : ''}>${escapeHtml(o.l)}</option>`
+    ).join('');
+
+    // Logic (hanya baris ke-2 ke atas)
+    const logicHtml = i === 0
+      ? `<div class="advf-logic">WHERE</div>`
+      : `<select class="advf-logic-select" data-idx="${i}" style="background:#ecfdf5;color:#059669;font-weight:700;border-color:#d1fae5">
+           <option value="AND" ${cond.logic === 'AND' ? 'selected' : ''}>AND</option>
+           <option value="OR" ${cond.logic === 'OR' ? 'selected' : ''}>OR</option>
+         </select>`;
+
+    // Value — 1 atau 2 input (kalau between)
+    let valueHtml;
+    if (cond.op === 'between') {
+      valueHtml = `<div style="display:flex;gap:4px;align-items:center">
+        <input class="advf-value" data-idx="${i}" value="${escapeHtml(cond.value || '')}" placeholder="min" style="flex:1" />
+        <span style="color:#94a3b8;font-size:11px">–</span>
+        <input class="advf-value2" data-idx="${i}" value="${escapeHtml(cond.value2 || '')}" placeholder="max" style="flex:1" />
+      </div>`;
+    } else {
+      valueHtml = `<input class="advf-value" data-idx="${i}" value="${escapeHtml(cond.value || '')}" placeholder="nilai" />`;
+    }
+
+    return `
+      <div class="advf-row" data-idx="${i}">
+        ${logicHtml}
+        <select class="advf-col" data-idx="${i}">${colOpts}</select>
+        <select class="advf-op" data-idx="${i}">${opOpts}</select>
+        ${valueHtml}
+        <button class="advf-del" data-idx="${i}" title="Hapus">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  // Bind events
+  cont.querySelectorAll('.advf-col').forEach(el => {
+    el.addEventListener('change', e => {
+      const i = +e.target.dataset.idx;
+      _advFilterDraft[i].col = +e.target.value;
+    });
+  });
+
+  cont.querySelectorAll('.advf-op').forEach(el => {
+    el.addEventListener('change', e => {
+      const i = +e.target.dataset.idx;
+      _advFilterDraft[i].op = e.target.value;
+      renderAdvConditions();   // re-render karena between butuh 2 input
+      updateAdvPreview();
+    });
+  });
+
+  cont.querySelectorAll('.advf-value').forEach(el => {
+    el.addEventListener('input', e => {
+      const i = +e.target.dataset.idx;
+      _advFilterDraft[i].value = e.target.value;
+      updateAdvPreview();
+    });
+  });
+
+  cont.querySelectorAll('.advf-value2').forEach(el => {
+    el.addEventListener('input', e => {
+      const i = +e.target.dataset.idx;
+      _advFilterDraft[i].value2 = e.target.value;
+      updateAdvPreview();
+    });
+  });
+
+  cont.querySelectorAll('.advf-logic-select').forEach(el => {
+    el.addEventListener('change', e => {
+      const i = +e.target.dataset.idx;
+      _advFilterDraft[i].logic = e.target.value;
+      updateAdvPreview();
+    });
+  });
+
+  cont.querySelectorAll('.advf-del').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const i = +e.currentTarget.dataset.idx;
+      _advFilterDraft.splice(i, 1);
+      if (_advFilterDraft.length === 0) {
+        _advFilterDraft.push({ col: 0, op: 'eq', value: '', logic: 'AND' });
+      }
+      renderAdvConditions();
+      updateAdvPreview();
+    });
+  });
+}
+
+/* =========================================================
+   MATCH CHECK — apakah row pass kondisi
+   ========================================================= */
+function checkAdvancedFilterMatch(row, conds) {
+  if (!conds.length) return true;
+
+  const sh = sheet();
+  const results = [];
+
+  for (const cond of conds) {
+    const addr = addrOf(row, cond.col);
+    const cl = sh.cells[addr];
+    let val = '';
+
+    if (cl) {
+      if (cl.f && hf) {
+        try { val = hfGet(row, cond.col); } catch { val = ''; }
+      } else {
+        val = cl.v ?? '';
+      }
+    }
+
+    const strVal = String(val).trim();
+    const numVal = Number(strVal);
+    const isNum = !isNaN(numVal) && strVal !== '';
+    const compareVal = String(cond.value ?? '').trim();
+    const numCompare = Number(compareVal);
+
+    let match = false;
+
+    switch (cond.op) {
+      case 'eq':
+        if (isNum && !isNaN(numCompare)) match = numVal === numCompare;
+        else match = strVal === compareVal;
+        break;
+      case 'neq':
+        if (isNum && !isNaN(numCompare)) match = numVal !== numCompare;
+        else match = strVal !== compareVal;
+        break;
+      case 'gt':
+        match = isNum && !isNaN(numCompare) && numVal > numCompare;
+        break;
+      case 'lt':
+        match = isNum && !isNaN(numCompare) && numVal < numCompare;
+        break;
+      case 'gte':
+        match = isNum && !isNaN(numCompare) && numVal >= numCompare;
+        break;
+      case 'lte':
+        match = isNum && !isNaN(numCompare) && numVal <= numCompare;
+        break;
+      case 'contains':
+        match = strVal.toLowerCase().includes(compareVal.toLowerCase());
+        break;
+      case 'startswith':
+        match = strVal.toLowerCase().startsWith(compareVal.toLowerCase());
+        break;
+      case 'endswith':
+        match = strVal.toLowerCase().endsWith(compareVal.toLowerCase());
+        break;
+      case 'between': {
+        const c2 = String(cond.value2 ?? '').trim();
+        const n2 = Number(c2);
+        match = isNum && !isNaN(n2) && numVal >= numCompare && numVal <= n2;
+        break;
+      }
+    }
+
+    results.push(match);
+  }
+
+  // Combine AND/OR
+  // Baris pertama = dasar
+  // Baris berikutnya pakai logic dari kondisi itu sendiri
+  let result = results[0];
+  for (let i = 1; i < conds.length; i++) {
+    const logic = conds[i].logic || 'AND';
+    if (logic === 'AND') result = result && results[i];
+    else result = result || results[i];
+  }
+  return result;
+}
+
+/* =========================================================
+   UPDATE PREVIEW
+   ========================================================= */
+function updateAdvPreview() {
+  const preview = document.getElementById('advf-preview');
+  if (!preview) return;
+
+  // Cek draft valid
+  const valid = _advFilterDraft.filter(c => c.value !== '' || c.op === 'between');
+  if (!valid.length) {
+    preview.classList.remove('show', 'error');
+    return;
+  }
+
+  // Hitung jumlah baris yang match (scan up to 1000 baris untuk preview cepat)
+  const sh = sheet();
+  let maxR = 0;
+  for (const addr of Object.keys(sh.cells || {})) {
+    const p = parseAddr(addr);
+    if (p && p.r > maxR) maxR = p.r;
+  }
+
+  const previewLimit = Math.min(maxR, 2000);
+  let matched = 0;
+  let totalChecked = 0;
+  const headerRow = getFilterHeaderRow();
+
+  for (let r = headerRow + 1; r <= previewLimit; r++) {
+    totalChecked++;
+    if (checkAdvancedFilterMatch(r, _advFilterDraft)) matched++;
+  }
+
+  preview.classList.add('show');
+  preview.classList.remove('error');
+
+  preview.innerHTML = `
+    <i class="fa-solid fa-circle-info" style="font-size:14px"></i>
+    <div>
+      <strong>${matched.toLocaleString('id-ID')}</strong> dari
+      <strong>${totalChecked.toLocaleString('id-ID')}</strong> baris match
+      ${previewLimit < maxR ? `<span style="color:#64748b"> (preview 2.000 baris pertama)</span>` : ''}
+    </div>
+  `;
+}
+
+/* =========================================================
+   LOCK CELL (per-cell)
+   ========================================================= */
+function isCellLocked(addr) {
+  const cl = sheet().cells[addr];
+  if (!cl || !cl.s) return false;
+  return cl.s.locked === true;
+}
+
+function isCellUnlocked(addr) {
+  const cl = sheet().cells[addr];
+  if (!cl || !cl.s) return false;
+  return cl.s.locked === false;
+}
+
+function setCellLocked(addr, locked) {
+  const sh = sheet();
+  if (!sh) return;
+  if (!sh.cells) sh.cells = {};
+
+  const existing = sh.cells[addr];
+
+  if (locked === true) {
+    // === LOCK ===
+    // Buat cell kalau belum ada
+    if (!existing) {
+      sh.cells[addr] = { s: { locked: true } };
+    } else {
+      existing.s = existing.s || {};
+      existing.s.locked = true;
+    }
+    markCellDirty(addr);
+  } else {
+    // === UNLOCK ===
+    if (!existing) return;   // tidak ada cell, tidak perlu unlock
+
+    if (existing.s) {
+      delete existing.s.locked;
+
+      // Kalau style kosong dan tidak ada value/formula, hapus cell
+      const sKeys = Object.keys(existing.s);
+      const hasValue = existing.v !== undefined && existing.v !== null && existing.v !== '';
+      const hasFormula = !!existing.f;
+
+      if (sKeys.length === 0 && !hasValue && !hasFormula) {
+        delete sh.cells[addr];
+        markCellDirty(addr);
+        return;
+      }
+    }
+
+    markCellDirty(addr);
+  }
+}
+
+function lockSelection() {
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  pushUndo();
+  const parts = expandRange(selection.start, selection.end);
+  for (const addr of parts) {
+    setCellLocked(addr, true);
+  }
+
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  markMetaDirty('structure');
+  scheduleSave();
+  renderVirtual(false);
+
+  toast(`🔒 ${parts.length} cell di-lock`);
+}
+
+function unlockSelection() {
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  pushUndo();
+  const parts = expandRange(selection.start, selection.end);
+  for (const addr of parts) {
+    setCellLocked(addr, false);
+  }
+
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  markMetaDirty('structure');
+  scheduleSave();
+  renderVirtual(false);
+
+  toast(`🔓 ${parts.length} cell di-unlock`);
+}
+
+/* =========================================================
+   APPLY VISUAL INDICATORS
+   ========================================================= */
+function applyLockIndicators() {
+  // Clear
+  document.querySelectorAll('#grid td.cell-locked, #grid td.cell-unlocked')
+    .forEach(td => td.classList.remove('cell-locked', 'cell-unlocked'));
+
+  document.querySelectorAll('#grid tbody td[data-addr]').forEach(td => {
+    const addr = td.dataset.addr;
+    const cl = sheet().cells[addr];
+    if (cl?.s?.locked === true) {
+      td.classList.add('cell-locked');
+    }
+  });
+}
+
+/* =========================================================
+   WORKBOOK PASSWORD
+   ========================================================= */
+
+/* Simpan wbId yang menunggu unlock */
+let _pendingUnlock = null;
+
+/* =========================================================
+   OPEN PASSWORD PROMPT
+   ========================================================= */
+function promptUnlockPassword(wbIdToUnlock, wbNameToShow) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('modal-unlock');
+    if (!modal) return resolve(false);
+
+    modal.classList.remove('hidden');
+    const input = document.getElementById('unlock-password');
+    const errEl = document.getElementById('unlock-error');
+
+    input.value = '';
+    errEl.textContent = '';
+
+    setTimeout(() => input.focus(), 50);
+
+    // Update judul dengan nama workbook
+    const titleEl = modal.querySelector('.modal-header h3');
+    if (titleEl && wbNameToShow) {
+      titleEl.innerHTML = `<i class="fa-solid fa-shield-halved"></i> "${escapeHtml(wbNameToShow)}" Terkunci`;
+    }
+
+    _pendingUnlock = { wbId: wbIdToUnlock, resolve };
+
+    // Handle Enter
+    const onKeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        attemptUnlock();
+      }
+    };
+
+    const onCancel = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    const cleanup = () => {
+      modal.classList.add('hidden');
+      input.removeEventListener('keydown', onKeydown);
+      document.getElementById('btn-unlock-apply').removeEventListener('click', attemptUnlock);
+      document.getElementById('btn-unlock-cancel').removeEventListener('click', onCancel);
+      _pendingUnlock = null;
+    };
+
+    const attemptUnlock = async () => {
+      const pwd = input.value;
+      if (!pwd) {
+        errEl.textContent = '⚠ Password wajib diisi';
+        return;
+      }
+
+      errEl.textContent = '';
+
+      try {
+        const res = await fetch(`/api/sheets/${wbIdToUnlock}/verify-password`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
+          body: JSON.stringify({ password: pwd })
+        });
+
+        const data = await res.json();
+
+        if (res.ok && data.ok) {
+          // Simpan password di session untuk re-check jika perlu
+          sessionStorage.setItem(`wb-pass-${wbIdToUnlock}`, pwd);
+          cleanup();
+          resolve(true);
+        } else {
+          errEl.textContent = '⚠ ' + (data.error || 'Password salah');
+          input.select();
+        }
+      } catch (e) {
+        errEl.textContent = '⚠ Gagal verifikasi: ' + e.message;
+      }
+    };
+
+    input.addEventListener('keydown', onKeydown);
+    document.getElementById('btn-unlock-apply').addEventListener('click', attemptUnlock);
+    document.getElementById('btn-unlock-cancel').addEventListener('click', onCancel);
+  });
+}
+
+/* =========================================================
+   SET / CHANGE PASSWORD
+   ========================================================= */
+function openSetPasswordModal() {
+  const modal = document.getElementById('modal-set-password');
+  if (!modal) return;
+
+  // Cek apakah sudah ada password
+  const hasPass = !!_wbHasPassword;
+
+  const titleEl = document.getElementById('set-pass-title');
+  const currentWrap = document.getElementById('current-pass-wrap');
+  const removeBtn = document.getElementById('btn-set-pass-remove');
+
+  titleEl.textContent = hasPass ? 'Ganti Password' : 'Set Password';
+  currentWrap.style.display = hasPass ? '' : 'none';
+  removeBtn.style.display = hasPass ? '' : 'none';
+
+  // Reset form
+  document.getElementById('current-password').value = '';
+  document.getElementById('new-password').value = '';
+  document.getElementById('confirm-password').value = '';
+  document.getElementById('set-pass-error').textContent = '';
+
+  modal.classList.remove('hidden');
+
+  setTimeout(() => {
+    const focusEl = hasPass
+      ? document.getElementById('current-password')
+      : document.getElementById('new-password');
+    focusEl?.focus();
+  }, 50);
+}
+
+function closeSetPasswordModal() {
+  document.getElementById('modal-set-password')?.classList.add('hidden');
+}
+
+async function submitSetPassword(removeMode = false) {
+  const errEl = document.getElementById('set-pass-error');
+  errEl.textContent = '';
+
+  const hasPass = !!_wbHasPassword;
+  const currentPwd = document.getElementById('current-password').value;
+  const newPwd = document.getElementById('new-password').value;
+  const confirmPwd = document.getElementById('confirm-password').value;
+
+  if (hasPass && !currentPwd) {
+    errEl.textContent = '⚠ Password lama wajib diisi';
+    return;
+  }
+
+  if (!removeMode) {
+    if (!newPwd) {
+      errEl.textContent = '⚠ Password baru wajib diisi';
+      return;
+    }
+    if (newPwd.length < 4) {
+      errEl.textContent = '⚠ Password minimal 4 karakter';
+      return;
+    }
+    if (newPwd !== confirmPwd) {
+      errEl.textContent = '⚠ Konfirmasi password tidak cocok';
+      return;
+    }
+  }
+
+  try {
+    const body = {
+      currentPassword: hasPass ? currentPwd : undefined,
+      newPassword: removeMode ? null : newPwd
+    };
+
+    const res = await fetch(`/api/sheets/${wbId}/password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify(body)
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = '⚠ ' + (data.error || 'Gagal');
+      return;
+    }
+
+    _wbHasPassword = !removeMode;
+    closeSetPasswordModal();
+
+    if (removeMode) {
+      sessionStorage.removeItem(`wb-pass-${wbId}`);
+      toast('✔ Password dihapus');
+    } else {
+      sessionStorage.setItem(`wb-pass-${wbId}`, newPwd);
+      toast('✔ Password ' + (hasPass ? 'diganti' : 'diset'));
+    }
+  } catch (e) {
+    errEl.textContent = '⚠ ' + e.message;
+  }
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-set-pass-cancel')?.addEventListener('click', closeSetPasswordModal);
+document.getElementById('btn-set-pass-apply')?.addEventListener('click', () => submitSetPassword(false));
+document.getElementById('btn-set-pass-remove')?.addEventListener('click', async () => {
+  if (!(await customConfirm('Hapus password workbook ini?', { type: 'danger', okText: 'Hapus' }))) return;
+  submitSetPassword(true);
+});
+
+/* Enter di input */
+['current-password', 'new-password', 'confirm-password'].forEach(id => {
+  document.getElementById(id)?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      document.getElementById('btn-set-pass-apply')?.click();
+    }
+    if (e.key === 'Escape') {
+      closeSetPasswordModal();
+    }
+  });
+});
+
+console.log('✅ Workbook Password initialized');
+
+/* =========================================================
+   AUDIT LOG
+   ========================================================= */
+let _auditEntries = [];
+
+function openAuditLog() {
+  if (!wbId) return toast('Buka workbook dulu');
+
+  const modal = document.getElementById('modal-audit');
+  if (!modal) return;
+
+  modal.classList.remove('hidden');
+
+  // Reset filters
+  document.getElementById('audit-filter-user').value = '';
+  document.getElementById('audit-filter-addr').value = '';
+  document.getElementById('audit-filter-action').value = '';
+
+  loadAuditLog();
+}
+
+function closeAuditLog() {
+  document.getElementById('modal-audit')?.classList.add('hidden');
+}
+
+async function loadAuditLog() {
+  const list = document.getElementById('audit-list');
+  const summary = document.getElementById('audit-summary');
+  if (!list) return;
+
+  list.innerHTML = '<div class="audit-empty"><i class="fa-solid fa-spinner fa-spin"></i>Memuat…</div>';
+
+  const user = document.getElementById('audit-filter-user').value.trim();
+  const addr = document.getElementById('audit-filter-addr').value.trim();
+  const action = document.getElementById('audit-filter-action').value;
+
+  const params = new URLSearchParams({ limit: '200' });
+  if (user) params.set('user', user);
+  if (addr) params.set('addr', addr);
+  if (action) params.set('action', action);
+
+  try {
+    const res = await fetch(`/api/sheets/${wbId}/audit-log?${params}`, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const data = await res.json();
+    _auditEntries = data.entries || [];
+
+    if (summary) {
+      summary.textContent = `Menampilkan ${_auditEntries.length} dari ${data.total} entri`;
+    }
+
+    if (!_auditEntries.length) {
+      list.innerHTML = `<div class="audit-empty">
+        <i class="fa-solid fa-clipboard-list"></i>
+        Belum ada riwayat perubahan
+      </div>`;
+      return;
+    }
+
+    renderAuditList();
+  } catch (e) {
+    list.innerHTML = `<div class="audit-empty" style="color:#dc2626">
+      <i class="fa-solid fa-triangle-exclamation"></i>
+      Gagal memuat: ${escapeHtml(e.message)}
+    </div>`;
+  }
+}
+
+function renderAuditList() {
+  const list = document.getElementById('audit-list');
+  if (!list) return;
+
+  list.innerHTML = _auditEntries.map((e, idx) => {
+    // Icon & label action
+    const iconMap = {
+      create: { icon: 'fa-plus', label: 'Dibuat' },
+      edit:   { icon: 'fa-pen',  label: 'Diubah' },
+      delete: { icon: 'fa-trash', label: 'Dihapus' }
+    };
+    const meta = iconMap[e.action] || iconMap.edit;
+
+    // Value display
+    const oldText = formatAuditValue(e.old_value);
+    const newText = formatAuditValue(e.new_value);
+
+    // Time display
+    const time = new Date(e.created_at).toLocaleString('id-ID', {
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+
+    // Sheet name
+    const sheetName = wbData.sheets[e.sheet_idx]?.name || `Sheet${e.sheet_idx + 1}`;
+
+    // Value diff
+    let valuesHtml = '';
+    if (e.action === 'create') {
+      valuesHtml = `<div class="ae-values"><span class="ae-new">${escapeHtml(newText)}</span></div>`;
+    } else if (e.action === 'delete') {
+      valuesHtml = `<div class="ae-values"><span class="ae-old">${escapeHtml(oldText)}</span></div>`;
+    } else {
+      valuesHtml = `<div class="ae-values">
+        <span class="ae-old">${escapeHtml(oldText)}</span>
+        <span class="ae-arrow">→</span>
+        <span class="ae-new">${escapeHtml(newText)}</span>
+      </div>`;
+    }
+
+    return `
+      <div class="audit-entry" data-idx="${idx}" data-addr="${escapeHtml(e.addr)}" data-sheet="${e.sheet_idx}">
+        <div class="ae-icon ${e.action}">
+          <i class="fa-solid ${meta.icon}"></i>
+        </div>
+        <div class="ae-body">
+          <div class="ae-header">
+            <span class="ae-addr">${escapeHtml(e.addr)}</span>
+            <span style="font-size:11px;color:#94a3b8">·</span>
+            <span class="ae-user">
+              <i class="fa-solid fa-user" style="font-size:10px;margin-right:3px"></i>
+              ${escapeHtml(e.username || 'Unknown')}
+            </span>
+            <span style="font-size:11px;color:#94a3b8">·</span>
+            <span style="font-size:11px;color:#64748b">
+              <i class="fa-solid fa-table" style="font-size:10px;margin-right:3px"></i>
+              ${escapeHtml(sheetName)}
+            </span>
+            <span class="ae-time">${escapeHtml(time)}</span>
+          </div>
+          <div style="font-size:11px;color:#64748b;margin-bottom:2px">
+            ${escapeHtml(meta.label)}
+          </div>
+          ${valuesHtml}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // Click handler — jump to cell
+  list.querySelectorAll('.audit-entry').forEach(item => {
+    item.addEventListener('click', async () => {
+      const addr = item.dataset.addr;
+      const sheetIdx = parseInt(item.dataset.sheet, 10);
+
+      closeAuditLog();
+
+      // Switch sheet kalau perlu
+      if (sheetIdx !== activeSheetIdx) {
+        await switchSheet(sheetIdx);
+      }
+
+      // Jump ke cell
+      selectCell(addr);
+      scrollAddrIntoView(addr);
+
+      // Highlight sementara
+      const td = findTd(addr);
+      if (td) {
+        td.style.transition = 'all .3s';
+        td.style.boxShadow = '0 0 0 4px rgba(16,185,129,.5)';
+        setTimeout(() => {
+          td.style.boxShadow = '';
+        }, 1500);
+      }
+
+      toast(`🎯 Ke ${addr}`);
+    });
+  });
+}
+
+/* Helper: format value untuk ditampilkan */
+function formatAuditValue(val) {
+  if (val === null || val === undefined) return '(kosong)';
+  if (typeof val === 'object') {
+    if (val.f) return val.f;
+    if (val.v !== undefined) return String(val.v);
+    return JSON.stringify(val);
+  }
+  return String(val);
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-audit-close')?.addEventListener('click', closeAuditLog);
+document.getElementById('btn-audit-cancel')?.addEventListener('click', closeAuditLog);
+document.getElementById('btn-audit-refresh')?.addEventListener('click', loadAuditLog);
+document.getElementById('modal-audit')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-audit') closeAuditLog();
+});
+
+// Filter — debounce input
+let _auditTimer = null;
+['audit-filter-user', 'audit-filter-addr', 'audit-filter-action'].forEach(id => {
+  document.getElementById(id)?.addEventListener('input', () => {
+    clearTimeout(_auditTimer);
+    _auditTimer = setTimeout(loadAuditLog, 300);
+  });
+  document.getElementById(id)?.addEventListener('change', () => {
+    clearTimeout(_auditTimer);
+    _auditTimer = setTimeout(loadAuditLog, 100);
+  });
+});
+
+console.log('✅ Audit Log initialized');
+document.getElementById('btn-audit')?.addEventListener('click', openAuditLog);
+
+/* =========================================================
+   PIVOT TABLE — Interactive
+   ========================================================= */
+let _pivotCounter = 0;
+
+function getPivots() {
+  const sh = sheet();
+  if (!sh) return [];
+  if (!Array.isArray(sh.pivots)) sh.pivots = [];
+  return sh.pivots;
+}
+
+/* =========================================================
+   CREATE PIVOT dari selection
+   ========================================================= */
+function createPivotFromSelection() {
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return toast('Pilih range dulu');
+
+  const r0 = Math.min(p1.r, p2.r), r1 = Math.max(p1.r, p2.r);
+  const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+  if (r1 - r0 < 1) return toast('⚠ Minimal 2 baris (header + data)');
+
+  const rangeStr = addrOf(r0, c0) + ':' + addrOf(r1, c1);
+
+  const pivot = {
+    id: 'pv' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
+    name: `Pivot ${getPivots().length + 1}`,
+    sourceSheetIdx: activeSheetIdx,
+    sourceRange: rangeStr,
+    rows: [c0],       // kolom pertama jadi baris default
+    cols: [],
+    values: [{ col: c1, agg: 'SUM' }],   // kolom terakhir jadi value default
+    filters: [],
+    x: 200 + (getPivots().length * 30),
+    y: 150 + (getPivots().length * 30),
+    w: 700,
+    h: 450
+  };
+
+  getPivots().push(pivot);
+  markMetaDirty('structure');
+  scheduleSave();
+
+  renderPivotWindow(pivot);
+  toast(`✔ Pivot "${pivot.name}" dibuat`);
+}
+
+/* =========================================================
+   RENDER SEMUA PIVOT untuk sheet aktif
+   ========================================================= */
+function renderAllPivots() {
+  // Hapus DOM pivot yang lama
+  document.querySelectorAll('.pivot-window').forEach(el => el.remove());
+
+  const pivots = getPivots();
+  for (const p of pivots) {
+    // Skip kalau bukan untuk sheet ini (pivot yang source-nya beda sheet)
+    if (p.sourceSheetIdx !== activeSheetIdx) continue;
+    renderPivotWindow(p);
+  }
+}
+
+/* =========================================================
+   RENDER SATU PIVOT WINDOW
+   ========================================================= */
+function renderPivotWindow(pivot) {
+  // Hapus window lama dengan id sama
+  document.querySelector(`.pivot-window[data-pivot-id="${pivot.id}"]`)?.remove();
+
+  const el = document.createElement('div');
+  el.className = 'pivot-window';
+  el.dataset.pivotId = pivot.id;
+  el.style.left = pivot.x + 'px';
+  el.style.top = pivot.y + 'px';
+  el.style.width = pivot.w + 'px';
+  el.style.height = pivot.h + 'px';
+
+  el.innerHTML = `
+    <div class="pivot-header">
+      <span class="pivot-title">${escapeHtml(pivot.name)}</span>
+      <div class="pivot-actions">
+        <button class="pivot-btn pivot-refresh" title="Refresh"><i class="fa-solid fa-rotate"></i></button>
+        <button class="pivot-btn pivot-source" title="Edit Source Range"><i class="fa-solid fa-crosshairs"></i></button>
+        <button class="pivot-btn pivot-close" title="Tutup"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+    </div>
+    <div class="pivot-body">
+      <div class="pivot-config">
+        <div class="pivot-section">
+          <div class="pivot-section-label"><i class="fa-solid fa-table-cells"></i> Fields</div>
+          <div id="pivot-fields-${pivot.id}" class="pivot-fields-list"></div>
+        </div>
+      </div>
+      <div class="pivot-result-wrap">
+        <div id="pivot-result-${pivot.id}"></div>
+      </div>
+    </div>
+    <div class="pivot-resize"></div>
+  `;
+
+  document.body.appendChild(el);
+
+  // Render fields list & result
+  renderPivotFields(pivot);
+  renderPivotResult(pivot);
+
+  // Drag
+  makePivotDraggable(el, el.querySelector('.pivot-header'), pivot);
+  makePivotResizable(el, el.querySelector('.pivot-resize'), pivot);
+
+  // Button handlers
+  el.querySelector('.pivot-close').addEventListener('click', () => {
+    if (!customConfirm(`Hapus pivot "${pivot.name}"?`)) return;
+    const pivots = getPivots();
+    const idx = pivots.findIndex(x => x.id === pivot.id);
+    if (idx >= 0) {
+      pivots.splice(idx, 1);
+      markMetaDirty('structure');
+      scheduleSave();
+    }
+    el.remove();
+    toast('✔ Pivot dihapus');
+  });
+
+  el.querySelector('.pivot-refresh').addEventListener('click', () => {
+    renderPivotResult(pivot);
+    toast('🔄 Pivot refresh');
+  });
+
+  el.querySelector('.pivot-source').addEventListener('click', () => {
+    editPivotSource(pivot);
+  });
+}
+
+/* =========================================================
+   RENDER FIELDS — drop zones + field list
+   ========================================================= */
+function renderPivotFields(pivot) {
+  const cont = document.getElementById(`pivot-fields-${pivot.id}`);
+  if (!cont) return;
+
+  // Ambil header fields dari source range
+  const srcCells = wbData.sheets[pivot.sourceSheetIdx]?.cells || {};
+  const [s, e] = rangeParts(pivot.sourceRange);
+  const p1 = parseAddr(s), p2 = parseAddr(e);
+  if (!p1 || !p2) return;
+
+  const r0 = Math.min(p1.r, p2.r);
+  const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+  // Header row = row pertama source
+  const fields = [];
+  for (let c = c0; c <= c1; c++) {
+    const addr = addrOf(r0, c);
+    const cl = srcCells[addr];
+    const headerText = cl?.v ? String(cl.v) : colName(c);
+    fields.push({ col: c, label: headerText, addr });
+  }
+
+  // Cek apakah ada di drop zone
+  const isAssigned = (col) =>
+    pivot.rows.includes(col) ||
+    pivot.cols.includes(col) ||
+    pivot.values.some(v => v.col === col);
+
+  const availableFields = fields.filter(f => !isAssigned(f.col));
+
+  // Build UI
+  let html = '';
+
+  // === ROWS ===
+  html += `
+    <div class="pivot-section">
+      <div class="pivot-section-label"><i class="fa-solid fa-bars"></i> Rows</div>
+      <div class="pivot-drop-zone" data-zone="rows" data-pivot="${pivot.id}">
+        ${pivot.rows.map(c => {
+          const f = fields.find(x => x.col === c);
+          return `<div class="pivot-field-chip" draggable="true" data-col="${c}" data-zone="rows" data-pivot="${pivot.id}">
+            ${escapeHtml(f?.label || colName(c))}
+            <span class="chip-remove" data-col="${c}" data-zone="rows" data-pivot="${pivot.id}">×</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+
+  // === COLUMNS ===
+  html += `
+    <div class="pivot-section">
+      <div class="pivot-section-label"><i class="fa-solid fa-table-columns"></i> Columns</div>
+      <div class="pivot-drop-zone" data-zone="cols" data-pivot="${pivot.id}">
+        ${pivot.cols.map(c => {
+          const f = fields.find(x => x.col === c);
+          return `<div class="pivot-field-chip" draggable="true" data-col="${c}" data-zone="cols" data-pivot="${pivot.id}">
+            ${escapeHtml(f?.label || colName(c))}
+            <span class="chip-remove" data-col="${c}" data-zone="cols" data-pivot="${pivot.id}">×</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+
+  // === VALUES ===
+  html += `
+    <div class="pivot-section">
+      <div class="pivot-section-label"><i class="fa-solid fa-sigma"></i> Values</div>
+      <div class="pivot-drop-zone" data-zone="values" data-pivot="${pivot.id}">
+        ${pivot.values.map(v => {
+          const f = fields.find(x => x.col === v.col);
+          return `<div class="pivot-field-chip agg" draggable="true" data-col="${v.col}" data-zone="values" data-pivot="${pivot.id}">
+            <select data-col="${v.col}" data-pivot="${pivot.id}">
+              <option value="SUM" ${v.agg === 'SUM' ? 'selected' : ''}>SUM</option>
+              <option value="COUNT" ${v.agg === 'COUNT' ? 'selected' : ''}>COUNT</option>
+              <option value="AVERAGE" ${v.agg === 'AVERAGE' ? 'selected' : ''}>AVG</option>
+              <option value="MIN" ${v.agg === 'MIN' ? 'selected' : ''}>MIN</option>
+              <option value="MAX" ${v.agg === 'MAX' ? 'selected' : ''}>MAX</option>
+            </select>
+            ${escapeHtml(f?.label || colName(v.col))}
+            <span class="chip-remove" data-col="${v.col}" data-zone="values" data-pivot="${pivot.id}">×</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+
+  // === AVAILABLE FIELDS ===
+  html += `
+    <div class="pivot-section">
+      <div class="pivot-section-label"><i class="fa-solid fa-cube"></i> Available Fields</div>
+      <div class="pivot-fields-list">
+        ${availableFields.map(f => `
+          <div class="pivot-field-item" draggable="true" data-col="${f.col}" data-label="${escapeHtml(f.label)}" data-pivot="${pivot.id}">
+            ${escapeHtml(f.label)}
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+
+  cont.innerHTML = html;
+
+  // === BIND DRAG & DROP ===
+  bindPivotDragDrop(pivot, cont);
+}
+
+/* =========================================================
+   BIND DRAG DROP
+   ========================================================= */
+function bindPivotDragDrop(pivot, cont) {
+  // Field chips — draggable
+  cont.querySelectorAll('.pivot-field-chip[draggable]').forEach(chip => {
+    chip.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', JSON.stringify({
+        col: parseInt(chip.dataset.col, 10),
+        fromZone: chip.dataset.zone,
+        pivotId: chip.dataset.pivot
+      }));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+  });
+
+  // Available fields — draggable
+  cont.querySelectorAll('.pivot-field-item[draggable]').forEach(item => {
+    item.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', JSON.stringify({
+        col: parseInt(item.dataset.col, 10),
+        label: item.dataset.label,
+        fromZone: null,
+        pivotId: item.dataset.pivot
+      }));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+  });
+
+  // Drop zones
+  cont.querySelectorAll('.pivot-drop-zone').forEach(zone => {
+    zone.addEventListener('dragover', e => {
+      e.preventDefault();
+      zone.classList.add('drag-over');
+    });
+    zone.addEventListener('dragleave', () => {
+      zone.classList.remove('drag-over');
+    });
+    zone.addEventListener('drop', e => {
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+      try {
+        const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+        if (data.pivotId !== pivot.id) return;
+        assignPivotField(pivot, data.col, data.fromZone, zone.dataset.zone);
+      } catch (err) {
+        console.warn('Drop failed:', err);
+      }
+    });
+  });
+
+  // Chip remove buttons
+  cont.querySelectorAll('.chip-remove').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const col = parseInt(btn.dataset.col, 10);
+      const zone = btn.dataset.zone;
+      removePivotField(pivot, col, zone);
+    });
+  });
+
+  // Aggregate select
+  cont.querySelectorAll('.pivot-field-chip.agg select').forEach(sel => {
+    sel.addEventListener('change', e => {
+      const col = parseInt(e.target.dataset.col, 10);
+      const v = pivot.values.find(x => x.col === col);
+      if (v) {
+        v.agg = e.target.value;
+        markMetaDirty('structure');
+        scheduleSave();
+        renderPivotResult(pivot);
+        renderPivotFields(pivot);
+      }
+    });
+  });
+}
+
+/* =========================================================
+   ASSIGN / REMOVE FIELD
+   ========================================================= */
+function assignPivotField(pivot, col, fromZone, toZone) {
+  // Hapus dari zone lama
+  if (fromZone === 'rows') pivot.rows = pivot.rows.filter(c => c !== col);
+  else if (fromZone === 'cols') pivot.cols = pivot.cols.filter(c => c !== col);
+  else if (fromZone === 'values') pivot.values = pivot.values.filter(v => v.col !== col);
+
+  // Tambah ke zone baru
+  if (toZone === 'rows') {
+    if (!pivot.rows.includes(col)) pivot.rows.push(col);
+  } else if (toZone === 'cols') {
+    if (!pivot.cols.includes(col)) pivot.cols.push(col);
+  } else if (toZone === 'values') {
+    if (!pivot.values.some(v => v.col === col)) {
+      pivot.values.push({ col, agg: 'SUM' });
+    }
+  }
+
+  markMetaDirty('structure');
+  scheduleSave();
+  renderPivotFields(pivot);
+  renderPivotResult(pivot);
+}
+
+function removePivotField(pivot, col, zone) {
+  if (zone === 'rows') pivot.rows = pivot.rows.filter(c => c !== col);
+  else if (zone === 'cols') pivot.cols = pivot.cols.filter(c => c !== col);
+  else if (zone === 'values') pivot.values = pivot.values.filter(v => v.col !== col);
+
+  markMetaDirty('structure');
+  scheduleSave();
+  renderPivotFields(pivot);
+  renderPivotResult(pivot);
+}
+
+/* =========================================================
+   COMPUTE PIVOT
+   ========================================================= */
+function computePivot(pivot) {
+  const srcSheet = wbData.sheets[pivot.sourceSheetIdx];
+  if (!srcSheet) return { rows: [], cols: [], data: [] };
+
+  const [s, e] = rangeParts(pivot.sourceRange);
+  const p1 = parseAddr(s), p2 = parseAddr(e);
+  if (!p1 || !p2) return { rows: [], cols: [], data: [] };
+
+  const r0 = Math.min(p1.r, p2.r);
+  const r1 = Math.max(p1.r, p2.r);
+  const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+  // Get cell value helper
+  const getVal = (r, c) => {
+    const addr = addrOf(r, c);
+    const cl = srcSheet.cells[addr];
+    if (!cl) return '';
+    if (cl.f && pivot.sourceSheetIdx === activeSheetIdx) {
+      try { return hfGet(r, c); } catch { return ''; }
+    }
+    return cl.v ?? '';
+  };
+
+  // Header row = r0
+  const headers = {};
+  for (let c = c0; c <= c1; c++) {
+    headers[c] = String(getVal(r0, c) || colName(c));
+  }
+
+  // Collect data
+  const groups = new Map();  // key → { rowKeys, colKeys, values }
+
+  for (let r = r0 + 1; r <= r1; r++) {
+    const rowKeyParts = pivot.rows.map(c => String(getVal(r, c) || '(blank)'));
+    const colKeyParts = pivot.cols.map(c => String(getVal(r, c) || '(blank)'));
+    const rowKey = rowKeyParts.join('\u0001');
+    const colKey = colKeyParts.join('\u0001');
+    const combinedKey = rowKey + '\u0002' + colKey;
+
+    if (!groups.has(combinedKey)) {
+      groups.set(combinedKey, {
+        rowKeys: rowKeyParts,
+        colKeys: colKeyParts,
+        vals: pivot.values.map(() => [])
+      });
+    }
+
+    const g = groups.get(combinedKey);
+    pivot.values.forEach((v, vi) => {
+      const raw = getVal(r, v.col);
+      const num = Number(raw);
+      if (v.agg === 'COUNT') {
+        if (raw !== '' && raw !== null && raw !== undefined) g.vals[vi].push(1);
+      } else {
+        if (!isNaN(num)) g.vals[vi].push(num);
+      }
+    });
+  }
+
+  // Aggregate
+  const aggFn = (arr, agg) => {
+    if (!arr.length) return 0;
+    switch (agg) {
+      case 'SUM': return arr.reduce((a, b) => a + b, 0);
+      case 'COUNT': return arr.length;
+      case 'AVERAGE': return arr.reduce((a, b) => a + b, 0) / arr.length;
+      case 'MIN': return Math.min(...arr);
+      case 'MAX': return Math.max(...arr);
+      default: return 0;
+    }
+  };
+
+  // Extract unique row keys & col keys
+  const uniqueRowKeys = new Map();  // rowKeyStr → rowKeyParts
+  const uniqueColKeys = new Map();
+
+  for (const [key, g] of groups) {
+    const rk = g.rowKeys.join('\u0001');
+    const ck = g.colKeys.join('\u0001');
+    if (!uniqueRowKeys.has(rk)) uniqueRowKeys.set(rk, g.rowKeys);
+    if (!uniqueColKeys.has(ck)) uniqueColKeys.set(ck, g.colKeys);
+  }
+
+  // Sort keys
+  const sortFn = (a, b) => {
+    const na = Number(a), nb = Number(b);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return String(a).localeCompare(String(b));
+  };
+
+  const rowKeysArr = [...uniqueRowKeys.values()].sort((a, b) => sortFn(a[0], b[0]));
+  const colKeysArr = [...uniqueColKeys.values()].sort((a, b) => sortFn(a[0], b[0]));
+
+  // Build result matrix
+  const rowLabels = rowKeysArr.map(rk => rk.join(' / '));
+  const colLabels = colKeysArr.map(ck => ck.join(' / '));
+
+  const data = [];
+  for (const rk of rowKeysArr) {
+    const rowData = [];
+    for (const ck of colKeysArr) {
+      const combinedKey = rk.join('\u0001') + '\u0002' + ck.join('\u0001');
+      const g = groups.get(combinedKey);
+      if (g) {
+        rowData.push(pivot.values.map((v, vi) => aggFn(g.vals[vi], v.agg)));
+      } else {
+        rowData.push(pivot.values.map(() => 0));
+      }
+    }
+    data.push({ rowLabel: rk.join(' / '), values: rowData });
+  }
+
+  return {
+    headers,
+    rowKeys: rowKeysArr,
+    colKeys: colKeysArr,
+    rowLabels,
+    colLabels,
+    data,
+    values: pivot.values
+  };
+}
+
+/* =========================================================
+   RENDER PIVOT RESULT
+   ========================================================= */
+function renderPivotResult(pivot) {
+  const cont = document.getElementById(`pivot-result-${pivot.id}`);
+  if (!cont) return;
+
+  if (!pivot.rows.length && !pivot.cols.length) {
+    cont.innerHTML = `<div class="pivot-empty">
+      <i class="fa-solid fa-table-columns"></i>
+      Tambahkan field ke <b>Rows</b> atau <b>Columns</b> dari panel kiri
+    </div>`;
+    return;
+  }
+
+  const result = computePivot(pivot);
+
+  if (!result.data.length) {
+    cont.innerHTML = `<div class="pivot-empty">
+      <i class="fa-solid fa-table-columns"></i>
+      Tidak ada data untuk ditampilkan
+    </div>`;
+    return;
+  }
+
+  // Build table
+  const hasCols = pivot.cols.length > 0;
+
+  let html = '<table class="pivot-result-table">';
+
+  // Header
+  html += '<thead><tr>';
+  html += '<th>' + (pivot.rows.length ? result.headers[pivot.rows[0]] || 'Row' : 'Row') + '</th>';
+
+  if (hasCols) {
+    // Multiple columns headers
+    for (const ck of result.colKeys) {
+      html += `<th colspan="${pivot.values.length}">${escapeHtml(ck.join(' / ') || '(blank)')}</th>`;
+    }
+  } else {
+    for (const v of pivot.values) {
+      const h = result.headers[v.col] || colName(v.col);
+      html += `<th>${escapeHtml(v.agg)} of ${escapeHtml(h)}</th>`;
+    }
+  }
+  html += '</tr>';
+
+  // Sub-header kalau ada cols
+  if (hasCols && pivot.values.length > 1) {
+    html += '<tr>';
+    html += '<th></th>';
+    for (let ci = 0; ci < result.colKeys.length; ci++) {
+      for (const v of pivot.values) {
+        const h = result.headers[v.col] || colName(v.col);
+        html += `<th style="font-weight:500;font-size:11px">${escapeHtml(v.agg)} ${escapeHtml(h)}</th>`;
+      }
+    }
+    html += '</tr>';
+  } else if (hasCols && pivot.values.length === 1) {
+    html += '<tr>';
+    html += '<th></th>';
+    for (let ci = 0; ci < result.colKeys.length; ci++) {
+      const h = result.headers[pivot.values[0].col] || colName(pivot.values[0].col);
+      html += `<th style="font-weight:500;font-size:11px">${escapeHtml(pivot.values[0].agg)} ${escapeHtml(h)}</th>`;
+    }
+    html += '</tr>';
+  }
+  html += '</thead>';
+
+  // Body
+  html += '<tbody>';
+
+  for (const row of result.data) {
+    html += '<tr>';
+    html += `<td><b>${escapeHtml(row.rowLabel || '(blank)')}</b></td>`;
+
+    for (const cellVals of row.values) {
+      if (Array.isArray(cellVals)) {
+        for (const v of cellVals) {
+          html += `<td class="num">${formatPivotNumber(v)}</td>`;
+        }
+      } else {
+        html += `<td class="num">${formatPivotNumber(cellVals)}</td>`;
+      }
+    }
+    html += '</tr>';
+  }
+
+  // Grand total
+  if (result.data.length > 1) {
+    html += '<tr class="total-row">';
+    html += '<td>Grand Total</td>';
+
+    const totalCols = result.colKeys.length * pivot.values.length;
+    for (let ci = 0; ci < totalCols; ci++) {
+      let total = 0;
+      for (const row of result.data) {
+        const flat = row.values.flat();
+        total += Number(flat[ci]) || 0;
+      }
+      html += `<td class="num">${formatPivotNumber(total)}</td>`;
+    }
+    html += '</tr>';
+  }
+
+  html += '</tbody></table>';
+  cont.innerHTML = html;
+}
+
+function formatPivotNumber(n) {
+  if (n === null || n === undefined) return '—';
+  if (typeof n === 'number') {
+    if (Number.isInteger(n)) return n.toLocaleString('id-ID');
+    return n.toLocaleString('id-ID', { maximumFractionDigits: 2 });
+  }
+  return String(n);
+}
+
+/* =========================================================
+   DRAG & RESIZE
+   ========================================================= */
+function makePivotDraggable(el, handle, model) {
+  handle.addEventListener('mousedown', e => {
+    if (e.target.closest('.pivot-btn')) return;
+    const sx = e.clientX, sy = e.clientY, ox = model.x, oy = model.y;
+    const mv = ev => {
+      model.x = Math.max(0, ox + ev.clientX - sx);
+      model.y = Math.max(0, oy + ev.clientY - sy);
+      el.style.left = model.x + 'px';
+      el.style.top = model.y + 'px';
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', mv);
+      document.removeEventListener('mouseup', up);
+      markMetaDirty('structure');
+      scheduleSave();
+    };
+    document.addEventListener('mousemove', mv);
+    document.addEventListener('mouseup', up);
+  });
+}
+
+function makePivotResizable(el, handle, model) {
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const sx = e.clientX, sy = e.clientY, ow = model.w, oh = model.h;
+    const mv = ev => {
+      model.w = Math.max(400, ow + ev.clientX - sx);
+      model.h = Math.max(250, oh + ev.clientY - sy);
+      el.style.width = model.w + 'px';
+      el.style.height = model.h + 'px';
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', mv);
+      document.removeEventListener('mouseup', up);
+      markMetaDirty('structure');
+      scheduleSave();
+    };
+    document.addEventListener('mousemove', mv);
+    document.addEventListener('mouseup', up);
+  });
+}
+
+/* =========================================================
+   EDIT SOURCE
+   ========================================================= */
+async function editPivotSource(pivot) {
+  const newRange = await customPrompt(
+    'Ubah source range (contoh: A1:F100):',
+    pivot.sourceRange,
+    { title: 'Edit Source Range' }
+  );
+  if (!newRange || newRange === pivot.sourceRange) return;
+
+  // Validasi
+  const [s, e] = rangeParts(newRange);
+  if (!parseAddr(s) || !parseAddr(e)) {
+    return toast('⚠ Range tidak valid');
+  }
+
+  pivot.sourceRange = newRange.toUpperCase();
+  markMetaDirty('structure');
+  scheduleSave();
+  renderPivotFields(pivot);
+  renderPivotResult(pivot);
+  toast('✔ Source diubah');
+}
+
+/* =========================================================
+   MODAL: LIST PIVOTS
+   ========================================================= */
+function openPivotList() {
+  if (!wbId) return toast('Buka workbook dulu');
+
+  const modal = document.getElementById('modal-pivots');
+  if (!modal) return;
+
+  const list = document.getElementById('pivots-list');
+  const pivots = getPivots();
+
+  if (!pivots.length) {
+    list.innerHTML = `<div style="padding:30px 20px;text-align:center;color:#94a3b8">
+      <i class="fa-solid fa-table-columns" style="font-size:32px;color:#cbd5e1;display:block;margin-bottom:12px"></i>
+      Belum ada pivot. Pilih range data lalu klik <b>Pivot Table</b>.
+    </div>`;
+  } else {
+    list.innerHTML = pivots.map(p => `
+      <div class="pivot-list-item" data-id="${p.id}">
+        <div class="pl-icon"><i class="fa-solid fa-table-columns"></i></div>
+        <div class="pl-body">
+          <div class="pl-name">${escapeHtml(p.name)}</div>
+          <div class="pl-meta">
+            ${wbData.sheets[p.sourceSheetIdx]?.name || 'Sheet'}!${p.sourceRange} ·
+            ${p.rows.length} rows · ${p.values.length} values
+          </div>
+        </div>
+        <div class="pl-del" data-id="${p.id}" title="Hapus">
+          <i class="fa-solid fa-trash"></i>
+        </div>
+      </div>
+    `).join('');
+
+    // Click to open
+    list.querySelectorAll('.pivot-list-item').forEach(item => {
+      item.addEventListener('click', e => {
+        if (e.target.closest('.pl-del')) return;
+        const id = item.dataset.id;
+        const p = getPivots().find(x => x.id === id);
+        if (p) {
+          // Switch ke source sheet kalau perlu
+          if (p.sourceSheetIdx !== activeSheetIdx) {
+            switchSheet(p.sourceSheetIdx).then(() => renderPivotWindow(p));
+          } else {
+            renderPivotWindow(p);
+          }
+          modal.classList.add('hidden');
+        }
+      });
+    });
+
+    // Delete buttons
+    list.querySelectorAll('.pl-del').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        if (!(await customConfirm('Hapus pivot ini?', { type: 'danger', okText: 'Hapus' }))) return;
+
+        const pivots = getPivots();
+        const idx = pivots.findIndex(x => x.id === id);
+        if (idx >= 0) {
+          pivots.splice(idx, 1);
+          markMetaDirty('structure');
+          scheduleSave();
+        }
+        document.querySelector(`.pivot-window[data-pivot-id="${id}"]`)?.remove();
+        openPivotList();
+      });
+    });
+  }
+
+  modal.classList.remove('hidden');
+}
+
+function closePivotList() {
+  document.getElementById('modal-pivots')?.classList.add('hidden');
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-pivot-new')?.addEventListener('click', createPivotFromSelection);
+document.getElementById('btn-pivot-list')?.addEventListener('click', openPivotList);
+document.getElementById('btn-pivots-close')?.addEventListener('click', closePivotList);
+document.getElementById('btn-pivots-cancel')?.addEventListener('click', closePivotList);
+document.getElementById('modal-pivots')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-pivots') closePivotList();
+});
+
+console.log('✅ Pivot Table initialized');
+
+/* =========================================================
+   IMPORT FROM URL
+   ========================================================= */
+let _iuPreviewData = null;   // data terakhir yang di-fetch
+
+function openImportURLModal() {
+  if (!wbId) return toast('Buka workbook dulu');
+
+  const modal = document.getElementById('modal-import-url');
+  if (!modal) return;
+
+  // Reset
+  document.getElementById('iu-url').value = '';
+  document.getElementById('iu-format').value = 'auto';
+  document.getElementById('iu-target').value = 'new';
+  document.getElementById('iu-sheet-name').value = 'Data Import';
+  document.getElementById('iu-header-row').value = '1';
+  document.getElementById('iu-has-header').checked = true;
+  document.getElementById('iu-error').textContent = '';
+  document.getElementById('iu-preview-meta').textContent = '';
+  document.getElementById('iu-preview').innerHTML = '<div class="iu-preview-empty">Klik <b>Fetch & Preview</b> untuk melihat data</div>';
+  document.getElementById('btn-iu-import').disabled = true;
+  _iuPreviewData = null;
+
+  modal.classList.remove('hidden');
+  setTimeout(() => document.getElementById('iu-url')?.focus(), 50);
+}
+
+function closeImportURLModal() {
+  document.getElementById('modal-import-url')?.classList.add('hidden');
+}
+
+/* =========================================================
+   FETCH URL
+   ========================================================= */
+async function fetchURLData() {
+  const url = document.getElementById('iu-url').value.trim();
+  const errEl = document.getElementById('iu-error');
+  errEl.textContent = '';
+
+  if (!url) {
+    errEl.textContent = '⚠ URL wajib diisi';
+    return;
+  }
+
+  const btn = document.getElementById('btn-iu-fetch');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Fetching…';
+
+  try {
+    const res = await fetch('/api/sheets/fetch-url', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({ url })
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = '⚠ ' + (data.error || 'Gagal fetch');
+      return;
+    }
+
+    // Detect format
+    const format = document.getElementById('iu-format').value;
+    const detected = detectFormat(url, data.contentType, data.content, format);
+
+    // Parse
+    const parsed = parseImportData(data.content, detected);
+
+    if (!parsed || !parsed.rows || !parsed.rows.length) {
+      errEl.textContent = '⚠ Tidak ada data yang bisa di-parse';
+      return;
+    }
+
+    _iuPreviewData = {
+      url,
+      format: detected,
+      rows: parsed.rows,
+      headers: parsed.headers,
+      size: data.size
+    };
+
+    renderImportPreview();
+    document.getElementById('btn-iu-import').disabled = false;
+    document.getElementById('iu-preview-meta').textContent =
+      `${parsed.rows.length} baris · ${parsed.headers.length} kolom · ${(data.size / 1024).toFixed(1)} KB`;
+
+  } catch (e) {
+    errEl.textContent = '⚠ ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = origHTML;
+  }
+}
+
+function detectFormat(url, contentType, content, userChoice) {
+  if (userChoice !== 'auto') return userChoice;
+
+  const lowerUrl = url.toLowerCase();
+  const lowerCT = (contentType || '').toLowerCase();
+
+  if (lowerUrl.endsWith('.json') || lowerCT.includes('json')) return 'json';
+  if (lowerUrl.endsWith('.tsv') || lowerUrl.endsWith('.tab')) return 'tsv';
+  if (lowerUrl.endsWith('.csv')) return 'csv';
+
+  // Content-based
+  const trimmed = content.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return 'json';
+
+  // Cek tab vs comma
+  const firstLine = trimmed.split('\n')[0] || '';
+  if (firstLine.split('\t').length > firstLine.split(',').length) return 'tsv';
+
+  return 'csv';
+}
+
+/* =========================================================
+   PARSE DATA
+   ========================================================= */
+function parseImportData(content, format) {
+  const hasHeader = document.getElementById('iu-has-header').checked;
+
+  if (format === 'json') {
+    return parseJSONData(content, hasHeader);
+  }
+  return parseDelimitedData(content, format === 'tsv' ? '\t' : ',', hasHeader);
+}
+
+function parseJSONData(content, hasHeader) {
+  try {
+    const obj = JSON.parse(content);
+    let arr = null;
+
+    // Cari array pertama
+    if (Array.isArray(obj)) {
+      arr = obj;
+    } else if (obj && typeof obj === 'object') {
+      // Cari key yang isinya array
+      for (const key of Object.keys(obj)) {
+        if (Array.isArray(obj[key]) && obj[key].length > 0) {
+          arr = obj[key];
+          break;
+        }
+      }
+    }
+
+    if (!arr || !arr.length) return null;
+
+    // Array of primitives
+    if (typeof arr[0] !== 'object') {
+      return {
+        headers: ['Value'],
+        rows: arr.map(v => [String(v)])
+      };
+    }
+
+    // Array of objects
+    const allKeys = new Set();
+    for (const item of arr) {
+      if (item && typeof item === 'object') {
+        Object.keys(item).forEach(k => allKeys.add(k));
+      }
+    }
+
+    const keys = [...allKeys];
+    const headers = hasHeader ? keys : keys;
+
+    const rows = arr.map(item => keys.map(k => {
+      const v = item?.[k];
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    }));
+
+    return { headers, rows };
+  } catch (e) {
+    console.warn('JSON parse failed:', e);
+    return null;
+  }
+}
+
+function parseDelimitedData(content, delimiter, hasHeader) {
+  // Normalize line endings
+  const text = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/, '');
+  const lines = text.split('\n');
+
+  const rows = [];
+  for (const line of lines) {
+    const cells = [];
+    let cur = '';
+    let inQuote = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuote && line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuote = !inQuote;
+        }
+      } else if (ch === delimiter && !inQuote) {
+        cells.push(cur);
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    cells.push(cur);
+    rows.push(cells);
+  }
+
+  if (!rows.length) return null;
+
+  let headers, dataRows;
+  if (hasHeader) {
+    headers = rows[0];
+    dataRows = rows.slice(1);
+  } else {
+    const maxCols = Math.max(...rows.map(r => r.length));
+    headers = Array.from({ length: maxCols }, (_, i) => `Col ${i + 1}`);
+    dataRows = rows;
+  }
+
+  return { headers, rows: dataRows };
+}
+
+/* =========================================================
+   RENDER PREVIEW
+   ========================================================= */
+function renderImportPreview() {
+  const cont = document.getElementById('iu-preview');
+  if (!cont || !_iuPreviewData) return;
+
+  const { headers, rows } = _iuPreviewData;
+
+  // Ambil 20 baris pertama untuk preview
+  const preview = rows.slice(0, 20);
+
+  let html = '<table>';
+  html += '<thead><tr>';
+  html += '<th style="width:40px;text-align:center">#</th>';
+  headers.forEach(h => html += `<th>${escapeHtml(String(h))}</th>`);
+  html += '</tr></thead><tbody>';
+
+  preview.forEach((row, i) => {
+    html += '<tr>';
+    html += `<td style="text-align:center;color:#94a3b8;font-size:10.5px">${i + 1}</td>`;
+    headers.forEach((_, ci) => {
+      const v = row[ci] ?? '';
+      const s = String(v);
+      const isNum = s !== '' && !isNaN(Number(s));
+      html += `<td class="${isNum ? 'num' : ''}">${escapeHtml(s)}</td>`;
+    });
+    html += '</tr>';
+  });
+
+  if (rows.length > 20) {
+    html += `<tr><td colspan="${headers.length + 1}" style="text-align:center;color:#94a3b8;font-size:11px;padding:8px">
+      … dan ${rows.length - 20} baris lainnya
+    </td></tr>`;
+  }
+
+  html += '</tbody></table>';
+  cont.innerHTML = html;
+}
+
+/* =========================================================
+   IMPORT DATA
+   ========================================================= */
+async function importURLData() {
+  console.log('🔵 importURLData called');
+
+  if (!_iuPreviewData) {
+    console.warn('❌ _iuPreviewData null');
+    return toast('⚠ Fetch data dulu');
+  }
+
+  const { headers, rows } = _iuPreviewData;
+  const target = document.getElementById('iu-target').value;
+  const sheetName = document.getElementById('iu-sheet-name').value.trim() || 'Data Import';
+  const hasHeader = document.getElementById('iu-has-header').checked;
+
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  pushUndo();
+
+  let targetSheetIdx;
+  let startRow = 0;
+
+  // =====================================================
+  // 🎯 STEP 1: Buat sheet baru & SET ACTIVE LANGSUNG
+  // (JANGAN pakai switchSheet — biar tidak trigger save internal)
+  // =====================================================
+  if (target === 'new') {
+    // Cek duplikat nama
+    let finalName = sheetName;
+    let n = 1;
+    while (wbData.sheets.some(s => s.name === finalName)) {
+      n++;
+      finalName = sheetName + ' ' + n;
+    }
+
+    const newSheet = {
+      name: finalName,
+      cells: {},
+      colWidths: {}, rowHeight: 26,
+      rowHeights: {},
+      cf: [], charts: [], merged: [], filters: {},
+      images: [], validations: [],
+      hidden: false, tabColor: null, rowGroups: [],
+      protected: false, protectHash: null,
+      freezeRow: 0, freezeCol: 0,
+      pivots: [], advancedFilters: []
+    };
+
+    wbData.sheets.push(newSheet);
+    targetSheetIdx = wbData.sheets.length - 1;
+    loadedSheetIdxs.add(targetSheetIdx);
+
+    // 🎯 SET ACTIVE LANGSUNG — tanpa switchSheet
+    activeSheetIdx = targetSheetIdx;
+    wbData.activeSheet = targetSheetIdx;
+    dirtyMeta.activeSheet = true;
+
+    startRow = 0;
+  } else {
+    targetSheetIdx = activeSheetIdx;
+    const sh = wbData.sheets[targetSheetIdx];
+    let maxR = -1;
+    for (const addr of Object.keys(sh.cells || {})) {
+      const p = parseAddr(addr);
+      if (p && p.r > maxR) maxR = p.r;
+    }
+    startRow = maxR >= 0 ? maxR + 2 : 0;
+  }
+
+  // =====================================================
+  // 🎯 STEP 2: Tulis data ke sheet target
+  // =====================================================
+  const sh = wbData.sheets[targetSheetIdx];
+  if (!sh.cells) sh.cells = {};
+
+  let totalCells = 0;
+  let currentRow = startRow;
+
+  // Header
+  if (hasHeader) {
+    for (let c = 0; c < headers.length; c++) {
+      const addr = addrOf(currentRow, c);
+      sh.cells[addr] = {
+        v: String(headers[c]),
+        s: { bold: true, bg: '#d1fae5', color: '#065f46', align: 'center' }
+      };
+      markCellDirty(addr);
+      totalCells++;
+    }
+    currentRow++;
+  }
+
+  // Data rows
+  for (const row of rows) {
+    for (let c = 0; c < headers.length; c++) {
+      const addr = addrOf(currentRow, c);
+      const raw = row[c] ?? '';
+      const str = String(raw).trim();
+
+      let cell = null;
+      if (str !== '') {
+        const num = Number(str);
+        const v = !isNaN(num) && str !== '' ? num : str;
+        cell = { v };
+      }
+
+      if (cell) {
+        sh.cells[addr] = cell;
+        markCellDirty(addr);
+        totalCells++;
+      }
+    }
+    currentRow++;
+  }
+
+  console.log(`📊 Imported ${totalCells} cells, activeSheetIdx=${activeSheetIdx}, targetSheetIdx=${targetSheetIdx}`);
+
+  // =====================================================
+  // 🎯 STEP 3: Rebuild HF dengan sheet baru
+  // =====================================================
+  try { await rebuildHFWithLoaded(); } catch (e) { console.warn(e); }
+  await recalcRowsLimit(true);
+
+  // =====================================================
+  // 🎯 STEP 4: Reset state & render
+  // =====================================================
+  saveFilterStateToSheet();
+  if (typeof loadFilterStateFromSheet === 'function') loadFilterStateFromSheet();
+
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
+  renderSheetTabs();
+
+  const gridWrapEl = document.getElementById('grid-wrap');
+  if (gridWrapEl) gridWrapEl.scrollTop = 0;
+
+  forceRefreshGrid();
+
+  activeCell = 'A1';
+  selection = { start: 'A1', end: 'A1' };
+  updateSelectionUI();
+
+  // =====================================================
+  // 🎯 STEP 5: Save — paksa tunggu sampai selesai
+  // =====================================================
+  markMetaDirty('structure');
+
+  // Tunggu save sebelumnya selesai (kalau ada)
+  let tries = 0;
+  while (saving && tries < 50) {
+    await new Promise(r => setTimeout(r, 100));
+    tries++;
+  }
+
+  try {
+    await saveWB();
+    console.log('✅ Save after import completed');
+  } catch (e) {
+    console.error('Save failed:', e);
+    toast('⚠ Coba Ctrl+S manual');
+  }
+
+  // =====================================================
+  // STEP 6: Auto-refresh config
+  // =====================================================
+  if (target === 'new') {
+    try {
+      addAutoRefreshConfig(targetSheetIdx, _iuPreviewData.url, {
+        format: _iuPreviewData.format,
+        hasHeader
+      });
+    } catch (e) { console.warn(e); }
+  }
+
+  closeImportURLModal();
+  toast(`✔ Import ${totalCells.toLocaleString('id-ID')} sel dari URL`);
+}
+
+/* =========================================================
+   AUTO-REFRESH CONFIG (simpel — pakai localStorage)
+   ========================================================= */
+const AUTO_REFRESH_KEY = 'wex-auto-refresh';
+
+function getAutoRefreshConfigs() {
+  try {
+    const raw = localStorage.getItem(AUTO_REFRESH_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+
+function saveAutoRefreshConfigs(configs) {
+  try {
+    localStorage.setItem(AUTO_REFRESH_KEY, JSON.stringify(configs));
+  } catch (e) { console.warn(e); }
+}
+
+function addAutoRefreshConfig(sheetIdx, url, opts) {
+  if (!wbId) return;
+  const configs = getAutoRefreshConfigs();
+  const key = `${wbId}:${sheetIdx}`;
+  configs[key] = {
+    url,
+    format: opts.format,
+    hasHeader: opts.hasHeader,
+    addedAt: Date.now()
+  };
+  saveAutoRefreshConfigs(configs);
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-iu-close')?.addEventListener('click', closeImportURLModal);
+document.getElementById('btn-iu-cancel')?.addEventListener('click', closeImportURLModal);
+document.getElementById('btn-iu-fetch')?.addEventListener('click', fetchURLData);
+document.addEventListener('click', e => {
+  if (e.target.closest('#btn-iu-import')) {
+    e.preventDefault();
+    console.log('🔵 Import button clicked');
+    importURLData();
+  }
+});
+
+document.getElementById('modal-import-url')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-import-url') closeImportURLModal();
+});
+
+// Enter di URL → fetch
+document.getElementById('iu-url')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    fetchURLData();
+  }
+});
+
+console.log('✅ Import from URL initialized');
+document.getElementById('btn-import-url')?.addEventListener('click', openImportURLModal);
 
 /* =========================================================
    INIT — dengan safety net biar UI tetap jalan
@@ -5734,55 +10563,92 @@ document.getElementById('btn-unmerge')?.addEventListener('click', () => {
 document.getElementById('btn-filter-toggle')?.addEventListener('click', () => {
   filterMode = !filterMode;
   const btn = document.getElementById('btn-filter-toggle');
+
   if (btn) {
     btn.style.background = filterMode ? 'linear-gradient(135deg,#10b981,#059669)' : '';
     btn.style.color = filterMode ? '#fff' : '';
   }
-  renderFilterHeaders();
-  toast(filterMode ? 'Mode filter aktif — klik ikon di header kolom' : 'Mode filter nonaktif');
-});
+
+  // 🎯 Snapshot baris selection jadi header filter
+  if (filterMode) {
+    const p = parseAddr(selection.start);
+    filterHeaderRow = p ? p.r : null;
+  } else {
+    filterHeaderRow = null;   // reset saat nonaktif
+  }
+
+  invalidateRowMap();
+  window._lastRenderKey = null;
+  renderVirtual(false);
+
+  if (filterMode) {
+    const hr = getFilterHeaderRow();
+    toast(`🔽 Filter aktif di baris ${hr + 1}. Klik ▼ di cell kolom untuk filter.`);
+  } else {
+    toast('Filter dinonaktifkan');
+  }
+}, true);
 
 document.getElementById('btn-filter-clear')?.addEventListener('click', () => {
   sheet().filters = {};
+  sheet().advancedFilters = [];
   invalidateRowMap();
-  pushUndo();
+  saveFilterToLocal();
+  window._lastRenderKey = null;
+  window._lastFrozenKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
   markMetaDirty('structure');
-  renderSheet();
+  scheduleSave();
+  renderVirtual(false);
   renderFilterHeaders();
-  toast('✔ Filter dibersihkan');
+  toast('✔ Semua filter dibersihkan');
 });
 
+/* =========================================================
+   RENDER FILTER HEADERS — single source of truth
+   ========================================================= */
 function renderFilterHeaders() {
-  const thead = document.querySelector('#grid thead tr');
-  if (!thead) return;
-  // Hapus tombol filter lama
-  thead.querySelectorAll('.fx-filter-btn').forEach(b => b.remove());
-  thead.querySelectorAll('th[data-col]').forEach(th => {
-    th.classList.remove('filtered', 'filter-active');
-  });
+  // const thead = document.querySelector('#grid thead tr');
+  // if (!thead) return;
 
-  if (!filterMode) return;
+  // // 🎯 Hapus SEMUA tombol filter lama (cleanup)
+  // thead.querySelectorAll('.fx-filter-btn').forEach(b => b.remove());
+  // thead.querySelectorAll('th[data-col]').forEach(th => {
+  //   th.classList.remove('filtered', 'filter-active');
+  // });
 
-  const filters = sheet().filters || {};
-  thead.querySelectorAll('th[data-col]').forEach(th => {
-    const c = +th.dataset.col;
-    const btn = document.createElement('button');
-    btn.className = 'fx-filter-btn';
-    btn.innerHTML = '<i class="fa-solid fa-caret-down"></i>';
-    btn.title = 'Filter kolom ini';
-    btn.addEventListener('mousedown', e => {
-      e.stopPropagation();
-      e.preventDefault();
-      openFilterPopup(c, th);
-    });
-    th.appendChild(btn);
-    if (filters[c]?.values?.length) {
-      th.classList.add('filtered', 'filter-active');
-    }
-  });
+  // // Ambil filter state
+  // const filters = sheet().filters || {};
+
+  // // 🎯 Buat tombol filter untuk SETIAP kolom dengan closure benar
+  // thead.querySelectorAll('th[data-col]').forEach(th => {
+  //   const c = +th.dataset.col;   // ← closure benar per kolom
+
+  //   const btn = document.createElement('button');
+  //   btn.className = 'fx-filter-btn';
+  //   btn.innerHTML = '<i class="fa-solid fa-caret-down"></i>';
+  //   btn.title = `Filter kolom ${colName(c)}`;
+
+  //   // 🎯 Handler dengan kolom YANG BENAR
+  //   btn.addEventListener('mousedown', ev => {
+  //     ev.stopPropagation();
+  //     ev.preventDefault();
+  //     console.log(`🔽 Open filter popup for column ${colName(c)} (idx=${c})`);
+  //     openFilterPopup(c, th);
+  //   });
+
+  //   th.appendChild(btn);
+
+  //   // Highlight filter aktif
+  //   if (filters[c]?.values?.length) {
+  //     th.classList.add('filtered', 'filter-active');
+  //   }
+  // });
 }
 
 function openFilterPopup(colIdx, thEl) {
+  console.log(`📋 openFilterPopup: colIdx=${colIdx} (${colName(colIdx)}), th=${thEl.dataset.col}`);
   closeFilterPopup();
   const rect = thEl.getBoundingClientRect();
 
@@ -5879,10 +10745,10 @@ function openFilterPopup(colIdx, thEl) {
   popup.querySelector('#fx-fp-clear').onclick = () => {
     if (sheet().filters) delete sheet().filters[colIdx];
     invalidateRowMap();
-    pushUndo();
-    markMetaDirty('structure');
+    saveFilterToLocal();
     closeFilterPopup();
-    renderSheet();
+    window._lastRenderKey = null;
+    renderVirtual(false);
     renderFilterHeaders();
     toast('✔ Filter kolom dibersihkan');
   };
@@ -5890,15 +10756,15 @@ function openFilterPopup(colIdx, thEl) {
     sheet().filters ||= {};
     const list_ = sortedKeys;
     if (selected.size === list_.length) {
-      delete sheet().filters[colIdx];   // semua nilai = tidak memfilter
+      delete sheet().filters[colIdx];
     } else {
       sheet().filters[colIdx] = { values: [...selected] };
     }
     invalidateRowMap();
-    pushUndo();
-    markMetaDirty('structure');
+    saveFilterToLocal();
     closeFilterPopup();
-    renderSheet();
+    window._lastRenderKey = null;
+    renderVirtual(false);
     renderFilterHeaders();
     toast('✔ Filter diterapkan');
   };
@@ -5907,6 +10773,37 @@ function openFilterPopup(colIdx, thEl) {
   setTimeout(() => {
     document.addEventListener('mousedown', outsideFilterHandler, true);
   }, 0);
+}
+
+/* =========================================================
+   FILTER STATE — localStorage (bukan DB)
+   ========================================================= */
+function saveFilterToLocal() {
+  if (!wbId) return;
+  try {
+    const key = `filter-${wbId}`;
+    const filtersAll = {};
+    wbData.sheets.forEach((sh, idx) => {
+      filtersAll[idx] = sh.filters || {};
+    });
+    localStorage.setItem(key, JSON.stringify(filtersAll));
+  } catch (e) {
+    console.warn('saveFilterToLocal failed:', e);
+  }
+}
+
+function loadFilterFromLocal(sheetId) {
+  try {
+    const raw = localStorage.getItem(`filter-${sheetId}`);
+    if (!raw) return;
+    const filtersAll = JSON.parse(raw);
+    wbData.sheets.forEach((sh, idx) => {
+      sh.filters = filtersAll[idx] || {};
+    });
+    console.log('📁 Filter loaded from localStorage');
+  } catch (e) {
+    console.warn('loadFilterFromLocal failed:', e);
+  }
 }
 
 function outsideFilterHandler(e) {
@@ -5948,6 +10845,7 @@ document.addEventListener('mousedown', e => {
    ========================================================= */
 async function showHome() {
   if (window.Collab) window.Collab.disconnect();
+
   // Simpan workbook aktif kalau ada perubahan
   if (wbId && dirty && hf && !saving) {
     try { await saveWB(); } catch (e) { console.warn('save before home failed:', e); }
@@ -5963,10 +10861,10 @@ async function showHome() {
   document.getElementById('app').classList.add('hidden');
   document.getElementById('home-screen').classList.remove('hidden');
 
-  // Reset state workbook aktif
+  // 🎯 Reset state — JANGAN reset wbName
   wbId = null;
-  wbName = 'Untitled';
-  document.getElementById('wb-name').value = wbName;
+  // wbName tetap seperti terakhir kali, tidak di-reset ke 'Untitled'
+  // karena openWB() nanti akan set wbName dari server
 
   // Render list
   await renderHomeList();
@@ -6418,6 +11316,7 @@ document.querySelectorAll('#file-dropdown .fd-item').forEach(btn => {
       case 'export-pdf': exportFile('pdf'); break;
       case 'logout': document.getElementById('btn-logout')?.click(); break;
       case 'optimize': optimizeWorkbook(); break;
+      case 'set-password': openSetPasswordModal(); break;
     }
   });
 });
@@ -7250,7 +12149,7 @@ function replaceAll() {
 
   const replaceWith = document.getElementById('replace-input').value;
   const count = findState.matches.length;
-  if (!confirm(`Ganti ${count} hasil dengan "${replaceWith}"?`)) return;
+  if (!customConfirm(`Ganti ${count} hasil dengan "${replaceWith}"?`)) return;
 
   pushUndo();
   const regex = buildReplaceRegex(findState.query, findState.options);
@@ -7724,7 +12623,7 @@ document.getElementById('btn-dup-apply')?.addEventListener('click', () => {
 
   if (!toRemove.length) return toast('Tidak ada duplikat');
 
-  if (!confirm(`Hapus ${toRemove.length} baris duplikat?`)) return;
+  if (!customConfirm(`Hapus ${toRemove.length} baris duplikat?`)) return;
 
   pushUndo();
 
@@ -7763,71 +12662,101 @@ document.getElementById('btn-dup-apply')?.addEventListener('click', () => {
    AUTO FILTER DROPDOWN DI HEADER (selalu tampil)
    ========================================================= */
 function enableAutoFilterHeaders() {
-  const thead = document.querySelector('#grid thead tr');
-  if (!thead) return;
+  // const thead = document.querySelector('#grid thead tr');
+  // if (!thead) return;
 
-  // Selalu tampilkan ikon filter di header (bukan hanya mode filter)
-  thead.querySelectorAll('th[data-col]').forEach(th => {
-    if (th.querySelector('.fx-filter-btn')) return;
+  // // Selalu tampilkan ikon filter di header (bukan hanya mode filter)
+  // thead.querySelectorAll('th[data-col]').forEach(th => {
+  //   if (th.querySelector('.fx-filter-btn')) return;
 
-    const c = +th.dataset.col;
-    const btn = document.createElement('button');
-    btn.className = 'fx-filter-btn';
-    btn.innerHTML = '<i class="fa-solid fa-caret-down"></i>';
-    btn.title = 'Filter kolom ini';
-    btn.addEventListener('mousedown', e => {
-      e.stopPropagation();
-      e.preventDefault();
-      openFilterPopup(c, th);
-    });
-    th.appendChild(btn);
-  });
+  //   const c = +th.dataset.col;
+  //   const btn = document.createElement('button');
+  //   btn.className = 'fx-filter-btn';
+  //   btn.innerHTML = '<i class="fa-solid fa-caret-down"></i>';
+  //   btn.title = 'Filter kolom ini';
+  //   btn.addEventListener('mousedown', e => {
+  //     e.stopPropagation();
+  //     e.preventDefault();
+  //     openFilterPopup(c, th);
+  //   });
+  //   th.appendChild(btn);
+  // });
 
-  // Highlight filter aktif
-  const filters = sheet().filters || {};
-  thead.querySelectorAll('th[data-col]').forEach(th => {
-    const c = +th.dataset.col;
-    th.classList.toggle('filtered', !!filters[c]?.values?.length);
-    th.classList.toggle('filter-active', !!filters[c]?.values?.length);
-  });
+  // // Highlight filter aktif
+  // const filters = sheet().filters || {};
+  // thead.querySelectorAll('th[data-col]').forEach(th => {
+  //   const c = +th.dataset.col;
+  //   th.classList.toggle('filtered', !!filters[c]?.values?.length);
+  //   th.classList.toggle('filter-active', !!filters[c]?.values?.length);
+  // });
 }
 
-// Override renderFilterHeaders — panggil auto filter selalu
-const _origRenderFilterHeaders = renderFilterHeaders;
-renderFilterHeaders = function () {
-  // Selalu tampilkan (sekarang filter bukan mode lagi)
-  const thead = document.querySelector('#grid thead tr');
-  if (!thead) return;
-  thead.querySelectorAll('.fx-filter-btn').forEach(b => b.remove());
-  thead.querySelectorAll('th[data-col]').forEach(th => th.classList.remove('filtered', 'filter-active'));
-  enableAutoFilterHeaders();
-};
+// // Override renderFilterHeaders — panggil auto filter selalu
+// const _origRenderFilterHeaders = renderFilterHeaders;
+// renderFilterHeaders = function () {
+//   // Selalu tampilkan (sekarang filter bukan mode lagi)
+//   const thead = document.querySelector('#grid thead tr');
+//   if (!thead) return;
+//   thead.querySelectorAll('.fx-filter-btn').forEach(b => b.remove());
+//   thead.querySelectorAll('th[data-col]').forEach(th => th.classList.remove('filtered', 'filter-active'));
+//   enableAutoFilterHeaders();
+// };
 
 // Panggil saat build grid
 const _origBuildGrid = buildGrid;
 buildGrid = function () {
   _origBuildGrid();
-  enableAutoFilterHeaders();
+  // enableAutoFilterHeaders();
 };
 
 /* Tombol Filter toggle jadi Clear All Filters */
 document.getElementById('btn-filter-toggle')?.addEventListener('click', async () => {
-  // Ganti perilaku: kalau ada filter → clear, kalau tidak → info
-  const filters = sheet().filters || {};
-  const hasFilter = Object.keys(filters).some(k => filters[k]?.values?.length);
-  if (hasFilter) {
-    if (await customConfirm('Bersihkan semua filter di sheet ini?')) {
-      sheet().filters = {};
-      invalidateRowMap();
-      pushUndo();
-      markMetaDirty('structure');
-      renderSheet();
-      toast('✔ Semua filter dibersihkan');
-    }
-  } else {
-    toast('Klik ikon ▼ di header kolom untuk filter');
+  filterMode = !filterMode;
+  const btn = document.getElementById('btn-filter-toggle');
+
+  if (btn) {
+    btn.style.background = filterMode ? 'linear-gradient(135deg,#10b981,#059669)' : '';
+    btn.style.color = filterMode ? '#fff' : '';
   }
-}, true);   // capture phase untuk override
+
+  window._lastRenderKey = null;
+  renderVirtual(false);
+
+  if (filterMode) {
+    const hr = getFilterHeaderRow();
+    toast(`🔽 Filter aktif di baris ${hr + 1}. Klik ▼ di header kolom untuk filter.`);
+  } else {
+    toast('Filter dinonaktifkan');
+  }
+}, true);
+
+// /* =========================================================
+//    Right-click row header → "Set sebagai Filter Header"
+//    ========================================================= */
+// document.getElementById('grid')?.addEventListener('contextmenu', e => {
+//   const rowTh = e.target.closest('tbody th[data-row]');
+//   if (!rowTh) return;   // hanya row header
+
+//   e.preventDefault();
+//   const rowNum = +rowTh.dataset.row;
+
+//   // Konfirmasi
+//   if (customConfirm(`Set baris ${rowNum + 1} sebagai header filter?`)) {
+//     filterHeaderRow = rowNum;
+//     filterMode = true;
+
+//     const btn = document.getElementById('btn-filter-toggle');
+//     if (btn) {
+//       btn.style.background = 'linear-gradient(135deg,#10b981,#059669)';
+//       btn.style.color = '#fff';
+//     }
+
+//     invalidateRowMap();
+//     window._lastRenderKey = null;
+//     renderVirtual(false);
+//     toast(`✅ Baris ${rowNum + 1} jadi header filter`);
+//   }
+// });
 
 /* =========================================================
    SHEET PROTECTION
@@ -7913,6 +12842,9 @@ function applySheetProtection() {
     btnProtect.style.display = isProtected ? 'none' : '';
     btnUnprotect.style.display = isProtected ? '' : 'none';
   }
+
+  // 🎯 Apply lock indicators
+  applyLockIndicators();
 
   renderSheetTabs();
 }
@@ -8017,7 +12949,7 @@ document.getElementById('btn-unfreeze')?.addEventListener('click', unfreezeAll);
    FREEZE RENDERING PATCH — modify renderVirtual
    ========================================================= */
 const _origRenderVirtual = renderVirtual;
-renderVirtual = function () {
+renderVirtual = function (fastMode = false) {
   const gridWrapEl = document.getElementById('grid-wrap');
   const scrollTop = gridWrapEl.scrollTop;
   const viewH = gridWrapEl.clientHeight;
@@ -8028,13 +12960,27 @@ renderVirtual = function () {
   const frozenRowCount = Math.min(sheet().freezeRow || 0, 20);
   const frozenColCount = Math.min(sheet().freezeCol || 0, 5);
 
-    const effectiveScrollTop = Math.max(0, scrollTop);
+  const effectiveScrollTop = Math.max(0, scrollTop);
   const scrollStart = Math.max(0, Math.floor(effectiveScrollTop / ROW_H) - BUFFER);
   const scrollEnd = Math.min(totalRows, Math.ceil((effectiveScrollTop + viewH) / ROW_H) + BUFFER);
 
-  if (scrollStart === visibleStart && scrollEnd === visibleEnd &&
-      frozenRowCount === window._lastFrozenRow &&
-      frozenColCount === window._lastFrozenCol) return;
+  // 🎯 stateKey WAJIB include activeSheetIdx + nama sheet
+  // biar ganti sheet selalu trigger re-render walau posisi scroll sama
+  const sheetName = sheet()?.name || '';
+  const stateKey =
+    activeSheetIdx + '|' + sheetName +
+    '|' + scrollStart + ':' + scrollEnd +
+    '|' + frozenRowCount + ':' + frozenColCount +
+    '|' + (filterMode ? '1' : '0') +
+    '|' + (filterHeaderRow == null ? 'x' : filterHeaderRow);
+
+  if (stateKey === window._lastFrozenKey) {
+    // console.log('⏭ renderVirtual SKIP:', stateKey);
+    return;
+  }
+  // console.log('🎨 renderVirtual RUN:', stateKey);
+  window._lastFrozenKey = stateKey;
+
   visibleStart = scrollStart;
   visibleEnd = scrollEnd;
   window._lastFrozenRow = frozenRowCount;
@@ -8062,7 +13008,7 @@ renderVirtual = function () {
     }
   }
 
-/* ---- 1. Frozen rows (0..frozenRowCount-1) ---- */
+  /* ---- 1. Frozen rows ---- */
   for (let r = 0; r < frozenRowCount; r++) {
     const actualR = rowMap ? rowMap[r] : r;
     if (actualR === undefined) continue;
@@ -8072,7 +13018,6 @@ renderVirtual = function () {
     tr.style.top = (26 + r * ROW_H) + 'px';
     tr.style.zIndex = '8';
 
-    // Sticky per-cell (fallback untuk browser lama)
     tr.querySelectorAll('td, th').forEach(cell => {
       cell.style.position = 'sticky';
       cell.style.top = (26 + r * ROW_H) + 'px';
@@ -8082,7 +13027,7 @@ renderVirtual = function () {
     frag.appendChild(tr);
   }
 
-  /* ---- 2. Top spacer (frozenRowCount..scrollStart) ---- */
+  /* ---- 2. Top spacer ---- */
   if (scrollStart > frozenRowCount) {
     const spacerH = (scrollStart - frozenRowCount) * ROW_H;
     const tr = document.createElement('tr');
@@ -8126,35 +13071,43 @@ renderVirtual = function () {
     }
   });
 
-  // Apply freeze-col styles
   if (frozenColCount > 0) {
     applyFreezeCols(frozenColCount);
   }
 
-  renderVisibleCells();
-  renderCFVisible();
-  applySelectionStyles();
-  renderRowHeaderHighlight();
-  applyValidationIndicators();
-  applyCommentMarkers();
+  if (fastMode) {
+    // 🎯 FAST: cuma render cells + selection
+    renderVisibleCells();
+    applySelectionStyles();
+  } else {
+    // 🎯 FULL: semua fitur
+    renderVisibleCells();
+    renderCFVisible();
+    applySelectionStyles();
+    renderRowHeaderHighlight();
+    applyValidationIndicators();
+    applyCommentMarkers();
+  }
+
+  if (typeof applyHiddenRowsCols === 'function') {
+    applyHiddenRowsCols();
+  }
 };
 
 /* Patch visibleStart untuk renderVisibleCells dll */
-const _origRenderVisibleCells = renderVisibleCells;
-renderVisibleCells = function () {
-  const frozenRowCount = Math.min(sheet().freezeRow || 0, 20);
-  // Render frozen rows dulu
-  for (let r = 0; r < frozenRowCount; r++) {
-    const tr = rowEls[r];
-    if (!tr) continue;
-    tr.querySelectorAll('td[data-addr]').forEach(td => {
-      const p = parseAddr(td.dataset.addr);
-      if (p) updateCellDisplay(td, p.r, p.c);
-    });
-  }
-  // Lalu visible rows
-  _origRenderVisibleCells();
-};
+// const _origRenderVisibleCells = renderVisibleCells;
+// renderVisibleCells = function () {
+//   const frozenRowCount = Math.min(sheet().freezeRow || 0, 20);
+//   for (let r = 0; r < frozenRowCount; r++) {
+//     const tr = rowEls[r];
+//     if (!tr) continue;
+//     tr.querySelectorAll('td[data-addr]').forEach(td => {
+//       const p = parseAddr(td.dataset.addr);
+//       if (p) updateCellDisplay(td, p.r, p.c);
+//     });
+//   }
+//   _origRenderVisibleCells();
+// };
 
 /* Terapkan sticky left untuk freeze cols */
 function applyFreezeCols(frozenColCount) {
@@ -8359,7 +13312,7 @@ document.getElementById('btn-val-apply')?.addEventListener('click', () => {
 });
 
 document.getElementById('btn-validation-clear')?.addEventListener('click', () => {
-  if (!confirm('Hapus semua validasi di sheet ini?')) return;
+  if (!customConfirm('Hapus semua validasi di sheet ini?')) return;
   pushUndo();
   sheet().validations = [];
   markMetaDirty('structure');
@@ -8396,28 +13349,48 @@ function renderExistingValidations() {
   });
 }
 
-function applyValidationIndicators() {
-  document.querySelectorAll('#grid td.validated, #grid td.invalid').forEach(td => {
-    td.classList.remove('validated', 'invalid');
-  });
+function getValidationAddrs() {
+  if (_validationAddrsCache) return _validationAddrsCache;
   const vals = sheet().validations || [];
-  if (!vals.length) return;
+  if (!vals.length) { _validationAddrsCache = []; return []; }
 
-  document.querySelectorAll('#grid td[data-addr]').forEach(td => {
-    const p = parseAddr(td.dataset.addr);
-    if (!p) return;
-    const rule = findValidationForCell(td.dataset.addr);
-    if (!rule) return;
+  const addrs = [];
+  const cells = sheet().cells || {};
+  for (const addr in cells) {
+    const p = parseAddr(addr);
+    if (!p) continue;
+    for (const v of vals) {
+      const r = parseRange(v.range);
+      if (!r) continue;
+      if (p.r >= r.r0 && p.r <= r.r1 && p.c >= r.c0 && p.c <= r.c1) {
+        addrs.push(addr);
+        break;
+      }
+    }
+  }
+  _validationAddrsCache = addrs;
+  console.log('✅ Validation cache built:', addrs.length);
+  return addrs;
+}
+
+function applyValidationIndicators() {
+  document.querySelectorAll('#grid td.validated, #grid td.invalid')
+    .forEach(td => td.classList.remove('validated', 'invalid'));
+
+  const addrs = getValidationAddrs();
+  if (!addrs.length) return;
+
+  for (const addr of addrs) {
+    const td = document.querySelector(`#grid td[data-addr="${addr}"]`);
+    if (!td) continue;
     td.classList.add('validated');
 
-    // Cek nilainya
-    const cl = sheet().cells[td.dataset.addr];
+    const cl = sheet().cells[addr];
     const v = cl?.v;
-    if (v === undefined || v === null || v === '') return;
-    if (!validateValue(v, rule)) {
-      td.classList.add('invalid');
-    }
-  });
+    if (v === undefined || v === null || v === '') continue;
+    const rule = findValidationForCell(addr);
+    if (rule && !validateValue(v, rule)) td.classList.add('invalid');
+  }
 }
 
 /* Cek saat commit — reject kalau tidak valid */
@@ -8575,10 +13548,37 @@ document.getElementById('btn-delete-comment')?.addEventListener('click', () => {
   document.getElementById('btn-comment-delete').click();
 });
 
+/* =========================================================
+   COMMENT MARKERS — versi cache (jangan iterasi 2M cells)
+   ========================================================= */
+let _commentAddrsCache = null;
+let _validationAddrsCache = null;
+
+function invalidateCommentCache() { _commentAddrsCache = null; }
+function invalidateValidationCache() { _validationAddrsCache = null; }
+
+function getCommentAddrs() {
+  if (_commentAddrsCache) return _commentAddrsCache;
+  const addrs = [];
+  const cells = sheet().cells || {};
+  for (const addr in cells) {
+    if (cells[addr]?.comment) addrs.push(addr);
+  }
+  _commentAddrsCache = addrs;
+  console.log('💬 Comment cache built:', addrs.length);
+  return addrs;
+}
+
 function applyCommentMarkers() {
-  document.querySelectorAll('#grid td.has-comment').forEach(td => td.classList.remove('has-comment'));
-  for (const [addr, cell] of Object.entries(sheet().cells || {})) {
-    if (!cell.comment) continue;
+  // Clear dulu
+  document.querySelectorAll('#grid td.has-comment')
+    .forEach(td => td.classList.remove('has-comment'));
+
+  const addrs = getCommentAddrs();
+  if (!addrs.length) return;
+
+  // Hanya apply ke td yang ada di DOM (bukan iterasi semua cells)
+  for (const addr of addrs) {
     const td = document.querySelector(`#grid td[data-addr="${addr}"]`);
     if (td) td.classList.add('has-comment');
   }
@@ -8715,6 +13715,11 @@ ctxMenu?.querySelectorAll('button').forEach(btn => {
       case 'clear': document.getElementById('btn-clear-all')?.click(); break;
       case 'insert-row': document.getElementById('btn-insert-row')?.click(); break;
       case 'delete-row': document.getElementById('btn-del-row')?.click(); break;
+      case 'paste-value':   doPasteSpecial('value'); break;
+      case 'paste-formula': doPasteSpecial('formula'); break;
+      case 'paste-format':  doPasteSpecial('format'); break;
+      case 'lock-cell': lockSelection(); break;
+      case 'unlock-cell': unlockSelection(); break;
     }
   });
 });
@@ -8797,15 +13802,20 @@ function showCrossSheetBanner() {
   if (!crossSheetRef) return;
   const banner = document.getElementById('cross-sheet-banner');
   const target = document.getElementById('cs-target');
-  const formula = document.getElementById('cs-formula');
-  if (!banner) return;
+  const input = document.getElementById('cs-formula-input');
+  if (!banner || !input) return;
 
   const originalSheet = wbData.sheets[crossSheetRef.originalSheetIdx];
   target.textContent = `Menyunting rumus untuk ${originalSheet.name}!${crossSheetRef.addr}`;
-  formula.textContent = crossSheetRef.formula;
+  input.value = crossSheetRef.formula;
   banner.classList.remove('hidden');
 
-  // Highlight cell target di sheet asli (tidak terlihat, tapi state)
+  // 🎯 Auto-focus & cursor di akhir
+  setTimeout(() => {
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }, 50);
+
   console.log('🎯 Cross-sheet mode:', crossSheetRef);
 }
 
@@ -8830,32 +13840,26 @@ function hideCrossSheetBanner() {
 function insertCrossSheetRef2(fullRef) {
   if (!crossSheetRef) return;
 
-  // 🎯 Auto-quote nama sheet kalau ada spasi / karakter spesial
-  // fullRef format: "SheetName!A1" atau "SheetName!A1:B5"
-  const m = /^(.+?)!(.+)$/.exec(fullRef);
-  if (m) {
-    const [, sheetName, refPart] = m;
+  const input = document.getElementById('cs-formula-input');
+  if (!input) return;
 
-    // Cek apakah perlu quote: ada spasi, tanda hubung, titik, atau mulai dengan angka
-    const needsQuote = /[\s\-\.\(\)]/.test(sheetName) || /^[0-9]/.test(sheetName);
+  // 🎯 Insert di cursor position, bukan append ke akhir
+  const val = input.value;
+  const pos = input.selectionStart ?? val.length;
+  const newVal = val.slice(0, pos) + fullRef + val.slice(pos);
 
-    let safeSheetName = sheetName;
-    if (needsQuote && !sheetName.startsWith("'")) {
-      // Escape single quote dalam nama sheet ('' = escaped)
-      safeSheetName = "'" + sheetName.replace(/'/g, "''") + "'";
-    }
+  input.value = newVal;
 
-    fullRef = safeSheetName + '!' + refPart;
-  }
+  // Cursor pindah setelah ref
+  const newPos = pos + fullRef.length;
+  input.focus();
+  input.setSelectionRange(newPos, newPos);
 
-  crossSheetRef.formula += fullRef;
-
-  const formula = document.getElementById('cs-formula');
-  if (formula) formula.textContent = crossSheetRef.formula;
+  // Sync ke crossSheetRef
+  crossSheetRef.formula = newVal;
 
   console.log('✍ Cross-sheet ref ditambahkan:', fullRef);
-  console.log('   Formula sekarang:', crossSheetRef.formula);
-
+  console.log('   Formula sekarang:', newVal);
   if (typeof toast === 'function') toast('✔ ' + fullRef);
 }
 
@@ -8870,36 +13874,63 @@ function insertCrossSheetRange(sheetName, startAddr, endAddr) {
 
 async function finishCrossSheetEdit() {
   if (!crossSheetRef) return;
-  const { originalSheetIdx, addr, formula } = crossSheetRef;
 
-  // Simpan dulu reference
-  const refBackup = crossSheetRef;
+  const input = document.getElementById('cs-formula-input');
+  const finalFormula = input?.value || crossSheetRef.formula;
 
-  // Switch ke sheet asli
+  const { originalSheetIdx, addr } = crossSheetRef;
+  const refBackup = { ...crossSheetRef, formula: finalFormula };
+
   crossSheetRef = null;
   hideCrossSheetBanner();
 
-  // Cek formula lengkap
-  if (!isFormulaComplete(formula)) {
+  if (!isFormulaComplete(finalFormula)) {
     toast('⚠ Formula belum lengkap');
     crossSheetRef = refBackup;
     showCrossSheetBanner();
     return;
   }
 
-  // Switch ke sheet asli
+  // Reset cache SEBELUM switch
+  window._lastFrozenKey = null;
+  window._lastFrozenRow = null;
+  window._lastFrozenCol = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  rowEls = {};
+
   await switchSheet(originalSheetIdx);
 
-  // Commit formula di cell target
   const p = parseAddr(addr);
   if (p) {
     ensureCell(addr);
-    sheet().cells[addr].f = formula;
+    sheet().cells[addr].f = finalFormula;
     delete sheet().cells[addr].v;
-    setHFCellSafe(p.r, p.c, formula);
+
+    try { await rebuildHFWithLoaded(); } catch (e) { console.warn(e); }
+
+    setHFCellSafe(p.r, p.c, finalFormula);
     markCellDirty(addr);
-    renderVisibleCells();
-    renderCFVisible();
+
+    clearHFCache();
+    window._lastFrozenKey = null;
+    window._lastFrozenRow = null;
+    window._lastFrozenCol = null;
+    window._lastRenderKey = null;
+    visibleStart = -1;
+    visibleEnd = -1;
+    rowEls = {};
+
+    renderSheet();
+
+    setTimeout(() => {
+      clearHFCache();
+      window._lastFrozenKey = null;
+      window._lastRenderKey = null;
+      renderSheet();
+    }, 150);
+
     toast('✔ Formula disimpan');
   }
 }
@@ -8909,7 +13940,10 @@ function cancelCrossSheetEdit() {
   const originalIdx = crossSheetRef.originalSheetIdx;
   crossSheetRef = null;
   hideCrossSheetBanner();
-  // Kembali ke sheet asli tanpa commit
+
+  const input = document.getElementById('cs-formula-input');
+  if (input) input.value = '';
+
   switchSheet(originalIdx);
   toast('Dibatalkan');
 }
@@ -9004,3 +14038,1680 @@ async function optimizeWorkbook() {
     toast('⚠ ' + e.message);
   }
 }
+
+/* =========================================================
+   DRAG SELECT — blok cell dengan drag mouse
+   ========================================================= */
+let isDragging = false;
+let dragStartAddr = null;
+
+document.getElementById('grid').addEventListener('mousedown', e => {
+  // Skip kalau sedang edit, klik header, grip resize, atau ref-mode
+  if (editor || insertingRefMode || crossSheetRef) return;
+  if (e.target.closest('th')) return;
+  if (e.target.closest('.col-resize-grip') || e.target.closest('.row-resize-grip')) return;
+
+  const td = e.target.closest('td[data-addr]');
+  if (!td) return;
+
+  if (e.button !== 0) return;  // hanya left click
+
+  isDragging = true;
+  dragStartAddr = td.dataset.addr;
+
+  if (!e.shiftKey) {
+    selection = { start: dragStartAddr, end: dragStartAddr };
+    activeCell = dragStartAddr;
+    updateSelectionUI();
+  }
+});
+
+document.addEventListener('mousemove', e => {
+  if (!isDragging || !dragStartAddr) return;
+
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const td = el?.closest('td[data-addr]');
+  if (!td) return;
+
+  const currentAddr = td.dataset.addr;
+  if (currentAddr === selection.end) return;
+
+  selection.end = currentAddr;
+  activeCell = selection.start;
+  updateSelectionUI();
+  updateStatusStats();
+});
+
+document.addEventListener('mouseup', () => {
+  isDragging = false;
+  dragStartAddr = null;
+});
+
+/* =========================================================
+   HEADER SELECT — klik header row/col untuk select semua
+   ========================================================= */
+document.getElementById('grid').addEventListener('mousedown', e => {
+  // Skip kalau sedang edit atau ref-mode
+  if (editor || crossSheetRef) return;
+
+  const target = e.target;
+
+  // Header kolom
+  if (target.matches('#grid thead th[data-col]')) {
+    e.preventDefault();
+    const c = +target.dataset.col;
+    const lastRow = Math.max(1, ROWS);
+    selection = { start: addrOf(0, c), end: addrOf(ROWS - 1, c) };
+    activeCell = addrOf(0, c);
+    updateSelectionUI();
+    updateStatusStats();
+    // Highlight header
+    document.querySelectorAll('#grid thead th').forEach(th => th.classList.remove('active'));
+    target.classList.add('active');
+    return;
+  }
+
+  // Header baris
+  if (target.matches('#grid tbody th[data-row]')) {
+    e.preventDefault();
+    const r = +target.dataset.row;
+    selection = { start: addrOf(r, 0), end: addrOf(r, COLS - 1) };
+    activeCell = addrOf(r, 0);
+    updateSelectionUI();
+    updateStatusStats();
+    document.querySelectorAll('#grid tbody th').forEach(th => th.classList.remove('active'));
+    target.classList.add('active');
+    return;
+  }
+
+  // Klik di sudut (pojok kiri atas) → select all
+  if (target.matches('#grid thead th:first-child')) {
+    e.preventDefault();
+    selection = { start: 'A1', end: addrOf(ROWS - 1, COLS - 1) };
+    activeCell = 'A1';
+    updateSelectionUI();
+    updateStatusStats();
+    return;
+  }
+}, true);   // capture phase
+/* =========================================================
+   FILTER HEADER ROW — baris yang jadi header filter
+   Auto-detect: baris dengan data terbanyak (dalam 10 baris pertama)
+   ========================================================= */
+function getFilterHeaderRow() {
+  // 🎯 Kalau sudah di-set (dari toggle / right-click), pakai itu — JANGAN baca selection lagi
+  if (filterHeaderRow !== null && filterHeaderRow >= 0) return filterHeaderRow;
+
+  // Fallback: auto-detect baris dengan data terbanyak
+  const cells = sheet().cells || {};
+  let bestRow = 0, bestCount = 0;
+  for (let r = 0; r < 10; r++) {
+    let count = 0;
+    for (let c = 0; c < COLS; c++) {
+      const cell = cells[addrOf(r, c)];
+      if (cell && cell.v !== undefined && cell.v !== null && cell.v !== '') count++;
+    }
+    if (count > bestCount) { bestCount = count; bestRow = r; }
+  }
+  return bestRow;
+}
+/* =========================================================
+   OPEN FILTER POPUP — anchor di cell header
+   ========================================================= */
+function openFilterPopupAtCell(colIdx, anchorEl) {
+  closeFilterPopup();
+  if (!anchorEl) return;
+
+  const rect = anchorEl.getBoundingClientRect();
+  const headerRow = getFilterHeaderRow();
+
+  // Kumpulkan nilai UNIQUE dari kolom (skip header row)
+  const values = new Map();
+  for (const a of Object.keys(sheet().cells || {})) {
+    const p = parseAddr(a);
+    if (!p || p.c !== colIdx) continue;
+    if (p.r === headerRow) continue;
+
+    const cl = sheet().cells[a];
+    if (!cl) continue;
+
+    // 🎯 Baca nilai HF kalau formula
+    let v;
+    if (cl.f) {
+      try { v = hfGet(p.r, p.c); } catch { v = ''; }
+    } else {
+      v = cl.v;
+    }
+    if (v === undefined || v === null || v === '') continue;
+
+    const key = String(v);
+    values.set(key, (values.get(key) || 0) + 1);
+  }
+
+  const sortedKeys = [...values.keys()].sort((a, b) => {
+    const na = Number(a), nb = Number(b);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return a.localeCompare(b);
+  });
+
+  const active = sheet().filters?.[colIdx]?.values;
+  const activeSet = active ? new Set(active) : null;
+  const selected = new Set(activeSet ? [...activeSet] : sortedKeys);
+
+  // Buat popup
+  const popup = document.createElement('div');
+  popup.className = 'fx-filter-popup';
+
+  const PW = 320, PH = 420;
+  let left = rect.left;
+  let top = rect.bottom + 4;
+
+  if (left + PW > window.innerWidth - 10) left = window.innerWidth - PW - 10;
+  if (left < 10) left = 10;
+  if (top + PH > window.innerHeight - 10) {
+    const above = rect.top - PH - 4;
+    top = above >= 10 ? above : Math.max(10, window.innerHeight - PH - 10);
+  }
+
+  popup.style.left = left + 'px';
+  popup.style.top = top + 'px';
+
+  const headerName = sheet().cells[addrOf(headerRow, colIdx)]?.v || '';
+  const title = headerName
+    ? `${colName(colIdx)} — ${String(headerName).slice(0, 30)}`
+    : `Filter Kolom ${colName(colIdx)}`;
+
+  popup.innerHTML = `
+    <div class="fx-fp-header">
+      <i class="fa-solid fa-filter"></i> ${escapeHtml(title)}
+      <span class="fx-fp-count">${sortedKeys.length} nilai</span>
+    </div>
+    <div class="fx-fp-search"><input type="text" placeholder="Cari nilai…" id="fx-fp-search"></div>
+    <div class="fx-fp-list" id="fx-fp-list"></div>
+    <div class="fx-fp-actions">
+      <button id="fx-fp-all">Semua</button>
+      <button id="fx-fp-none">Kosongkan</button>
+      <button id="fx-fp-clear">Clear</button>
+      <button class="primary" id="fx-fp-apply">Terapkan</button>
+    </div>
+  `;
+  document.body.appendChild(popup);
+  filterPopupEl = popup;
+
+  const list = popup.querySelector('#fx-fp-list');
+  const renderList = (query = '') => {
+    const q = query.toLowerCase();
+    const filtered = sortedKeys.filter(k => !q || k.toLowerCase().includes(q));
+    if (!filtered.length) {
+      list.innerHTML = '<div class="fx-fp-item empty">Tidak ada nilai</div>';
+      return;
+    }
+    list.innerHTML = filtered.map(k => {
+      const checked = selected.has(k);
+      const esc = escapeHtml(k);
+      return `<label class="fx-fp-item">
+        <input type="checkbox" data-v="${esc}" ${checked ? 'checked' : ''}>
+        <span>${esc}</span>
+        <small style="color:#94a3b8">${values.get(k)}</small>
+      </label>`;
+    }).join('');
+
+    list.querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.addEventListener('change', () => {
+        const v = cb.dataset.v;
+        if (cb.checked) selected.add(v);
+        else selected.delete(v);
+      });
+    });
+  };
+  renderList();
+
+  popup.querySelector('#fx-fp-search').addEventListener('input', e => renderList(e.target.value));
+
+  popup.querySelector('#fx-fp-all').onclick = () => {
+    sortedKeys.forEach(k => selected.add(k));
+    renderList(popup.querySelector('#fx-fp-search').value);
+  };
+
+  popup.querySelector('#fx-fp-none').onclick = () => {
+    selected.clear();
+    renderList(popup.querySelector('#fx-fp-search').value);
+  };
+
+  popup.querySelector('#fx-fp-clear').onclick = () => {
+    if (sheet().filters) delete sheet().filters[colIdx];
+    invalidateRowMap();
+    saveFilterToLocal();
+    closeFilterPopup();
+    window._lastRenderKey = null;
+    renderVirtual(false);
+    toast(`✔ Filter ${colName(colIdx)} dibersihkan`);
+  };
+
+  popup.querySelector('#fx-fp-apply').onclick = () => {
+    sheet().filters ||= {};
+    if (selected.size === sortedKeys.length) {
+      delete sheet().filters[colIdx];
+    } else {
+      sheet().filters[colIdx] = { values: [...selected] };
+    }
+    invalidateRowMap();
+    saveFilterToLocal();
+    closeFilterPopup();
+    window._lastRenderKey = null;
+    renderVirtual(false);
+    toast(`✔ Filter ${colName(colIdx)} diterapkan`);
+  };
+
+  setTimeout(() => {
+    document.addEventListener('mousedown', outsideFilterHandler, true);
+  }, 0);
+}
+/* =========================================================
+   FIX FILTER TOGGLE — single source of truth
+   ========================================================= */
+(function initFilterToggleFix() {
+  const oldBtn = document.getElementById('btn-filter-toggle');
+  if (!oldBtn) {
+    console.warn('btn-filter-toggle tidak ditemukan');
+    return;
+  }
+
+  // 🔑 Clone tombol → semua addEventListener lama otomatis hilang
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    filterMode = !filterMode;
+
+    // Style visual
+    btn.style.background = filterMode
+      ? 'linear-gradient(135deg,#10b981,#059669)' : '';
+    btn.style.color = filterMode ? '#fff' : '';
+
+    // 🎯 Kalau aktif: baris header = baris cell yang sedang dipilih
+    if (filterMode) {
+      const p = parseAddr(selection.start);
+      filterHeaderRow = p ? p.r : 0;
+      console.log('🟢 Filter ON, header row =', filterHeaderRow);
+    } else {
+      filterHeaderRow = null;
+      console.log('🔴 Filter OFF');
+    }
+
+    // Reset cache & re-render
+    invalidateRowMap();
+    window._lastRenderKey = null;
+    renderVirtual(false);
+
+    // Debug: cek tombol ▼ benar-benar ke-render
+    setTimeout(() => {
+      const btns = document.querySelectorAll('.fx-filter-btn-inline');
+      console.log('🔽 Jumlah tombol ▼ yang ke-render:', btns.length);
+      if (filterMode && btns.length === 0) {
+        toast('⚠ Filter aktif tapi 0 tombol render — cek console');
+      }
+    }, 100);
+
+    toast(filterMode
+      ? `🔽 Filter aktif di baris ${filterHeaderRow + 1}`
+      : 'Filter dinonaktifkan');
+  });
+
+  console.log('✅ Filter toggle di-rebind (single listener)');
+})();
+
+(function rebindFilterToggle() {
+  const oldBtn = document.getElementById('btn-filter-toggle');
+  if (!oldBtn) return;
+
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+
+  btn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+
+    filterMode = !filterMode;
+
+    btn.style.background = filterMode
+      ? 'linear-gradient(135deg,#10b981,#059669)' : '';
+    btn.style.color = filterMode ? '#fff' : '';
+
+    if (filterMode) {
+      const p = parseAddr(selection.start);
+      filterHeaderRow = p ? p.r : 0;
+    } else {
+      filterHeaderRow = null;
+    }
+
+    saveFilterStateToSheet()
+    invalidateRowMap();
+    window._lastRenderKey = null;   // untuk renderVirtual versi lama (jaga-jaga)
+    renderVirtual(false);
+
+    setTimeout(() => {
+      const n = document.querySelectorAll('.fx-filter-btn-inline').length;
+      console.log(`🔽 Filter ${filterMode ? 'ON' : 'OFF'} | row=${filterHeaderRow} | tombol=${n}`);
+    }, 100);
+
+    toast(filterMode
+      ? `🔽 Filter aktif — baris ${filterHeaderRow + 1}`
+      : 'Filter dinonaktifkan');
+  }, true);
+
+  console.log('✅ Filter toggle di-rebind');
+})();
+/* =========================================================
+   CROSS-SHEET INPUT BINDINGS
+   ========================================================= */
+(function initCrossSheetInput() {
+  const input = document.getElementById('cs-formula-input');
+  if (!input) return;
+
+  // 🎯 Cegah keydown bubble ke document (biar gak buka editor di A1)
+  input.addEventListener('keydown', e => {
+    e.stopPropagation();
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      finishCrossSheetEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelCrossSheetEdit();
+    }
+  }, true);   // capture phase
+
+  // Sync ke crossSheetRef saat user ketik
+  input.addEventListener('input', () => {
+    if (crossSheetRef) {
+      crossSheetRef.formula = input.value;
+    }
+  });
+
+  // 🎯 Cegah mousedown di input "bocor" ke grid (yang bikin cell A1 ter-edit)
+  input.addEventListener('mousedown', e => {
+    e.stopPropagation();
+  }, true);
+
+  console.log('✅ Cross-sheet input bindings installed');
+})();
+
+/* =========================================================
+   F4 — CYCLE ABSOLUTE REFERENCE ($)
+   ========================================================= */
+function cycleAbsoluteRef(input) {
+  const val = input.value;
+  const pos = input.selectionStart ?? val.length;
+
+  // Cari ref di sekitar cursor: A1, $A$1, A$1, $A1
+  // Range bisa 1-3 huruf kolom, angka row
+  const before = val.slice(0, pos);
+  const after = val.slice(pos);
+
+  // Cari ref yang berakhir tepat di cursor
+  const m = /(\$?)([A-Z]{1,3})(\$?)(\d+)$/.exec(before);
+  if (!m) return false;
+
+  const [full, colDollar, col, rowDollar, row] = m;
+  const startPos = pos - full.length;
+
+  // Cycle: A1 → $A$1 → A$1 → $A1 → A1
+  let newRef;
+  if (!colDollar && !rowDollar)      newRef = `$${col}$${row}`;
+  else if (colDollar && rowDollar)   newRef = `${col}$${row}`;
+  else if (!colDollar && rowDollar)  newRef = `$${col}${row}`;
+  else                                newRef = `${col}${row}`;
+
+  input.value = val.slice(0, startPos) + newRef + after;
+  const newPos = startPos + newRef.length;
+  input.setSelectionRange(newPos, newPos);
+  return true;
+}
+
+// Bind F4 ke editor & formula bar
+document.addEventListener('keydown', e => {
+  if (e.key !== 'F4') return;
+
+  const fi = document.getElementById('formula-input');
+  const target = document.activeElement;
+
+  if (editor && editor.input === target) {
+    e.preventDefault();
+    cycleAbsoluteRef(editor.input);
+  } else if (fi && fi === target) {
+    e.preventDefault();
+    cycleAbsoluteRef(fi);
+  }
+}, true);
+/* =========================================================
+   ADJUST FORMULA REFS SAAT FILL/COPY
+   ========================================================= */
+function adjustFormula(formula, dRow, dCol) {
+  if (!formula || (dRow === 0 && dCol === 0)) return formula;
+
+  // Match: prefix(non-alnum) + optional$ + col(1-3) + optional$ + row(digits)
+  // Not followed by letter/digit (avoid LOG10 false positive)
+  return formula.replace(
+    /(^|[^A-Za-z0-9_])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_])/g,
+    (match, prefix, colDollar, col, rowDollar, row) => {
+      let newCol = col;
+      let newRow = parseInt(row, 10);
+
+      if (colDollar !== '$' && dCol !== 0) {
+        let c = 0;
+        for (const ch of col) c = c * 26 + (ch.charCodeAt(0) - 64);
+        c = c - 1 + dCol;
+        if (c < 0) c = 0;
+        newCol = colName(c);
+      }
+      if (rowDollar !== '$' && dRow !== 0) {
+        newRow = newRow + dRow;
+        if (newRow < 1) newRow = 1;
+      }
+      return prefix + colDollar + newCol + rowDollar + newRow;
+    }
+  );
+}
+/* =========================================================
+   FILL HANDLE — drag untuk copy formula seperti Excel
+   ========================================================= */
+let fillHandleEl = null;
+let fillDrag = null;
+
+function ensureFillHandle() {
+  if (fillHandleEl) return fillHandleEl;
+  fillHandleEl = document.createElement('div');
+  fillHandleEl.id = 'fill-handle';
+  fillHandleEl.className = 'fill-handle';
+  fillHandleEl.addEventListener('mousedown', startFillDrag, true);
+  document.body.appendChild(fillHandleEl);
+  return fillHandleEl;
+}
+
+function showFillHandle() {
+  const h = ensureFillHandle();
+
+  if (editor || currentAccessMode === 'view') {
+    h.style.display = 'none';
+    return;
+  }
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) { h.style.display = 'none'; return; }
+
+  const r1 = Math.max(p1.r, p2.r);
+  const c1 = Math.max(p1.c, p2.c);
+  const td = document.querySelector(`#grid td[data-addr="${addrOf(r1, c1)}"]`);
+
+  if (!td) { h.style.display = 'none'; return; }
+
+  const rect = td.getBoundingClientRect();
+  const gridRect = document.getElementById('grid-wrap').getBoundingClientRect();
+
+  // Sembunyikan kalau td di luar viewport grid
+  if (rect.bottom < gridRect.top || rect.top > gridRect.bottom ||
+      rect.right < gridRect.left || rect.left > gridRect.right) {
+    h.style.display = 'none';
+    return;
+  }
+
+  h.style.display = 'block';
+  h.style.left = (rect.right - 5) + 'px';
+  h.style.top  = (rect.bottom - 5) + 'px';
+}
+
+function hideFillHandle() {
+  if (fillHandleEl) fillHandleEl.style.display = 'none';
+}
+
+function startFillDrag(e) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  const p1 = parseAddr(selection.start);
+  const p2 = parseAddr(selection.end);
+  if (!p1 || !p2) return;
+
+  fillDrag = {
+    r0: Math.min(p1.r, p2.r), r1: Math.max(p1.r, p2.r),
+    c0: Math.min(p1.c, p2.c), c1: Math.max(p1.c, p2.c),
+    targetR: Math.max(p1.r, p2.r),
+    targetC: Math.max(p1.c, p2.c)
+  };
+
+  const onMove = ev => {
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    const td = el?.closest('td[data-addr]');
+    if (!td) return;
+    const p = parseAddr(td.dataset.addr);
+    if (!p) return;
+    fillDrag.targetR = p.r;
+    fillDrag.targetC = p.c;
+    highlightFillRange(fillDrag);
+  };
+
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    clearFillHighlight();
+    if (fillDrag) {
+      const copy = fillDrag;
+      fillDrag = null;
+      applyFill(copy);
+    }
+  };
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function highlightFillRange(f) {
+  document.querySelectorAll('#grid td.fill-preview').forEach(td => td.classList.remove('fill-preview'));
+  const tr = Math.max(f.targetR, f.r1);
+  const tc = Math.max(f.targetC, f.c1);
+  for (let r = f.r0; r <= tr; r++) {
+    for (let c = f.c0; c <= tc; c++) {
+      const td = document.querySelector(`#grid td[data-addr="${addrOf(r, c)}"]`);
+      if (td) td.classList.add('fill-preview');
+    }
+  }
+}
+
+function clearFillHighlight() {
+  document.querySelectorAll('#grid td.fill-preview').forEach(td => td.classList.remove('fill-preview'));
+}
+
+function applyFill(f) {
+  const tR = f.targetR;
+  const tC = f.targetC;
+
+  // Cek apakah ada perubahan
+  if (tR >= f.r0 && tR <= f.r1 && tC >= f.c0 && tC <= f.c1) return;
+
+  pushUndo();
+
+  const srcH = f.r1 - f.r0 + 1;
+  const srcW = f.c1 - f.c0 + 1;
+
+  // Range akhir = union dari source + target
+  const endR0 = Math.min(tR, f.r0);
+  const endR1 = Math.max(tR, f.r1);
+  const endC0 = Math.min(tC, f.c0);
+  const endC1 = Math.max(tC, f.c1);
+
+  for (let r = endR0; r <= endR1; r++) {
+    for (let c = endC0; c <= endC1; c++) {
+      // Skip cell source
+      if (r >= f.r0 && r <= f.r1 && c >= f.c0 && c <= f.c1) continue;
+
+      // 🎯 Modulo positif — handle arah negatif
+      const offR = ((r - f.r0) % srcH + srcH) % srcH;
+      const offC = ((c - f.c0) % srcW + srcW) % srcW;
+      const srcR = f.r0 + offR;
+      const srcC = f.c0 + offC;
+
+      const srcAddr = addrOf(srcR, srcC);
+      const srcCell = sheet().cells[srcAddr];
+      const dstAddr = addrOf(r, c);
+      const dRow = r - srcR;
+      const dCol = c - srcC;
+      const tp = parseAddr(dstAddr);
+
+      if (!srcCell) {
+        delete sheet().cells[dstAddr];
+        if (tp) hfSet(tp.r, tp.c, null);
+        markCellDirty(dstAddr);
+        continue;
+      }
+
+      const newCell = JSON.parse(JSON.stringify(srcCell));
+
+      if (newCell.f) {
+        newCell.f = adjustFormula(newCell.f, dRow, dCol);
+        delete newCell.v;
+        if (tp) setHFCellSafe(tp.r, tp.c, newCell.f);
+      } else if (newCell.v !== undefined) {
+        if (tp) setHFCellSafe(tp.r, tp.c, newCell.v);
+      }
+
+      sheet().cells[dstAddr] = newCell;
+      markCellDirty(dstAddr);
+    }
+  }
+
+  selection = { start: addrOf(endR0, endC0), end: addrOf(endR1, endC1) };
+  activeCell = addrOf(f.r0, f.c0);
+
+  clearHFCache();
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  renderVirtual(false);
+  updateSelectionUI();
+
+  toast('📋 Fill selesai');
+}
+function doPasteSpecial(mode) {
+  if (!clipboard?.length) return toast('Clipboard kosong');
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  const p = parseAddr(activeCell);
+  if (!p) return;
+  const origin = parseAddr(clipboard[0].addr);
+  if (!origin) return;
+
+  pushUndo();
+
+  for (const { addr, cell } of clipboard) {
+    const sp = parseAddr(addr);
+    const target = addrOf(p.r + (sp.r - origin.r), p.c + (sp.c - origin.c));
+    const tp = parseAddr(target);
+    if (!tp) continue;
+
+    if (mode === 'value') {
+      // 🎯 Paste nilai HF-evaluated (rumus → value)
+      let v = null;
+      if (cell) {
+        if (cell.f) {
+          try { v = hfGet(sp.r, sp.c); } catch { v = null; }
+        } else {
+          v = cell.v;
+        }
+      }
+      if (v === null || v === undefined || v === '') {
+        delete sheet().cells[target];
+      } else {
+        sheet().cells[target] = { v };
+      }
+      hfSet(tp.r, tp.c, v ?? null);
+    } else if (mode === 'formula') {
+      if (!cell) { delete sheet().cells[target]; hfSet(tp.r, tp.c, null); continue; }
+      const dst = sheet().cells[target] || {};
+      if (cell.f) {
+        dst.f = cell.f;
+        delete dst.v;
+        hfSet(tp.r, tp.c, cell.f);
+      } else {
+        dst.v = cell.v;
+        delete dst.f;
+        hfSet(tp.r, tp.c, cell.v);
+      }
+      sheet().cells[target] = dst;
+    } else if (mode === 'format') {
+      if (cell?.s) {
+        const dst = sheet().cells[target] || {};
+        dst.s = JSON.parse(JSON.stringify(cell.s));
+        sheet().cells[target] = dst;
+      }
+    }
+    markCellDirty(target);
+  }
+
+  clearHFCache();
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  renderVirtual(false);
+  toast('📥 Paste ' + mode);
+}
+const wbNameInput = document.getElementById('wb-name');
+if (wbNameInput) {
+  wbNameInput.addEventListener('input', e => {
+    wbName = e.target.value;
+    markMetaDirty('name');
+  });
+
+  wbNameInput.addEventListener('blur', () => {
+    if (wbName && dirtyMeta.name) scheduleSave();
+  });
+}
+/* =========================================================
+   WB NAME INPUT BINDINGS
+   ========================================================= */
+(function bindWbNameInput() {
+  const el = document.getElementById('wb-name');
+  if (!el) return;
+
+  // Real-time update
+  el.addEventListener('input', e => {
+    wbName = e.target.value;
+    markMetaDirty('name');
+  });
+
+  // Blur → save
+  el.addEventListener('blur', e => {
+    wbName = e.target.value;
+    markMetaDirty('name');
+    scheduleSave();
+    console.log('💾 wbName saved:', wbName);
+  });
+
+  // Enter → blur
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.target.blur();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.target.value = wbName;   // restore
+      e.target.blur();
+    }
+  });
+
+  console.log('✅ wb-name bindings installed');
+})();
+
+/* =========================================================
+   ANALYZE — Excel-like Dashboard + Pivot + Charts
+   ========================================================= */
+(function initAnalyze() {
+  const btn = document.getElementById('btn-analyze');
+  const modal = document.getElementById('modal-analyze');
+  if (!btn || !modal) return;
+
+  const nameInput = document.getElementById('an-sheet-name');
+
+  btn.addEventListener('click', () => {
+    nameInput.value = 'Dashboard';
+    modal.classList.remove('hidden');
+  });
+
+  document.getElementById('btn-an-cancel').addEventListener('click', () => {
+    modal.classList.add('hidden');
+  });
+
+  document.getElementById('btn-an-run').addEventListener('click', async () => {
+    if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+    const dashName = nameInput.value.trim() || 'Dashboard';
+    modal.classList.add('hidden');
+    await analyzeWorkbook(dashName);
+  });
+})();
+
+/* =========================================================
+   MAIN: analyzeWorkbook
+   ========================================================= */
+async function analyzeWorkbook(dashName = 'Dashboard') {
+  if (!wbData?.sheets?.length) return toast('Workbook kosong');
+
+  showLoading('Menganalisa…');
+  await yieldToUI();
+
+  try {
+    // 1. Load semua sheet
+    updateLoading('Memuat semua sheet…');
+    await yieldToUI();
+    for (let k = 0; k < wbData.sheets.length; k++) {
+      if (!loadedSheetIdxs.has(k)) {
+        updateLoading(`Memuat "${wbData.sheets[k].name}"…`);
+        await lazyLoadSheet(k);
+      }
+    }
+
+    // 2. Kumpulkan records
+    updateLoading('Menggabungkan data…');
+    await yieldToUI();
+    const records = collectAllRecords();
+    if (!records.length) {
+      hideLoading();
+      return toast('⚠ Tidak ada data untuk dianalisa');
+    }
+    console.log(`📊 Records: ${records.length}`);
+
+    // 3. Analisa kolom
+    const cols = analyzeColumns(records);
+    console.log('📋 Columns:', cols);
+
+    const pivotCols = cols.filter(c => c.type === 'category' && c.unique <= 30 && c.unique > 1);
+    const valueCols = cols.filter(c => c.type === 'number');
+    const dateCols = cols.filter(c => c.type === 'date');
+
+    // 4. Buat Dashboard
+    updateLoading('Membuat dashboard…');
+    await yieldToUI();
+    const dashIdx = createDashboardSheet(records, cols, pivotCols, valueCols, dashName);
+
+    // 5. Buat Pivot sheets (max 5)
+    const maxPivots = 5;
+    const pivotResults = [];
+    for (let i = 0; i < Math.min(pivotCols.length, maxPivots); i++) {
+      const pcol = pivotCols[i];
+      updateLoading(`Membuat pivot: ${pcol.name}…`);
+      await yieldToUI();
+      const vcol = valueCols[0]?.name || null;
+      const pivotIdx = createPivotSheet(records, pcol.name, vcol, 'Dashboard', dashName);
+      if (pivotIdx >= 0) pivotResults.push({ name: pcol.name, idx: pivotIdx });
+    }
+
+    // 6. Buat Trend sheet
+    if (dateCols.length && valueCols.length) {
+      updateLoading('Membuat trend…');
+      await yieldToUI();
+      createTrendSheet(records, dateCols[0].name, valueCols[0].name, dashName);
+    }
+
+    // 7. Selesai
+    markMetaDirty('structure');
+    scheduleSave();
+    hideLoading();
+
+    await switchSheet(dashIdx);
+    toast(`✔ Dashboard + ${pivotResults.length} pivot dibuat`);
+
+  } catch (e) {
+    hideLoading();
+    console.error(e);
+    toast('⚠ ' + e.message);
+  }
+}
+
+/* =========================================================
+   COLLECT RECORDS dari semua sheet
+   ========================================================= */
+function collectAllRecords() {
+  const records = [];
+
+  wbData.sheets.forEach((sh, shIdx) => {
+    const cells = sh.cells || {};
+    if (!Object.keys(cells).length) return;
+
+    let maxR = -1, maxC = -1;
+    for (const a of Object.keys(cells)) {
+      const p = parseAddr(a);
+      if (!p) continue;
+      if (p.r > maxR) maxR = p.r;
+      if (p.c > maxC) maxC = p.c;
+    }
+    if (maxR < 1) return;
+
+    // 🎯 Skip sheet tanpa header
+    let headerCount = 0;
+    for (let c = 0; c <= maxC; c++) {
+      const cl = cells[addrOf(0, c)];
+      if (cl && cl.v !== undefined && cl.v !== null && cl.v !== '') headerCount++;
+    }
+    if (headerCount < 2) {
+      console.log(`⏭ Skip sheet "${sh.name}" — tidak ada header`);
+      return;
+    }
+
+    // Ambil headers
+    const headers = [];
+    for (let c = 0; c <= maxC; c++) {
+      const cl = cells[addrOf(0, c)];
+      let h = '';
+      if (cl) {
+        if (cl.f && shIdx === activeSheetIdx) {
+          try { h = displayVal(hfGet(0, c)); } catch { h = ''; }
+        } else {
+          h = displayVal(cl.v);
+        }
+      }
+      headers.push(h || colName(c));
+    }
+
+    // Data rows
+    for (let r = 1; r <= maxR; r++) {
+      const row = { __sheet: sh.name };
+      let hasData = false;
+      for (let c = 0; c <= maxC; c++) {
+        const addr = addrOf(r, c);
+        const cl = cells[addr];
+        if (!cl) continue;
+
+        let v;
+        if (cl.f && shIdx === activeSheetIdx) {
+          try { v = hfGet(r, c); } catch { v = null; }
+        } else {
+          v = cl.v;
+        }
+
+        if (v !== null && v !== undefined && v !== '') {
+          row[headers[c]] = v;
+          hasData = true;
+        }
+      }
+      if (hasData) records.push(row);
+    }
+  });
+
+  return records;
+}
+
+/* =========================================================
+   ANALYZE COLUMNS
+   Deteksi tipe tiap kolom: number / date / category / text
+   ========================================================= */
+function analyzeColumns(records) {
+  const keys = new Set();
+  records.forEach(r => {
+    Object.keys(r).forEach(k => {
+      if (!k.startsWith('__')) keys.add(k);
+    });
+  });
+
+  const cols = [];
+  for (const k of keys) {
+    const values = records.map(r => r[k]).filter(v => v !== null && v !== undefined && v !== '');
+    if (!values.length) continue;
+
+    const sample = values.slice(0, 200);
+    const numCount = sample.filter(v => !isNaN(Number(v)) && String(v).trim() !== '').length;
+    const dateCount = sample.filter(v => isDateLike(v)).length;
+    const unique = new Set(values.map(v => String(v))).size;
+
+    let type = 'text';
+    if (dateCount / sample.length > 0.7) type = 'date';
+    else if (numCount / sample.length > 0.7) type = 'number';
+    else if (unique <= Math.max(50, records.length * 0.5)) type = 'category';
+
+    cols.push({ name: k, type, unique, sample: values.slice(0, 3) });
+  }
+  return cols;
+}
+
+function isDateLike(v) {
+  if (v == null) return false;
+  const s = String(v).trim();
+  if (!s) return false;
+  // ISO date
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return true;
+  // Excel serial (50000-50000)
+  if (/^\d{5,6}(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (n > 20000 && n < 60000) return true;
+  }
+  return false;
+}
+
+/* =========================================================
+   CREATE DASHBOARD SHEET
+   ========================================================= */
+function createDashboardSheet(records, cols, pivotCols, valueCols, dashName) {
+  const cells = {};
+  let r = 0;
+  const R = (rr, cc, v, style) => {
+    const a = addrOf(rr, cc);
+    cells[a] = { v };
+    if (style) cells[a].s = style;
+  };
+  const put = (v, style) => { R(r, 0, v, style); };
+  const skip = (n = 1) => { r += n; };
+
+  const totalRecords = records.length;
+  const sheetsIncluded = new Set(records.map(x => x.__sheet)).size;
+  const dateCol = cols.find(c => c.type === 'date')?.name;
+  const mainValue = valueCols[0]?.name;
+
+  /* ============== TITLE ============== */
+  R(r, 0, '📊  WORKBOOK DASHBOARD', {
+    bold: true, fontSize: 18, color: '#065f46'
+  });
+  r++;
+  R(r, 0, `Dibuat: ${new Date().toLocaleString('id-ID')}`, {
+    fontSize: 10, color: '#64748b', italic: true
+  });
+  r += 2;
+
+  /* ============== KPI CARDS (visual) ============== */
+  // Tulis label KPI dalam 4 kartu
+  const kpiRow = r;
+  const kpiData = [
+    { label: 'TOTAL RECORDS', value: totalRecords.toLocaleString('id-ID'), bg: '#dbeafe', fg: '#1e40af' },
+    { label: 'SHEET DIANALISA', value: sheetsIncluded, bg: '#d1fae5', fg: '#065f46' },
+    { label: 'TOTAL KOLOM', value: cols.length, bg: '#fef3c7', fg: '#92400e' },
+  ];
+
+  const kpiCols = 4;   // 4 kartu berjejer
+  kpiData.forEach((k, i) => {
+    const c = i * 2;
+    R(kpiRow, c, k.label, { bold: true, fontSize: 9, color: k.fg, bg: k.bg, align: 'center' });
+    R(kpiRow + 1, c, k.value, { bold: true, fontSize: 20, color: k.fg, bg: k.bg, align: 'center' });
+    R(kpiRow + 2, c, '', { bg: k.bg });
+    // padding kolom sebelah
+    R(kpiRow, c + 1, '', { bg: '#ffffff' });
+    R(kpiRow + 1, c + 1, '', { bg: '#ffffff' });
+    R(kpiRow + 2, c + 1, '', { bg: '#ffffff' });
+  });
+  r += 4;
+
+  /* ============== RINGKASAN KOLOM NUMERIK ============== */
+  if (valueCols.length) {
+    R(r, 0, '📈  STATISTIK KOLOM NUMERIK', { bold: true, fontSize: 12, color: '#059669' });
+    r++;
+
+    const hdr = ['Kolom', 'Total', 'Rata-rata', 'Min', 'Max'];
+    hdr.forEach((h, i) => R(r, i, h, {
+      bold: true, bg: '#ecfdf5', color: '#065f46', align: 'center',
+      borders: { top: true, bottom: true, left: true, right: true, style: 'thin', color: '#10b981' }
+    }));
+    r++;
+
+    for (const vc of valueCols.slice(0, 8)) {
+      const vals = records.map(x => Number(x[vc.name])).filter(n => !isNaN(n));
+      if (!vals.length) continue;
+      const sum = vals.reduce((a, b) => a + b, 0);
+      const avg = sum / vals.length;
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+
+      R(r, 0, vc.name, { bold: true });
+      R(r, 1, fmtNum(sum), { align: 'right' });
+      R(r, 2, fmtNum(avg, 2), { align: 'right' });
+      R(r, 3, fmtNum(min), { align: 'right' });
+      R(r, 4, fmtNum(max), { align: 'right' });
+      r++;
+    }
+    r++;
+  }
+
+  /* ============== TOP 5 PER CATEGORY (mini pivot) ============== */
+  for (const pcol of pivotCols.slice(0, 3)) {
+    R(r, 0, `🔎  TOP 5 ${pcol.name.toUpperCase()}`, { bold: true, fontSize: 12, color: '#059669' });
+    r++;
+
+    const counts = new Map();
+    records.forEach(rec => {
+      const k = String(rec[pcol.name] ?? '(kosong)');
+      counts.set(k, (counts.get(k) || 0) + 1);
+    });
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+    R(r, 0, pcol.name, { bold: true, bg: '#ecfdf5', align: 'center' });
+    R(r, 1, 'Count', { bold: true, bg: '#ecfdf5', align: 'center' });
+    R(r, 2, '%', { bold: true, bg: '#ecfdf5', align: 'center' });
+    r++;
+
+    for (const [k, cnt] of sorted) {
+      R(r, 0, k);
+      R(r, 1, cnt, { align: 'right' });
+      R(r, 2, ((cnt / totalRecords) * 100).toFixed(1) + '%', { align: 'right', color: '#64748b' });
+      r++;
+    }
+    r++;
+  }
+
+  /* ============== FOOTER ============== */
+  R(r, 0, '💡 Tip: lihat sheet "Pivot …" untuk data lengkap per kategori', {
+    italic: true, fontSize: 10, color: '#94a3b8'
+  });
+
+  /* ============== CREATE SHEET ============== */
+  const newSheet = {
+    name: dashName,
+    cells,
+    colWidths: { 0: 220, 1: 120, 2: 120, 3: 120, 4: 120 },
+    rowHeight: 26,
+    rowHeights: {},   // set KPI rows lebih tinggi
+    cf: [], charts: [], merged: [], filters: {},
+    images: [], validations: [],
+    freezeRow: 0, freezeCol: 0, protected: false
+  };
+
+  // KPI row height: lebih tinggi biar kartu terlihat
+  newSheet.rowHeights[kpiRow] = 32;
+  newSheet.rowHeights[kpiRow + 1] = 40;
+  newSheet.rowHeights[kpiRow + 2] = 8;
+
+  // Charts untuk mini pivot
+  newSheet.charts = [];
+
+  wbData.sheets.push(newSheet);
+  const newIdx = wbData.sheets.length - 1;
+  loadedSheetIdxs.add(newIdx);
+  return newIdx;
+}
+
+/* =========================================================
+   CREATE PIVOT SHEET
+   ========================================================= */
+function createPivotSheet(records, groupCol, valueCol, prefix, dashName) {
+  const counts = new Map();
+
+  records.forEach(rec => {
+    const k = String(rec[groupCol] ?? '(kosong)');
+    if (!counts.has(k)) counts.set(k, { count: 0, sum: 0, values: [] });
+    const g = counts.get(k);
+    g.count++;
+    if (valueCol) {
+      const n = Number(rec[valueCol]);
+      if (!isNaN(n)) {
+        g.sum += n;
+        g.values.push(n);
+      }
+    }
+  });
+
+  const rows = [...counts.entries()].map(([k, g]) => ({
+    key: k,
+    count: g.count,
+    sum: g.sum,
+    avg: g.values.length ? g.sum / g.values.length : 0
+  })).sort((a, b) => b.count - a.count);
+
+  const cells = {};
+  let r = 0;
+  const R = (rr, cc, v, style) => {
+    const a = addrOf(rr, cc);
+    cells[a] = { v };
+    if (style) cells[a].s = style;
+  };
+
+  R(r, 0, `📊  PIVOT: ${groupCol}`, { bold: true, fontSize: 16, color: '#065f46' });
+  r++;
+  R(r, 0, `Total ${records.length} baris · ${rows.length} kategori`, {
+    italic: true, fontSize: 10, color: '#64748b'
+  });
+  r += 2;
+
+  // Header
+  const hdr = [groupCol, 'Count', '%'];
+  if (valueCol) {
+    hdr.push(`Sum(${valueCol})`, `Avg(${valueCol})`);
+  }
+  hdr.forEach((h, i) => R(r, i, h, {
+    bold: true, bg: '#d1fae5', color: '#065f46', align: 'center',
+    borders: { top: true, bottom: true, left: true, right: true, style: 'medium', color: '#10b981' }
+  }));
+  r++;
+
+  // Data
+  rows.forEach((row, i) => {
+    const isAlt = i % 2 === 1;
+    const bg = isAlt ? '#f8fafc' : '#ffffff';
+    R(r, 0, row.key, { bg, bold: true });
+    R(r, 1, row.count, { bg, align: 'right' });
+    R(r, 2, ((row.count / records.length) * 100).toFixed(1) + '%', {
+      bg, align: 'right', color: '#64748b'
+    });
+    if (valueCol) {
+      R(r, 3, fmtNum(row.sum), { bg, align: 'right' });
+      R(r, 4, fmtNum(row.avg, 2), { bg, align: 'right' });
+    }
+    r++;
+  });
+
+  // Grand total
+  r++;
+  R(r, 0, 'TOTAL', {
+    bold: true, bg: '#d1fae5', color: '#065f46',
+    borders: { top: true, bottom: true, left: true, right: true, style: 'medium', color: '#10b981' }
+  });
+  R(r, 1, records.length, { bold: true, bg: '#d1fae5', align: 'right', color: '#065f46' });
+  R(r, 2, '100%', { bold: true, bg: '#d1fae5', align: 'right', color: '#065f46' });
+  if (valueCol) {
+    const totalSum = rows.reduce((a, b) => a + b.sum, 0);
+    R(r, 3, fmtNum(totalSum), { bold: true, bg: '#d1fae5', align: 'right', color: '#065f46' });
+    R(r, 4, '', { bg: '#d1fae5' });
+  }
+
+  // Chart data — top 10 di sebelah kanan (kolom G)
+  const chartStartCol = 6;
+  const chartTop = 4;
+  R(chartTop, chartStartCol, 'Label', { bold: true, bg: '#f1f5f9' });
+  R(chartTop, chartStartCol + 1, 'Value', { bold: true, bg: '#f1f5f9' });
+  const top10 = rows.slice(0, 10);
+  top10.forEach((row, i) => {
+    R(chartTop + 1 + i, chartStartCol, String(row.key).slice(0, 30));
+    R(chartTop + 1 + i, chartStartCol + 1, row.count);
+  });
+
+  // Hitung range chart untuk Chart.js
+  const chartRange = addrOf(chartTop, chartStartCol) + ':' + addrOf(chartTop + top10.length, chartStartCol + 1);
+  const chartX = 200;   // posisi di layar
+  const chartY = 80;
+
+  const newSheet = {
+    name: `${prefix} — ${groupCol}`.slice(0, 30),
+    cells,
+    colWidths: { 0: 220, 1: 100, 2: 80, 3: 140, 4: 140 },
+    rowHeight: 26,
+    cf: [], charts: [], merged: [], filters: {},
+    images: [], validations: [],
+    freezeRow: 1, freezeCol: 0, protected: false
+  };
+
+  // Chart object
+  newSheet.charts.push({
+    id: 'c' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    type: 'bar',
+    range: chartRange,
+    x: chartX,
+    y: chartY,
+    w: 460,
+    h: 320
+  });
+
+  wbData.sheets.push(newSheet);
+  const newIdx = wbData.sheets.length - 1;
+  loadedSheetIdxs.add(newIdx);
+  return newIdx;
+}
+
+/* =========================================================
+   CREATE TREND SHEET (time-series)
+   ========================================================= */
+function createTrendSheet(records, dateCol, valueCol, dashName) {
+  // Group by month
+  const byMonth = new Map();
+
+  records.forEach(rec => {
+    const dateRaw = rec[dateCol];
+    if (!dateRaw) return;
+
+    let d;
+    const s = String(dateRaw).trim();
+    if (/^\d{5,6}(\.\d+)?$/.test(s)) {
+      // Excel serial → date (base 1899-12-30)
+      d = new Date(Date.UTC(1899, 11, 30) + Number(s) * 86400000);
+    } else {
+      d = new Date(s);
+    }
+    if (isNaN(d.getTime())) return;
+
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!byMonth.has(key)) byMonth.set(key, { count: 0, sum: 0 });
+    const g = byMonth.get(key);
+    g.count++;
+    const n = Number(rec[valueCol]);
+    if (!isNaN(n)) g.sum += n;
+  });
+
+  const sortedMonths = [...byMonth.keys()].sort();
+
+  const cells = {};
+  let r = 0;
+  const R = (rr, cc, v, style) => {
+    const a = addrOf(rr, cc);
+    cells[a] = { v };
+    if (style) cells[a].s = style;
+  };
+
+  R(r, 0, `📈  TREND BULANAN — ${valueCol}`, { bold: true, fontSize: 16, color: '#065f46' });
+  r += 2;
+
+  R(r, 0, 'Bulan', { bold: true, bg: '#dbeafe', color: '#1e40af', align: 'center' });
+  R(r, 1, 'Count', { bold: true, bg: '#dbeafe', color: '#1e40af', align: 'center' });
+  R(r, 2, `Sum(${valueCol})`, { bold: true, bg: '#dbeafe', color: '#1e40af', align: 'center' });
+  r++;
+
+  const chartTop = r;
+  for (const month of sortedMonths) {
+    const g = byMonth.get(month);
+    R(r, 0, month, { bold: true });
+    R(r, 1, g.count, { align: 'right' });
+    R(r, 2, fmtNum(g.sum), { align: 'right' });
+    r++;
+  }
+
+  const chartRange = addrOf(chartTop, 0) + ':' + addrOf(r - 1, 2);
+
+  const newSheet = {
+    name: `Trend — ${valueCol}`.slice(0, 30),
+    cells,
+    colWidths: { 0: 140, 1: 100, 2: 160 },
+    rowHeight: 26,
+    cf: [], charts: [], merged: [], filters: {},
+    images: [], validations: [],
+    freezeRow: 1, freezeCol: 0, protected: false
+  };
+
+  newSheet.charts.push({
+    id: 'ctrend' + Date.now(),
+    type: 'line',
+    range: chartRange,
+    x: 320,
+    y: 80,
+    w: 640,
+    h: 360
+  });
+
+  wbData.sheets.push(newSheet);
+  const newIdx = wbData.sheets.length - 1;
+  loadedSheetIdxs.add(newIdx);
+  return newIdx;
+}
+
+/* =========================================================
+   Helper: format angka
+   ========================================================= */
+function fmtNum(n, dec = 0) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  if (!isFinite(n)) return '—';
+  return Number(n).toLocaleString('id-ID', {
+    minimumFractionDigits: dec,
+    maximumFractionDigits: dec
+  });
+}
+
+/* =========================================================
+   HIDE / SHOW ROWS & COLUMNS
+   ========================================================= */
+function applyHiddenRowsCols() {
+  const sh = sheet();
+  if (!sh) return;
+
+  const hiddenCols = new Set(sh.hiddenCols || []);
+  const hiddenRows = new Set(sh.hiddenRows || []);
+
+  // 🎯 Sembunyikan kolom — thead + semua td di tbody
+  const theadThs = document.querySelectorAll('#grid thead th[data-col]');
+  theadThs.forEach(th => {
+    const c = parseInt(th.dataset.col, 10);
+    if (hiddenCols.has(c)) {
+      th.classList.add('col-hidden');
+    } else {
+      th.classList.remove('col-hidden');
+    }
+  });
+
+  const tbody = document.getElementById('grid-body');
+  if (tbody) {
+    Array.from(tbody.children).forEach(tr => {
+      const rowTh = tr.firstElementChild;
+      const r = rowTh?.dataset?.row ? parseInt(rowTh.dataset.row, 10) : -1;
+
+      // Sembunyikan baris
+      if (r >= 0 && hiddenRows.has(r)) {
+        tr.classList.add('row-hidden');
+      } else {
+        tr.classList.remove('row-hidden');
+      }
+
+      // Sembunyikan kolom di dalam baris
+      const tds = tr.querySelectorAll('td[data-addr]');
+      tds.forEach(td => {
+        const col = parseInt(td.dataset.col, 10);
+        if (hiddenCols.has(col)) {
+          td.classList.add('col-hidden');
+        } else {
+          td.classList.remove('col-hidden');
+        }
+      });
+    });
+  }
+
+  // 🎯 Indikator — garis tebal di header sebelum kolom yang hidden
+  theadThs.forEach(th => th.classList.remove('col-hidden-indicator'));
+  hiddenCols.forEach(c => {
+    const prevTh = document.querySelector(`#grid thead th[data-col="${c - 1}"]`);
+    if (prevTh) prevTh.classList.add('col-hidden-indicator');
+  });
+
+  // Indikator baris
+  if (tbody) {
+    Array.from(tbody.children).forEach(tr => tr.querySelector('th')?.classList.remove('row-hidden-indicator'));
+    hiddenRows.forEach(r => {
+      const tr = rowEls[r - 1];
+      if (tr?.firstElementChild) tr.firstElementChild.classList.add('row-hidden-indicator');
+    });
+  }
+}
+
+/* Simpan state hide ke sheet & save */
+function saveHiddenState() {
+  const sh = sheet();
+  if (!sh) return;
+  markMetaDirty('structure');
+  scheduleSave();
+}
+
+/* =========================================================
+   HEADER CONTEXT MENU — Hide / Unhide Row/Col
+   ========================================================= */
+let headerCtxMenu = null;
+
+function closeHeaderCtxMenu() {
+  if (headerCtxMenu) {
+    headerCtxMenu.remove();
+    headerCtxMenu = null;
+  }
+}
+
+function openHeaderCtxMenu(x, y, type, index) {
+  closeHeaderCtxMenu();
+
+  const sh = sheet();
+  const menu = document.createElement('div');
+  menu.className = 'header-context-menu';
+
+  if (type === 'col') {
+    const isHidden = (sh.hiddenCols || []).includes(index);
+    const hasHiddenNearby = (sh.hiddenCols || []).some(c => c === index - 1 || c === index + 1 || c === index);
+
+    menu.innerHTML = `
+      <button data-action="${isHidden ? 'unhide-col' : 'hide-col'}">
+        <i class="fa-solid ${isHidden ? 'fa-eye' : 'fa-eye-slash'}"></i>
+        ${isHidden ? 'Unhide Column ' + colName(index) : 'Hide Column ' + colName(index)}
+      </button>
+      ${hasHiddenNearby ? `
+        <button data-action="unhide-all-cols">
+          <i class="fa-solid fa-eye"></i> Unhide Semua Kolom
+        </button>
+      ` : ''}
+    `;
+  } else if (type === 'row') {
+    const isHidden = (sh.hiddenRows || []).includes(index);
+    const hasHiddenNearby = (sh.hiddenRows || []).some(r => r === index - 1 || r === index + 1 || r === index);
+
+    // 🎯 Cek apakah row ini di dalam group
+    const inGroup = getRowGroupAt(index);
+    const canGroup = selection.start && selection.end;
+
+    menu.innerHTML = `
+      <button data-action="${isHidden ? 'unhide-row' : 'hide-row'}">
+        <i class="fa-solid ${isHidden ? 'fa-eye' : 'fa-eye-slash'}"></i>
+        ${isHidden ? 'Unhide Row ' + (index + 1) : 'Hide Row ' + (index + 1)}
+      </button>
+      ${hasHiddenNearby ? `
+        <button data-action="unhide-all-rows">
+          <i class="fa-solid fa-eye"></i> Unhide Semua Baris
+        </button>
+      ` : ''}
+      <div class="ct-divider"></div>
+      <button data-action="group-rows">
+        <i class="fa-solid fa-layer-group"></i> Group Baris Terpilih
+      </button>
+      ${inGroup ? `
+        <button data-action="ungroup-rows">
+          <i class="fa-solid fa-object-ungroup"></i> Ungroup Baris
+        </button>
+      ` : ''}
+    `;
+  }
+
+  document.body.appendChild(menu);
+  headerCtxMenu = menu;
+
+  // Position
+  const rect = menu.getBoundingClientRect();
+  if (x + rect.width > window.innerWidth - 10) x = window.innerWidth - rect.width - 10;
+  if (y + rect.height > window.innerHeight - 10) y = window.innerHeight - rect.height - 10;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  // Handler klik
+  menu.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const action = btn.dataset.action;
+      const sh = sheet();
+      sh.hiddenCols = sh.hiddenCols || [];
+      sh.hiddenRows = sh.hiddenRows || [];
+
+      if (action === 'hide-col') {
+        if (!sh.hiddenCols.includes(index)) sh.hiddenCols.push(index);
+      } else if (action === 'unhide-col') {
+        sh.hiddenCols = sh.hiddenCols.filter(c => c !== index);
+      } else if (action === 'unhide-all-cols') {
+        sh.hiddenCols = [];
+      } else if (action === 'hide-row') {
+        if (!sh.hiddenRows.includes(index)) sh.hiddenRows.push(index);
+      } else if (action === 'unhide-row') {
+        sh.hiddenRows = sh.hiddenRows.filter(r => r !== index);
+      } else if (action === 'unhide-all-rows') {
+        sh.hiddenRows = [];
+      } else if (action === 'group-rows') {
+        // Group dari selection.start sampai selection.end
+        const p1 = parseAddr(selection.start);
+        const p2 = parseAddr(selection.end);
+        if (!p1 || !p2) return;
+        const from = Math.min(p1.r, p2.r);
+        const to = Math.max(p1.r, p2.r);
+        addRowGroup(from, to);
+
+      } else if (action === 'ungroup-rows') {
+        removeRowGroup(index);
+      }
+
+      saveHiddenState();
+      applyHiddenRowsCols();
+      closeHeaderCtxMenu();
+      toast(`✔ ${action.replace(/-/g, ' ')}`);
+    });
+  });
+
+  // Tutup klik luar
+  setTimeout(() => {
+    document.addEventListener('mousedown', function handler(e) {
+      if (headerCtxMenu && !headerCtxMenu.contains(e.target)) {
+        closeHeaderCtxMenu();
+        document.removeEventListener('mousedown', handler, true);
+      }
+    }, true);
+  }, 0);
+}
+
+/* =========================================================
+   BIND KANAN KLIK DI HEADER
+   ========================================================= */
+document.addEventListener('contextmenu', e => {
+  // Header kolom
+  const colTh = e.target.closest('#grid thead th[data-col]');
+  if (colTh) {
+    e.preventDefault();
+    const c = parseInt(colTh.dataset.col, 10);
+    openHeaderCtxMenu(e.clientX, e.clientY, 'col', c);
+    return;
+  }
+
+  // Header baris
+  const rowTh = e.target.closest('#grid tbody th[data-row]');
+  if (rowTh) {
+    e.preventDefault();
+    const r = parseInt(rowTh.dataset.row, 10);
+    openHeaderCtxMenu(e.clientX, e.clientY, 'row', r);
+    return;
+  }
+}, true);
+/* =========================================================
+   ROW GROUP BUTTON — Event Delegation
+   ========================================================= */
+document.getElementById('grid')?.addEventListener('mousedown', e => {
+  const btn = e.target.closest('.row-group-btn');
+  if (!btn) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  const from = parseInt(btn.dataset.groupFrom, 10);
+  const groups = getRowGroups();
+  const g = groups.find(x => x.from === from);
+  if (!g) return;
+
+  toggleRowGroupCollapse(g);
+}, true);
+/* =========================================================
+   BIND FORMULA AUDITING
+   ========================================================= */
+document.getElementById('btn-show-formulas')?.addEventListener('click', toggleShowFormulas);
+document.getElementById('btn-highlight-formulas')?.addEventListener('click', toggleHighlightFormulas);
+document.getElementById('btn-error-check')?.addEventListener('click', runErrorCheck);
+document.getElementById('btn-errors-close')?.addEventListener('click', closeErrorModal);
+document.getElementById('btn-errors-cancel')?.addEventListener('click', closeErrorModal);
+document.getElementById('modal-errors')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-errors') closeErrorModal();
+});
+
+/* Shortcut Ctrl+` untuk toggle show formulas */
+document.addEventListener('keydown', e => {
+  if (editor) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+
+  // Ctrl+` (backtick)
+  if (ctrl && (e.key === '`' || e.key === '~')) {
+    e.preventDefault();
+    toggleShowFormulas();
+    return;
+  }
+}, true);
+
+console.log('✅ Formula Auditing initialized');
+/* =========================================================
+   BIND ADVANCED FILTER
+   ========================================================= */
+document.getElementById('btn-adv-filter')?.addEventListener('click', openAdvancedFilterModal);
+document.getElementById('btn-advf-close')?.addEventListener('click', closeAdvancedFilterModal);
+document.getElementById('btn-advf-cancel')?.addEventListener('click', closeAdvancedFilterModal);
+document.getElementById('modal-adv-filter')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-adv-filter') closeAdvancedFilterModal();
+});
+
+document.getElementById('btn-advf-add')?.addEventListener('click', () => {
+  _advFilterDraft.push({ col: 0, op: 'eq', value: '', logic: 'AND' });
+  renderAdvConditions();
+});
+
+document.getElementById('btn-advf-apply')?.addEventListener('click', () => {
+  // Filter kondisi valid saja
+  const valid = _advFilterDraft.filter(c => c.value !== '' || c.op === 'between');
+  if (!valid.length) {
+    toast('⚠ Tidak ada kondisi valid');
+    return;
+  }
+
+  sheet().advancedFilters = JSON.parse(JSON.stringify(valid));
+  invalidateRowMap();
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  markMetaDirty('structure');
+  scheduleSave();
+  renderVirtual(false);
+  closeAdvancedFilterModal();
+  toast(`✔ Advanced filter diterapkan (${valid.length} kondisi)`);
+});
+
+document.getElementById('btn-advf-clear')?.addEventListener('click', () => {
+  sheet().advancedFilters = [];
+  _advFilterDraft = [{ col: 0, op: 'eq', value: '', logic: 'AND' }];
+  invalidateRowMap();
+  window._lastFrozenKey = null;
+  window._lastRenderKey = null;
+  visibleStart = -1;
+  visibleEnd = -1;
+  markMetaDirty('structure');
+  scheduleSave();
+  renderVirtual(false);
+  renderAdvConditions();
+  updateAdvPreview();
+  toast('✔ Advanced filter dibersihkan');
+});
+
+console.log('✅ Advanced Filter initialized');
+/* =========================================================
+   BIND LOCK/UNLOCK
+   ========================================================= */
+document.getElementById('btn-lock-cells')?.addEventListener('click', lockSelection);
+document.getElementById('btn-unlock-cells')?.addEventListener('click', unlockSelection);
+
+console.log('✅ Lock Cell initialized');

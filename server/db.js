@@ -99,6 +99,7 @@ export async function initDb() {
       view_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_view_links_token ON view_links(token);
+    ALTER TABLE sheets ADD COLUMN IF NOT EXISTS password_hash TEXT;
   `);
 
   await seedTemplates();

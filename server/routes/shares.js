@@ -152,4 +152,26 @@ router.get('/users/search', async (req, res) => {
     res.json([]);
   }
 });
+
+/* =========================================================
+   CHECK ACCESS — versi ringan (tanpa data JSONB)
+   Pakai di route yang tidak butuh data workbook
+   ========================================================= */
+export async function checkAccessLight(sheetId, userId) {
+  const sid = parseInt(sheetId, 10);
+  const uid = parseInt(userId, 10);
+  if (isNaN(sid) || isNaN(uid)) return null;
+
+  const { rows } = await pool.query(`
+    SELECT s.id, s.user_id, s.name, s.updated_at,
+           CASE WHEN s.user_id = $2::int THEN 'owner' ELSE sh.permission END AS access
+      FROM sheets s
+      LEFT JOIN shares sh ON sh.sheet_id = s.id AND sh.user_id = $2::int
+     WHERE s.id = $1::int
+       AND (s.user_id = $2::int OR sh.user_id IS NOT NULL)
+     LIMIT 1
+  `, [sid, uid]);
+
+  return rows[0] || null;
+}
 export default router;
