@@ -551,6 +551,23 @@
       </div>
       <div class="ribbon-group-label">Rows / Cols</div>
     </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-ctrl-button">
+          <i class="fa-solid fa-hand-pointer"></i> Button
+        </button>
+        <button class="rib wide" id="btn-ctrl-checkbox">
+          <i class="fa-solid fa-square-check"></i> Checkbox
+        </button>
+        <button class="rib wide" id="btn-ctrl-textbox">
+          <i class="fa-solid fa-i-cursor"></i> Input
+        </button>
+        <button class="rib wide" id="btn-ctrl-dropdown">
+          <i class="fa-solid fa-caret-down"></i> Dropdown
+        </button>
+      </div>
+      <div class="ribbon-group-label">Form Controls</div>
+    </div>
   </div>
 
   <!-- ---------- Ribbon: FORMULAS ---------- -->
@@ -570,31 +587,6 @@
         <button class="rib fn-btn" data-fn="TODAY"><i class="fa-regular fa-calendar"></i> TODAY</button>
       </div>
       <div class="ribbon-group-label">Quick Functions</div>
-      <div class="ribbon-group">
-        <div class="ribbon-group-body">
-          <button class="rib wide" id="btn-name-manager">
-            <i class="fa-solid fa-bookmark"></i> Name Manager
-          </button>
-          <button class="rib wide" id="btn-name-from-selection">
-            <i class="fa-solid fa-plus"></i> Define Name
-          </button>
-        </div>
-        <div class="ribbon-group-label">Named Ranges</div>
-      </div>
-      <div class="ribbon-group">
-        <div class="ribbon-group-body">
-          <button class="rib wide" id="btn-show-formulas" title="Ctrl+`">
-            <i class="fa-solid fa-eye"></i> Show Formulas
-          </button>
-          <button class="rib wide" id="btn-highlight-formulas" title="Highlight cell berformula">
-            <i class="fa-solid fa-highlighter"></i> Highlight
-          </button>
-          <button class="rib wide" id="btn-error-check" title="Cek error">
-            <i class="fa-solid fa-triangle-exclamation"></i> Error Check
-          </button>
-        </div>
-        <div class="ribbon-group-label">Formula Auditing</div>
-      </div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
@@ -604,6 +596,31 @@
         </div>
       </div>
       <div class="ribbon-group-label">Info</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-name-manager">
+          <i class="fa-solid fa-bookmark"></i> Name Manager
+        </button>
+        <button class="rib wide" id="btn-name-from-selection">
+          <i class="fa-solid fa-plus"></i> Define Name
+        </button>
+      </div>
+      <div class="ribbon-group-label">Named Ranges</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-show-formulas" title="Ctrl+`">
+          <i class="fa-solid fa-eye"></i> Show Formulas
+        </button>
+        <button class="rib wide" id="btn-highlight-formulas" title="Highlight cell berformula">
+          <i class="fa-solid fa-highlighter"></i> Highlight
+        </button>
+        <button class="rib wide" id="btn-error-check" title="Cek error">
+          <i class="fa-solid fa-triangle-exclamation"></i> Error Check
+        </button>
+      </div>
+      <div class="ribbon-group-label">Formula Auditing</div>
     </div>
   </div>
 
@@ -753,6 +770,17 @@
         <span id="zoom-label" class="zoom-label">100%</span>
       </div>
       <div class="ribbon-group-label">Zoom</div>
+    </div>
+    <div class="ribbon-group">
+      <div class="ribbon-group-body">
+        <button class="rib wide" id="btn-macro" title="Macro Manager (Alt+F8)">
+          <i class="fa-solid fa-code"></i> Macro
+        </button>
+        <button class="rib wide" id="btn-macro-run-last" title="Run macro terakhir">
+          <i class="fa-solid fa-play"></i> Run Last
+        </button>
+      </div>
+      <div class="ribbon-group-label">Automation</div>
     </div>
     <div class="ribbon-group">
       <div class="ribbon-group-body">
@@ -1961,6 +1989,215 @@ html
         <i class="fa-solid fa-check"></i> Import
       </button>
       <button class="btn ghost" id="btn-iu-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+<!-- ============ MODAL: MACRO MANAGER ============ -->
+<div id="modal-macros" class="modal hidden">
+  <div class="modal-card" style="min-width:900px;max-width:1100px;height:85vh;display:flex;flex-direction:column">
+    <div class="modal-header" style="flex-shrink:0">
+      <h3><i class="fa-solid fa-code"></i> Macro Manager</h3>
+      <button class="find-close-btn" id="btn-macro-close" style="position:absolute;top:16px;right:20px">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+    </div>
+
+    <div class="macro-body">
+      <!-- SIDEBAR -->
+      <div class="macro-sidebar">
+        <button class="btn primary" id="btn-macro-new" style="width:100%;margin-bottom:10px">
+          <i class="fa-solid fa-plus"></i> Macro Baru
+        </button>
+        <div id="macro-list" class="macro-list"></div>
+      </div>
+
+      <!-- EDITOR -->
+      <div class="macro-editor-wrap">
+        <div class="macro-editor-header">
+          <input id="macro-name" class="macro-name-input" placeholder="Nama macro…" />
+          <div class="macro-actions">
+            <button class="btn primary small" id="btn-macro-run">
+              <i class="fa-solid fa-play"></i> Run
+            </button>
+            <button class="btn ghost small" id="btn-macro-save">
+              <i class="fa-solid fa-floppy-disk"></i> Simpan
+            </button>
+            <button class="btn ghost small" id="btn-macro-delete" style="color:#dc2626">
+              <i class="fa-solid fa-trash"></i> Hapus
+            </button>
+          </div>
+        </div>
+
+        <textarea id="macro-code" class="macro-code" placeholder="// Tulis JavaScript di sini...
+// Contoh:
+// api.setCell('A1', 'Hello World');
+// api.alert('Done!');" spellcheck="false"></textarea>
+
+        <div class="macro-footer">
+          <div class="macro-docs-toggle" id="macro-docs-toggle">
+            <i class="fa-solid fa-book"></i> API Documentation
+          </div>
+          <div id="macro-docs" class="macro-docs hidden">
+            <div class="macro-doc-category">
+              <div class="macro-doc-cat-title"><i class="fa-solid fa-table-cells"></i> Cell Access</div>
+              <div class="macro-doc-item">
+                <code>api.getCell(addr)</code>
+                <span>Baca nilai cell. Formula dievaluasi.<br>Contoh: <code>api.getCell('A1')</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.setCell(addr, value)</code>
+                <span>Set nilai cell. Bisa teks, angka, atau formula (mulai dengan <code>=</code>).<br>Contoh: <code>api.setCell('B2', 100)</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.getRange('A1:C10')</code>
+                <span>Baca range → 2D array <code>[[v,v],[v,v]]</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.setRange(anchor, data2D)</code>
+                <span>Set range dari 2D array.<br>Contoh: <code>api.setRange('A1', [[1,2],[3,4]])</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.clearCell(addr)</code>
+                <span>Hapus isi cell (value + formula)</span>
+              </div>
+            </div>
+
+            <div class="macro-doc-category">
+              <div class="macro-doc-cat-title"><i class="fa-solid fa-palette"></i> Formatting</div>
+              <div class="macro-doc-item">
+                <code>api.formatCell(addr, style)</code>
+                <span>Set style cell.<br>Style: <code>{bold, italic, underline, color, bg, align, fontSize, numFmt}</code><br>Contoh: <code>api.formatCell('A1', {bold:true, bg:'#ff0'})</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.clearFormat(addr)</code>
+                <span>Hapus style cell</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.numberFormat(addr, 'currency')</code>
+                <span>Format angka: <code>'number'</code>, <code>'currency'</code>, <code>'percent'</code>, <code>'date'</code>, <code>'text'</code></span>
+              </div>
+            </div>
+
+            <div class="macro-doc-category">
+              <div class="macro-doc-cat-title"><i class="fa-solid fa-info-circle"></i> Info</div>
+              <div class="macro-doc-item">
+                <code>api.activeCell()</code>
+                <span>Address cell yang sedang aktif. Contoh: <code>'B5'</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.selection()</code>
+                <span>Object <code>{start, end}</code> dari selection</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.sheetName()</code> / <code>api.wbName()</code>
+                <span>Nama sheet / workbook aktif</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.rows()</code> / <code>api.cols()</code>
+                <span>Jumlah baris / kolom grid</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.getLastRow(col)</code>
+                <span>Baris terakhir yang ada data di kolom tertentu. Contoh: <code>api.getLastRow(0)</code></span>
+              </div>
+            </div>
+
+            <div class="macro-doc-category">
+              <div class="macro-doc-cat-title"><i class="fa-solid fa-utensils"></i> Utility</div>
+              <div class="macro-doc-item">
+                <code>api.alert(msg)</code>
+                <span>Tampilkan toast notification</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.log(...args)</code>
+                <span>Tulis ke log output panel</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.confirm(msg)</code>
+                <span>Dialog konfirmasi (async). <code>await api.confirm('Yakin?')</code></span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.prompt(msg, default)</code>
+                <span>Input dialog (async)</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>await api.sleep(ms)</code>
+                <span>Tunggu sekian milidetik</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.markDirty()</code>
+                <span>Mark workbook changed (trigger save)</span>
+              </div>
+            </div>
+
+            <div class="macro-doc-category">
+              <div class="macro-doc-cat-title"><i class="fa-solid fa-mouse-pointer"></i> Form Controls</div>
+              <div class="macro-doc-item">
+                <code>api.getControl(id)</code>
+                <span>Ambil control by id</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.setControlValue(id, val)</code>
+                <span>Set value control (checkbox/text/dropdown)</span>
+              </div>
+              <div class="macro-doc-item">
+                <code>api.onControlChange(id, fn)</code>
+                <span>Daftarkan listener saat control berubah</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="macro-output" class="macro-output">
+          <div class="macro-output-header">
+            <span><i class="fa-solid fa-terminal"></i> Output</span>
+            <button id="btn-macro-clear-log" class="macro-log-clear">
+              <i class="fa-solid fa-broom"></i> Clear
+            </button>
+          </div>
+          <div id="macro-log" class="macro-log"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- ============ MODAL: CONTROL SETTINGS ============ -->
+<div id="modal-control-settings" class="modal hidden">
+  <div class="modal-card" style="min-width:480px;max-width:560px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-sliders"></i> <span id="cs-title">Pengaturan Control</span></h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Label</span>
+        <input id="cs-label" placeholder="Klik Saya" />
+      </label>
+
+      <label class="modal-label">
+        <span>Warna Background</span>
+        <input type="color" id="cs-bg" value="#10b981" />
+      </label>
+
+      <label class="modal-label">
+        <span>Warna Teks</span>
+        <input type="color" id="cs-color" value="#ffffff" />
+      </label>
+
+      <label class="modal-label">
+        <span>Assign Macro (jalankan saat diklik)</span>
+        <select id="cs-macro"></select>
+      </label>
+
+      <label class="modal-label">
+        <span>Link ke Cell (opsional — simpan nilai ke cell)</span>
+        <input id="cs-cell" placeholder="Contoh: A1" />
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-cs-apply">
+        <i class="fa-solid fa-check"></i> Terapkan
+      </button>
+      <button class="btn ghost" id="btn-cs-cancel">Batal</button>
     </div>
   </div>
 </div>

@@ -284,6 +284,7 @@ router.get('/:id/sheets-meta', async (req, res) => {
         (password_hash IS NOT NULL) AS has_password,
         COALESCE(data->'activeSheet', '0'::jsonb) AS active_sheet,
         COALESCE(data->'namedRanges', '{}'::jsonb) AS named_ranges,
+        COALESCE(data->'macros', '[]'::jsonb) AS macros,
         COALESCE((
           SELECT jsonb_agg(jsonb_build_object(
             'name',        s->'name',
@@ -303,7 +304,8 @@ router.get('/:id/sheets-meta', async (req, res) => {
             'tabColor',    s->'tabColor',
             'rowGroups',   s->'rowGroups',
             'advancedFilters', s->'advancedFilters',
-            'pivots',      s->'pivots'
+            'pivots',      s->'pivots',
+            'controls',    s->'controls'
           ))
           FROM jsonb_array_elements(data->'sheets') s
         ), '[]'::jsonb) AS sheets,
@@ -318,6 +320,8 @@ router.get('/:id/sheets-meta', async (req, res) => {
       hasPassword: rows[0].has_password,
       activeSheet: rows[0].active_sheet,
       namedRanges: rows[0].named_ranges,
+      macros: rows[0].macros,
+      controls: rows[0].controls || [],
       sheets: rows[0].sheets,
       sheetCount: rows[0].sheet_count,
       access: a.access

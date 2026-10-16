@@ -211,6 +211,27 @@ router.patch('/:id/delta', async (req, res) => {
         [sid, JSON.stringify(meta.namedRanges)]
       );
     }
+    if (meta.controls !== undefined) {
+      await pool.query(`
+        UPDATE sheet_data
+          SET sheet = jsonb_set(
+                COALESCE(sheet, '{}'::jsonb),
+                '{controls}',
+                $3::jsonb
+              ),
+              updated_at = NOW()
+        WHERE sheet_id = $1::int AND sheet_idx = $2::int
+      `, [sid, sIdx, JSON.stringify(meta.controls)]);
+    }
+    if (meta.macros !== undefined) {
+      await pool.query(
+        `UPDATE sheets
+            SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{macros}', $2::jsonb),
+                updated_at = NOW()
+          WHERE id = $1::int`,
+        [sid, JSON.stringify(meta.macros)]
+      );
+    }
     if (meta.activeSheet !== undefined) {
       await pool.query(
         `UPDATE sheets

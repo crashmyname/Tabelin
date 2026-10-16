@@ -1732,6 +1732,7 @@ function renderSheet() {
   renderCharts();
   renderImages();
   renderAllPivots();
+  renderAllControls();
 }
 
 /* Alias — banyak kode lama panggil renderAll() */
@@ -4579,7 +4580,8 @@ async function saveWB(forceFull = false) {
       const metaBody = {
         name: metaToSave.name ? wbName : undefined,
         activeSheet: metaToSave.activeSheet ? activeSheetIdx : undefined,
-        namedRanges: wbData.namedRanges || {}
+        namedRanges: wbData.namedRanges || {},
+        macros: wbData.macros || [] 
       };
 
       // 🎯 Kirim sheetMeta / sheetOrder kalau structure berubah
@@ -4596,7 +4598,8 @@ async function saveWB(forceFull = false) {
             protected: !!s.protected,
             protectHash: s.protectHash || null,
             advancedFilters: s.advancedFilters || [],
-            pivots: s.pivots || []
+            pivots: s.pivots || [],
+            controls: s.controls || []
           };
         });
         metaBody.sheetMeta = sheetMeta;
@@ -4648,7 +4651,8 @@ async function saveWB(forceFull = false) {
                 protected: !!s.protected,
                 protectHash: s.protectHash || null,
                 advancedFilters: s.advancedFilters || [],
-                pivots: s.pivots || []
+                pivots: s.pivots || [],
+                controls: s.controls || []
               };
             });
             body.meta.sheetMeta = sheetMeta;
@@ -4934,6 +4938,7 @@ async function openWB(id) {
   wbData = {
     activeSheet: activeIdx,
     namedRanges: meta.namedRanges || {},
+    macros: meta.macros || [],
     sheets: (meta.sheets || []).map((s, idx) => ({
       name: s.name || `Sheet${idx + 1}`,
       colWidths: s.colWidths || {},
@@ -6707,13 +6712,17 @@ function getCollapsedRowSet() {
 /* =========================================================
    KEYBOARD SHORTCUTS HELP
    ========================================================= */
+/* =========================================================
+   KEYBOARD SHORTCUTS DATA
+   ========================================================= */
 const SHORTCUTS_DATA = [
   {
     category: 'File & Workbook',
     items: [
       { keys: ['Ctrl', 'S'], desc: 'Simpan workbook' },
       { keys: ['Ctrl', 'N'], desc: 'Workbook baru' },
-      { keys: ['Ctrl', 'P'], desc: 'Print' },
+      { keys: ['Ctrl', 'P'], desc: 'Print preview' },
+      { keys: ['Ctrl', 'Shift', 'D'], desc: 'Toggle Dark Mode' },
     ]
   },
   {
@@ -6725,14 +6734,15 @@ const SHORTCUTS_DATA = [
       { keys: ['Ctrl', 'X'], desc: 'Cut' },
       { keys: ['Ctrl', 'V'], desc: 'Paste' },
       { keys: ['Ctrl', 'Shift', 'V'], desc: 'Paste value only' },
-      { keys: ['Delete'], desc: 'Hapus sel' },
-      { keys: ['Backspace'], desc: 'Hapus sel' },
+      { keys: ['Delete'], desc: 'Hapus sel terpilih' },
+      { keys: ['Backspace'], desc: 'Hapus sel terpilih' },
       { keys: ['F2'], desc: 'Edit sel' },
       { keys: ['Enter'], desc: 'Commit & pindah bawah' },
       { keys: ['Shift', 'Enter'], desc: 'Commit & pindah atas' },
       { keys: ['Tab'], desc: 'Commit & pindah kanan' },
       { keys: ['Shift', 'Tab'], desc: 'Commit & pindah kiri' },
-      { keys: ['Alt', 'Enter'], desc: 'Line break dalam cell' },
+      { keys: ['Alt', 'Enter'], desc: 'Line break dalam cell (multi-baris)' },
+      { keys: ['Ctrl', 'Enter'], desc: 'Line break (alternatif Mac)' },
       { keys: ['Escape'], desc: 'Batal edit / tutup dialog' },
     ]
   },
@@ -6743,15 +6753,15 @@ const SHORTCUTS_DATA = [
       { keys: ['↓'], desc: 'Pindah bawah' },
       { keys: ['←'], desc: 'Pindah kiri' },
       { keys: ['→'], desc: 'Pindah kanan' },
-      { keys: ['Ctrl', '↑'], desc: 'Jump ke edge atas' },
-      { keys: ['Ctrl', '↓'], desc: 'Jump ke edge bawah' },
-      { keys: ['Ctrl', '←'], desc: 'Jump ke edge kiri' },
-      { keys: ['Ctrl', '→'], desc: 'Jump ke edge kanan' },
+      { keys: ['Ctrl', '↑'], desc: 'Jump ke edge data atas' },
+      { keys: ['Ctrl', '↓'], desc: 'Jump ke edge data bawah' },
+      { keys: ['Ctrl', '←'], desc: 'Jump ke edge data kiri' },
+      { keys: ['Ctrl', '→'], desc: 'Jump ke edge data kanan' },
       { keys: ['Shift', '↑'], desc: 'Extend selection atas' },
       { keys: ['Shift', '↓'], desc: 'Extend selection bawah' },
       { keys: ['Shift', '←'], desc: 'Extend selection kiri' },
       { keys: ['Shift', '→'], desc: 'Extend selection kanan' },
-      { keys: ['Ctrl', 'G'], desc: 'Go To cell' },
+      { keys: ['Ctrl', 'G'], desc: 'Go To cell / range' },
       { keys: ['Page Up'], desc: 'Scroll halaman naik' },
       { keys: ['Page Down'], desc: 'Scroll halaman turun' },
       { keys: ['Home'], desc: 'Ke awal baris' },
@@ -6770,9 +6780,9 @@ const SHORTCUTS_DATA = [
     category: 'Formula',
     items: [
       { keys: ['='], desc: 'Mulai formula' },
-      { keys: ['F4'], desc: 'Toggle $ absolute ref di formula' },
-      { keys: ['Ctrl', '`'], desc: 'Show formulas / values' },
-      { keys: ['Ctrl', 'Shift', 'V'], desc: 'Paste value only' },
+      { keys: ['F4'], desc: 'Toggle $ absolute ref (di editor formula)' },
+      { keys: ['Ctrl', '`'], desc: 'Show formulas / values (Formula Auditing)' },
+      { keys: ['Ctrl', 'Shift', 'V'], desc: 'Paste value only (rumus → nilai)' },
     ]
   },
   {
@@ -6785,9 +6795,37 @@ const SHORTCUTS_DATA = [
     ]
   },
   {
-    category: 'Insert & Insert',
+    category: 'Insert',
     items: [
       { keys: ['Ctrl', 'K'], desc: 'Insert hyperlink' },
+    ]
+  },
+  {
+    category: 'Sheet',
+    items: [
+      { keys: ['Klik kanan tab'], desc: 'Menu sheet (Duplicate, Rename, Hide, Color, Delete)' },
+      { keys: ['Double-click tab'], desc: 'Rename sheet' },
+      { keys: ['Drag tab'], desc: 'Reorder sheet' },
+      { keys: ['Klik tab +'], desc: 'Tambah sheet baru' },
+    ]
+  },
+  {
+    category: 'Filter',
+    items: [
+      { keys: ['Klik ▼ header'], desc: 'Filter kolom (mode filter aktif)' },
+      { keys: ['Klik kanan header'], desc: 'Hide / Unhide kolom atau baris' },
+      { keys: ['Klik kanan baris'], desc: 'Group / Ungroup baris' },
+    ]
+  },
+  {
+    category: 'Row / Column',
+    items: [
+      { keys: ['Klik + drag'], desc: 'Select range cell' },
+      { keys: ['Shift', 'Klik'], desc: 'Extend selection' },
+      { keys: ['Klik header kolom'], desc: 'Select seluruh kolom' },
+      { keys: ['Klik header baris'], desc: 'Select seluruh baris' },
+      { keys: ['Klik kiri atas'], desc: 'Select semua cell' },
+      { keys: ['Drag sudut kanan bawah'], desc: 'Fill handle (copy / fill series)' },
     ]
   },
   {
@@ -8081,43 +8119,133 @@ function openAuditLog() {
   document.getElementById('audit-filter-addr').value = '';
   document.getElementById('audit-filter-action').value = '';
 
-  loadAuditLog();
+  // Load dari awal
+  loadAuditLog(true);
 }
 
 function closeAuditLog() {
   document.getElementById('modal-audit')?.classList.add('hidden');
+
+  // Detach observer
+  if (_auditState.observer) {
+    _auditState.observer.disconnect();
+    _auditState.observer = null;
+  }
+  _auditState.loaded = [];
+  _auditState.offset = 0;
 }
 
-async function loadAuditLog() {
+/* =========================================================
+   AUDIT LOG — state
+   ========================================================= */
+const AUDIT_PAGE_SIZE = 100;
+const AUDIT_MAX_DOM = 2000;   // batas entries di DOM
+
+let _auditState = {
+  offset: 0,
+  total: 0,
+  loaded: [],        // entries yang sudah di-load
+  loading: false,
+  hasMore: true,
+  filterUser: '',
+  filterAddr: '',
+  filterAction: '',
+  observer: null
+};
+
+/* =========================================================
+   RESET & LOAD AWAL
+   ========================================================= */
+async function loadAuditLog(reset = true) {
   const list = document.getElementById('audit-list');
   const summary = document.getElementById('audit-summary');
   if (!list) return;
 
-  list.innerHTML = '<div class="audit-empty"><i class="fa-solid fa-spinner fa-spin"></i>Memuat…</div>';
+  if (reset) {
+    _auditState.offset = 0;
+    _auditState.loaded = [];
+    _auditState.hasMore = true;
+    _auditState.total = 0;
 
-  const user = document.getElementById('audit-filter-user').value.trim();
-  const addr = document.getElementById('audit-filter-addr').value.trim();
-  const action = document.getElementById('audit-filter-action').value;
+    // Ambil filter terbaru
+    _auditState.filterUser = document.getElementById('audit-filter-user')?.value.trim() || '';
+    _auditState.filterAddr = document.getElementById('audit-filter-addr')?.value.trim() || '';
+    _auditState.filterAction = document.getElementById('audit-filter-action')?.value || '';
 
-  const params = new URLSearchParams({ limit: '200' });
-  if (user) params.set('user', user);
-  if (addr) params.set('addr', addr);
-  if (action) params.set('action', action);
+    list.innerHTML = '<div class="audit-empty"><i class="fa-solid fa-spinner fa-spin"></i>Memuat…</div>';
+
+    // Detach observer lama
+    if (_auditState.observer) {
+      _auditState.observer.disconnect();
+      _auditState.observer = null;
+    }
+  }
+
+  if (_auditState.loading) return;
+  if (!_auditState.hasMore && !reset) return;
+
+  _auditState.loading = true;
+
+  // Show loader di bawah
+  if (!reset) {
+    const loader = document.createElement('div');
+    loader.id = 'audit-loader';
+    loader.className = 'audit-loading-more';
+    loader.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Memuat…';
+    list.appendChild(loader);
+  }
 
   try {
+    const params = new URLSearchParams({
+      limit: String(AUDIT_PAGE_SIZE),
+      offset: String(_auditState.offset)
+    });
+    if (_auditState.filterUser) params.set('user', _auditState.filterUser);
+    if (_auditState.filterAddr) params.set('addr', _auditState.filterAddr);
+    if (_auditState.filterAction) params.set('action', _auditState.filterAction);
+
     const res = await fetch(`/api/sheets/${wbId}/audit-log?${params}`, {
       headers: { 'Authorization': 'Bearer ' + token }
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
 
     const data = await res.json();
-    _auditEntries = data.entries || [];
 
-    if (summary) {
-      summary.textContent = `Menampilkan ${_auditEntries.length} dari ${data.total} entri`;
+    // Update state
+    _auditState.total = data.total || 0;
+    const newEntries = data.entries || [];
+    _auditState.loaded = _auditState.loaded.concat(newEntries);
+    _auditState.offset += newEntries.length;
+
+    if (newEntries.length < AUDIT_PAGE_SIZE) {
+      _auditState.hasMore = false;
     }
 
-    if (!_auditEntries.length) {
+    // Cap DOM — buang entries lama kalau melebihi AUDIT_MAX_DOM
+    let domEntries = _auditState.loaded;
+    if (domEntries.length > AUDIT_MAX_DOM) {
+      domEntries = domEntries.slice(domEntries.length - AUDIT_MAX_DOM);
+    }
+
+    // Update summary
+    if (summary) {
+      const shown = domEntries.length;
+      const totalLoaded = _auditState.loaded.length;
+      summary.innerHTML = `
+        Menampilkan <strong>${shown.toLocaleString('id-ID')}</strong> dari
+        <strong>${_auditState.total.toLocaleString('id-ID')}</strong> entri
+        ${totalLoaded > shown ? `<span style="color:#94a3b8"> (memory: ${totalLoaded.toLocaleString('id-ID')})</span>` : ''}
+      `;
+    }
+
+    if (reset) {
+      list.innerHTML = '';
+    } else {
+      document.getElementById('audit-loader')?.remove();
+    }
+
+    // Render
+    if (domEntries.length === 0) {
       list.innerHTML = `<div class="audit-empty">
         <i class="fa-solid fa-clipboard-list"></i>
         Belum ada riwayat perubahan
@@ -8125,13 +8253,161 @@ async function loadAuditLog() {
       return;
     }
 
-    renderAuditList();
+    // Build HTML untuk semua entries
+    list.innerHTML = domEntries.map((e, idx) => renderAuditEntryHTML(e, idx)).join('');
+
+    // Bind click
+    list.querySelectorAll('.audit-entry').forEach(item => {
+      item.addEventListener('click', () => {
+        handleAuditEntryClick(item);
+      });
+    });
+
+    // Setup infinite scroll (sekali saja)
+    if (reset) {
+      setupAuditInfiniteScroll();
+    }
+
   } catch (e) {
-    list.innerHTML = `<div class="audit-empty" style="color:#dc2626">
-      <i class="fa-solid fa-triangle-exclamation"></i>
-      Gagal memuat: ${escapeHtml(e.message)}
+    console.error('audit-log error:', e);
+    if (reset) {
+      list.innerHTML = `<div class="audit-empty" style="color:#dc2626">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        Gagal memuat: ${escapeHtml(e.message)}
+      </div>`;
+    } else {
+      const loader = document.getElementById('audit-loader');
+      if (loader) {
+        loader.innerHTML = `<span style="color:#dc2626">Gagal memuat lagi. <button class="btn ghost small" onclick="loadAuditLog(false)">Coba lagi</button></span>`;
+      }
+    }
+  } finally {
+    _auditState.loading = false;
+  }
+}
+
+/* =========================================================
+   RENDER SATU ENTRY — jadi HTML string
+   ========================================================= */
+function renderAuditEntryHTML(e, idx) {
+  const iconMap = {
+    create: { icon: 'fa-plus', label: 'Dibuat' },
+    edit:   { icon: 'fa-pen',  label: 'Diubah' },
+    delete: { icon: 'fa-trash', label: 'Dihapus' }
+  };
+  const meta = iconMap[e.action] || iconMap.edit;
+
+  const oldText = formatAuditValue(e.old_value);
+  const newText = formatAuditValue(e.new_value);
+
+  const time = new Date(e.created_at).toLocaleString('id-ID', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+
+  const sheetName = wbData.sheets[e.sheet_idx]?.name || `Sheet${e.sheet_idx + 1}`;
+
+  let valuesHtml = '';
+  if (e.action === 'create') {
+    valuesHtml = `<div class="ae-values"><span class="ae-new">${escapeHtml(newText)}</span></div>`;
+  } else if (e.action === 'delete') {
+    valuesHtml = `<div class="ae-values"><span class="ae-old">${escapeHtml(oldText)}</span></div>`;
+  } else {
+    valuesHtml = `<div class="ae-values">
+      <span class="ae-old">${escapeHtml(oldText)}</span>
+      <span class="ae-arrow">→</span>
+      <span class="ae-new">${escapeHtml(newText)}</span>
     </div>`;
   }
+
+  return `
+    <div class="audit-entry" data-addr="${escapeHtml(e.addr)}" data-sheet="${e.sheet_idx}">
+      <div class="ae-icon ${e.action}">
+        <i class="fa-solid ${meta.icon}"></i>
+      </div>
+      <div class="ae-body">
+        <div class="ae-header">
+          <span class="ae-addr">${escapeHtml(e.addr)}</span>
+          <span style="font-size:11px;color:#94a3b8">·</span>
+          <span class="ae-user">
+            <i class="fa-solid fa-user" style="font-size:10px;margin-right:3px"></i>
+            ${escapeHtml(e.username || 'Unknown')}
+          </span>
+          <span style="font-size:11px;color:#94a3b8">·</span>
+          <span style="font-size:11px;color:#64748b">
+            <i class="fa-solid fa-table" style="font-size:10px;margin-right:3px"></i>
+            ${escapeHtml(sheetName)}
+          </span>
+          <span class="ae-time">${escapeHtml(time)}</span>
+        </div>
+        <div style="font-size:11px;color:#64748b;margin-bottom:2px">
+          ${escapeHtml(meta.label)}
+        </div>
+        ${valuesHtml}
+      </div>
+    </div>
+  `;
+}
+
+function handleAuditEntryClick(item) {
+  const addr = item.dataset.addr;
+  const sheetIdx = parseInt(item.dataset.sheet, 10);
+
+  closeAuditLog();
+
+  if (sheetIdx !== activeSheetIdx) {
+    switchSheet(sheetIdx).then(() => {
+      selectCell(addr);
+      scrollAddrIntoView(addr);
+      flashCell(addr);
+    });
+  } else {
+    selectCell(addr);
+    scrollAddrIntoView(addr);
+    flashCell(addr);
+  }
+}
+
+function flashCell(addr) {
+  const td = findTd(addr);
+  if (td) {
+    td.style.transition = 'all .3s';
+    td.style.boxShadow = '0 0 0 4px rgba(16,185,129,.5)';
+    setTimeout(() => {
+      td.style.boxShadow = '';
+    }, 1500);
+  }
+}
+
+/* =========================================================
+   INFINITE SCROLL — load saat mendekati bawah
+   ========================================================= */
+function setupAuditInfiniteScroll() {
+  const list = document.getElementById('audit-list');
+  if (!list) return;
+
+  // Observer yang trigger load saat scroll 90% dari bawah
+  const sentinel = document.createElement('div');
+  sentinel.id = 'audit-sentinel';
+  sentinel.style.height = '1px';
+  list.appendChild(sentinel);
+
+  _auditState.observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      if (_auditState.loading) return;
+      if (!_auditState.hasMore) return;
+
+      console.log('📥 Load more audit entries, offset:', _auditState.offset);
+      loadAuditLog(false);
+    }
+  }, {
+    root: list,
+    rootMargin: '200px',   // trigger 200px sebelum bawah
+    threshold: 0
+  });
+
+  _auditState.observer.observe(sentinel);
 }
 
 function renderAuditList() {
@@ -8261,11 +8537,11 @@ let _auditTimer = null;
 ['audit-filter-user', 'audit-filter-addr', 'audit-filter-action'].forEach(id => {
   document.getElementById(id)?.addEventListener('input', () => {
     clearTimeout(_auditTimer);
-    _auditTimer = setTimeout(loadAuditLog, 300);
+    _auditTimer = setTimeout(() => loadAuditLog(true), 300);
   });
   document.getElementById(id)?.addEventListener('change', () => {
     clearTimeout(_auditTimer);
-    _auditTimer = setTimeout(loadAuditLog, 100);
+    _auditTimer = setTimeout(() => loadAuditLog(true), 100);
   });
 });
 
@@ -9555,6 +9831,950 @@ document.getElementById('iu-url')?.addEventListener('keydown', e => {
 
 console.log('✅ Import from URL initialized');
 document.getElementById('btn-import-url')?.addEventListener('click', openImportURLModal);
+
+/* =========================================================
+   MACRO / SCRIPT (JS)
+   ========================================================= */
+let _macroState = {
+  editingId: null,        // id macro yang sedang diedit
+  lastRunId: null         // id macro terakhir di-run
+};
+
+function getMacros() {
+  if (!wbData.macros) wbData.macros = [];
+  return wbData.macros;
+}
+
+function getMacroById(id) {
+  return getMacros().find(m => m.id === id);
+}
+
+/* =========================================================
+   OPEN / CLOSE
+   ========================================================= */
+function openMacroModal() {
+  if (!wbId) return toast('Buka workbook dulu');
+
+  const modal = document.getElementById('modal-macros');
+  if (!modal) return;
+
+  modal.classList.remove('hidden');
+
+  // Kalau belum ada macro, buat default blank
+  if (getMacros().length === 0) {
+    createNewMacro(true);
+  } else {
+    const first = getMacros()[0];
+    loadMacroIntoEditor(first.id);
+  }
+
+  renderMacroList();
+  clearMacroLog();
+
+  // Load macro list ke sidebar
+  setTimeout(() => {
+    document.getElementById('macro-code')?.focus();
+  }, 100);
+}
+
+function closeMacroModal() {
+  document.getElementById('modal-macros')?.classList.add('hidden');
+}
+
+/* =========================================================
+   SIDEBAR — render list
+   ========================================================= */
+function renderMacroList() {
+  const list = document.getElementById('macro-list');
+  if (!list) return;
+
+  const macros = getMacros();
+
+  if (!macros.length) {
+    list.innerHTML = `<div class="macro-list-empty">
+      Belum ada macro.<br>Klik <b>Macro Baru</b>.
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = macros.map(m => `
+    <div class="macro-list-item ${m.id === _macroState.editingId ? 'active' : ''}"
+         data-id="${m.id}">
+      <i class="fa-solid fa-code"></i>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${escapeHtml(m.name || 'Untitled')}
+      </span>
+    </div>
+  `).join('');
+
+  list.querySelectorAll('.macro-list-item').forEach(item => {
+    item.addEventListener('click', () => {
+      loadMacroIntoEditor(item.dataset.id);
+      renderMacroList();
+    });
+  });
+}
+
+/* =========================================================
+   EDITOR — load / save / delete / new
+   ========================================================= */
+function loadMacroIntoEditor(id) {
+  const m = getMacroById(id);
+  if (!m) return;
+
+  _macroState.editingId = id;
+
+  const nameEl = document.getElementById('macro-name');
+  const codeEl = document.getElementById('macro-code');
+  if (nameEl) nameEl.value = m.name || '';
+  if (codeEl) codeEl.value = m.code || '';
+}
+
+function createNewMacro(silent = false) {
+  const id = 'macro_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  const newMacro = {
+    id,
+    name: 'Macro Baru ' + (getMacros().length + 1),
+    code: getDefaultMacroCode(),
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+
+  getMacros().push(newMacro);
+  _macroState.editingId = id;
+
+  markMetaDirty('structure');
+  scheduleSave();
+
+  if (!silent) {
+    loadMacroIntoEditor(id);
+    renderMacroList();
+    toast('✔ Macro baru dibuat');
+  }
+
+  return newMacro;
+}
+
+function getDefaultMacroCode() {
+  return `// Macro JavaScript — gunakan API untuk akses sheet
+// Contoh:
+
+api.log('Mulai macro...');
+
+// Baca nilai dari cell
+const val = api.getCell('A1');
+api.log('A1 berisi: ' + val);
+
+// Set nilai ke cell
+api.setCell('B1', 'Hasil: ' + val);
+
+// Contoh loop
+// for (let i = 1; i <= 10; i++) {
+//   api.setCell('A' + i, i * 10);
+// }
+
+api.alert('✔ Macro selesai');
+`;
+}
+
+function saveMacroFromEditor() {
+  const id = _macroState.editingId;
+  const m = getMacroById(id);
+  if (!m) return toast('⚠ Pilih macro dulu');
+
+  const nameEl = document.getElementById('macro-name');
+  const codeEl = document.getElementById('macro-code');
+
+  m.name = (nameEl?.value || 'Untitled').trim() || 'Untitled';
+  m.code = codeEl?.value || '';
+  m.updatedAt = Date.now();
+
+  markMetaDirty('structure');
+  scheduleSave();
+
+  renderMacroList();
+  toast('✔ Macro disimpan');
+}
+
+async function deleteCurrentMacro() {
+  const id = _macroState.editingId;
+  if (!id) return;
+
+  const m = getMacroById(id);
+  if (!m) return;
+
+  if (!(await customConfirm(`Hapus macro "${m.name}"?`, { type: 'danger', okText: 'Hapus' }))) return;
+
+  const macros = getMacros();
+  const idx = macros.findIndex(x => x.id === id);
+  if (idx >= 0) macros.splice(idx, 1);
+
+  markMetaDirty('structure');
+  scheduleSave();
+
+  _macroState.editingId = null;
+  document.getElementById('macro-name').value = '';
+  document.getElementById('macro-code').value = '';
+
+  // Load macro pertama kalau ada
+  if (getMacros().length > 0) {
+    loadMacroIntoEditor(getMacros()[0].id);
+  }
+
+  renderMacroList();
+  toast('✔ Macro dihapus');
+}
+
+/* =========================================================
+   MACRO API — function yang diekspos ke user
+   ========================================================= */
+function buildMacroAPI() {
+  return {
+    /* ============ CELL ACCESS ============ */
+    getCell: (addr) => {
+      if (typeof addr !== 'string') return null;
+      const cl = sheet().cells[addr];
+      if (!cl) return null;
+      if (cl.f && hf) {
+        const p = parseAddr(addr);
+        if (p) {
+          try { return hfGet(p.r, p.c); } catch { return cl.v ?? null; }
+        }
+      }
+      return cl.v ?? null;
+    },
+
+    setCell: (addr, value) => {
+      if (typeof addr !== 'string') return;
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+      commit(addr, String(value));
+    },
+
+    clearCell: (addr) => {
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+      delete sheet().cells[addr];
+      const p = parseAddr(addr);
+      if (p) hfSet(p.r, p.c, null);
+      markCellDirty(addr);
+    },
+
+    getRange: (rangeStr) => {
+      const [s, e] = rangeParts(rangeStr);
+      const p1 = parseAddr(s), p2 = parseAddr(e);
+      if (!p1 || !p2) return [];
+
+      const r0 = Math.min(p1.r, p2.r), r1 = Math.max(p1.r, p2.r);
+      const c0 = Math.min(p1.c, p2.c), c1 = Math.max(p1.c, p2.c);
+
+      const out = [];
+      for (let r = r0; r <= r1; r++) {
+        const row = [];
+        for (let c = c0; c <= c1; c++) {
+          const addr = addrOf(r, c);
+          const cl = sheet().cells[addr];
+          if (cl) {
+            if (cl.f && hf) {
+              try { row.push(hfGet(r, c)); } catch { row.push(cl.v ?? null); }
+            } else {
+              row.push(cl.v ?? null);
+            }
+          } else {
+            row.push(null);
+          }
+        }
+        out.push(row);
+      }
+      return out;
+    },
+
+    setRange: (anchorAddr, data) => {
+      if (!Array.isArray(data)) throw new Error('data harus 2D array');
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+
+      const anchor = parseAddr(anchorAddr);
+      if (!anchor) throw new Error('anchor tidak valid');
+
+      for (let r = 0; r < data.length; r++) {
+        const row = data[r];
+        if (!Array.isArray(row)) continue;
+        for (let c = 0; c < row.length; c++) {
+          const addr = addrOf(anchor.r + r, anchor.c + c);
+          commit(addr, String(row[c] ?? ''));
+        }
+      }
+    },
+
+    /* ============ FORMATTING ============ */
+    formatCell: (addr, style) => {
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+      ensureCell(addr);
+      sheet().cells[addr].s = { ...(sheet().cells[addr].s || {}), ...style };
+      markCellDirty(addr);
+      const td = findTd(addr);
+      if (td) forceRenderCell(td, parseAddr(addr).r, parseAddr(addr).c);
+    },
+
+    clearFormat: (addr) => {
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+      const cl = sheet().cells[addr];
+      if (cl) {
+        delete cl.s;
+        markCellDirty(addr);
+        const td = findTd(addr);
+        if (td) forceRenderCell(td, parseAddr(addr).r, parseAddr(addr).c);
+      }
+    },
+
+    numberFormat: (addr, fmt) => {
+      if (currentAccessMode === 'view') throw new Error('Read-only mode');
+      ensureCell(addr);
+      sheet().cells[addr].s = sheet().cells[addr].s || {};
+      sheet().cells[addr].s.numFmt = fmt;
+      markCellDirty(addr);
+      const td = findTd(addr);
+      if (td) forceRenderCell(td, parseAddr(addr).r, parseAddr(addr).c);
+    },
+
+    /* ============ INFO ============ */
+    activeCell: () => activeCell,
+    selection: () => ({ start: selection.start, end: selection.end }),
+    sheet: () => sheet(),
+    sheetName: () => sheet().name,
+    wbName: () => wbName,
+    rows: () => ROWS,
+    cols: () => COLS,
+
+    getLastRow: (col) => {
+      let maxR = -1;
+      for (const addr of Object.keys(sheet().cells || {})) {
+        const p = parseAddr(addr);
+        if (p && p.c === col && p.r > maxR) maxR = p.r;
+      }
+      return maxR + 1;   // 1-based, 0 = tidak ada
+    },
+
+    /* ============ UTILITY ============ */
+    alert: (msg) => toast(String(msg)),
+
+    log: (...args) => {
+      appendMacroLog(args.map(a => {
+        if (typeof a === 'object') return JSON.stringify(a);
+        return String(a);
+      }).join(' '), 'info');
+    },
+
+    confirm: async (msg) => {
+      return await customConfirm(msg);
+    },
+
+    prompt: async (msg, def) => {
+      return await customPrompt(msg, def || '');
+    },
+
+    sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+
+    markDirty: () => {
+      markMetaDirty('structure');
+      scheduleSave();
+    },
+
+    /* ============ FORM CONTROLS ============ */
+    getControl: (id) => {
+      const ctrls = sheet().controls || [];
+      return ctrls.find(c => c.id === id) || null;
+    },
+
+    setControlValue: (id, val) => {
+      const ctrl = (sheet().controls || []).find(c => c.id === id);
+      if (!ctrl) return;
+      if (ctrl.type === 'checkbox') ctrl.checked = !!val;
+      else if (ctrl.type === 'textbox') ctrl.value = String(val);
+      else if (ctrl.type === 'dropdown') ctrl.selectedIndex = Number(val) || 0;
+      renderAllControls();
+      markMetaDirty('structure');
+      scheduleSave();
+    },
+
+    onControlChange: (id, fn) => {
+      if (!window._controlListeners) window._controlListeners = {};
+      window._controlListeners[id] = fn;
+    },
+  };
+}
+
+/* =========================================================
+   EXECUTOR — jalankan code user
+   ========================================================= */
+async function runCurrentMacro() {
+  const id = _macroState.editingId;
+  const m = getMacroById(id);
+  if (!m) return toast('⚠ Pilih macro dulu');
+
+  // Save dulu sebelum run
+  saveMacroFromEditor();
+
+  const code = m.code || '';
+  if (!code.trim()) return toast('⚠ Macro kosong');
+
+  _macroState.lastRunId = id;
+
+  clearMacroLog();
+  appendMacroLog(`▶ Menjalankan "${m.name}"...`, 'success');
+
+  const api = buildMacroAPI();
+
+  const t0 = performance.now();
+
+  try {
+    // Wrap: user's code dijalankan di dalam async function
+    const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    const fn = new AsyncFunction('api', code);
+
+    // Redirect console.log ke macro log
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalWarn = console.warn;
+
+    console.log = (...args) => {
+      appendMacroLog(args.map(a =>
+        typeof a === 'object' ? JSON.stringify(a) : String(a)
+      ).join(' '), 'info');
+    };
+    console.error = (...args) => {
+      appendMacroLog(args.map(String).join(' '), 'error');
+    };
+    console.warn = (...args) => {
+      appendMacroLog('⚠ ' + args.map(String).join(' '), 'info');
+    };
+
+    try {
+      await fn(api);
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+      console.warn = originalWarn;
+    }
+
+    const elapsed = (performance.now() - t0).toFixed(0);
+    appendMacroLog(`✅ Selesai dalam ${elapsed}ms`, 'success');
+
+  } catch (err) {
+    appendMacroLog(`❌ Error: ${err.message}`, 'error');
+    if (err.stack) {
+      const lines = err.stack.split('\n').slice(0, 3);
+      appendMacroLog(lines.join('\n'), 'error');
+    }
+  }
+}
+
+/* =========================================================
+   OUTPUT LOG
+   ========================================================= */
+function appendMacroLog(msg, type = 'info') {
+  const log = document.getElementById('macro-log');
+  if (!log) return;
+
+  const entry = document.createElement('div');
+  entry.className = 'macro-log-entry ' + type;
+  entry.textContent = msg;
+  log.appendChild(entry);
+
+  // Scroll ke bawah
+  log.scrollTop = log.scrollHeight;
+
+  // Cap DOM — max 500 entries
+  while (log.children.length > 500) {
+    log.removeChild(log.firstChild);
+  }
+}
+
+function clearMacroLog() {
+  const log = document.getElementById('macro-log');
+  if (log) log.innerHTML = '';
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-macro')?.addEventListener('click', openMacroModal);
+document.getElementById('btn-macro-close')?.addEventListener('click', closeMacroModal);
+document.getElementById('modal-macros')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-macros') closeMacroModal();
+});
+
+document.getElementById('btn-macro-new')?.addEventListener('click', () => {
+  createNewMacro(false);
+});
+
+document.getElementById('btn-macro-run')?.addEventListener('click', runCurrentMacro);
+document.getElementById('btn-macro-save')?.addEventListener('click', saveMacroFromEditor);
+document.getElementById('btn-macro-delete')?.addEventListener('click', deleteCurrentMacro);
+
+document.getElementById('btn-macro-clear-log')?.addEventListener('click', clearMacroLog);
+
+// Toggle docs
+document.getElementById('macro-docs-toggle')?.addEventListener('click', () => {
+  document.getElementById('macro-docs')?.classList.toggle('hidden');
+});
+
+// Run last macro
+document.getElementById('btn-macro-run-last')?.addEventListener('click', async () => {
+  if (!_macroState.lastRunId) {
+    return toast('⚠ Belum ada macro yang dijalankan');
+  }
+  const m = getMacroById(_macroState.lastRunId);
+  if (!m) return toast('⚠ Macro tidak ditemukan');
+  _macroState.editingId = m.id;
+  await runCurrentMacro();
+});
+
+// Hotkey: Alt+F8 → Macro Manager
+document.addEventListener('keydown', e => {
+  if (editor) return;
+  if (e.altKey && e.key === 'F8') {
+    e.preventDefault();
+    openMacroModal();
+  }
+}, true);
+
+// Tab behavior di code editor
+document.getElementById('macro-code')?.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const ta = e.target;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    ta.value = ta.value.substring(0, start) + '  ' + ta.value.substring(end);
+    ta.selectionStart = ta.selectionEnd = start + 2;
+  }
+
+  // Ctrl+Enter → Run
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    runCurrentMacro();
+  }
+
+  // Ctrl+S → Save
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveMacroFromEditor();
+  }
+});
+
+console.log('✅ Macro / Script initialized');
+
+/* =========================================================
+   FORM CONTROLS
+   ========================================================= */
+function getControls() {
+  const sh = sheet();
+  if (!sh) return [];
+  if (!Array.isArray(sh.controls)) sh.controls = [];
+  return sh.controls;
+}
+
+function renderAllControls() {
+  // Hapus DOM lama
+  document.querySelectorAll('.form-control').forEach(el => el.remove());
+
+  const wrap = document.getElementById('grid-wrap');
+  if (!wrap) return;
+
+  const controls = getControls();
+  for (const ctrl of controls) {
+    renderControl(ctrl, wrap);
+  }
+}
+
+function renderControl(ctrl, wrap) {
+  const el = document.createElement('div');
+  el.className = 'form-control ' + ctrl.type;
+  el.dataset.ctrlId = ctrl.id;
+  el.style.left = ctrl.x + 'px';
+  el.style.top = ctrl.y + 'px';
+  el.style.width = ctrl.w + 'px';
+  el.style.height = ctrl.h + 'px';
+
+  if (ctrl.type === 'button') {
+    el.innerHTML = `
+      <button class="fc-btn" style="background:${ctrl.bg || '#10b981'}; color:${ctrl.color || '#fff'}; font-size:${ctrl.fontSize || 12}px">
+        ${escapeHtml(ctrl.label || 'Button')}
+      </button>
+      <div class="fc-toolbar">
+        <button data-act="settings" title="Pengaturan"><i class="fa-solid fa-gear"></i></button>
+        <button data-act="del" class="danger" title="Hapus"><i class="fa-solid fa-trash"></i></button>
+      </div>
+      <div class="fc-resize"></div>
+    `;
+  } else if (ctrl.type === 'checkbox') {
+    el.innerHTML = `
+      <div class="fc-checkbox">
+        <input type="checkbox" ${ctrl.checked ? 'checked' : ''} />
+        <span>${escapeHtml(ctrl.label || 'Checkbox')}</span>
+      </div>
+      <div class="fc-toolbar">
+        <button data-act="settings" title="Pengaturan"><i class="fa-solid fa-gear"></i></button>
+        <button data-act="del" class="danger" title="Hapus"><i class="fa-solid fa-trash"></i></button>
+      </div>
+      <div class="fc-resize"></div>
+    `;
+  } else if (ctrl.type === 'textbox') {
+    el.innerHTML = `
+      <input class="fc-textbox" type="text" placeholder="${escapeHtml(ctrl.label || 'Input…')}" value="${escapeHtml(ctrl.value || '')}" />
+      <div class="fc-toolbar">
+        <button data-act="settings" title="Pengaturan"><i class="fa-solid fa-gear"></i></button>
+        <button data-act="del" class="danger" title="Hapus"><i class="fa-solid fa-trash"></i></button>
+      </div>
+      <div class="fc-resize"></div>
+    `;
+  } else if (ctrl.type === 'dropdown') {
+    const opts = (ctrl.options || []).map((o, i) =>
+      `<option value="${i}" ${i === (ctrl.selectedIndex || 0) ? 'selected' : ''}>${escapeHtml(o)}</option>`
+    ).join('');
+    el.innerHTML = `
+      <select class="fc-dropdown">${opts}</select>
+      <div class="fc-toolbar">
+        <button data-act="settings" title="Pengaturan"><i class="fa-solid fa-gear"></i></button>
+        <button data-act="del" class="danger" title="Hapus"><i class="fa-solid fa-trash"></i></button>
+      </div>
+      <div class="fc-resize"></div>
+    `;
+  }
+
+  wrap.appendChild(el);
+
+  makeControlDraggable(el, ctrl);
+  makeControlResizable(el.querySelector('.fc-resize'), el, ctrl);
+  bindControlActions(el, ctrl);
+}
+
+function makeControlDraggable(el, ctrl) {
+  el.addEventListener('mousedown', e => {
+    if (e.target.closest('.fc-toolbar') || e.target.closest('.fc-resize')) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Select
+    document.querySelectorAll('.form-control.selected').forEach(x => x.classList.remove('selected'));
+    el.classList.add('selected');
+
+    const sx = e.clientX, sy = e.clientY, ox = ctrl.x, oy = ctrl.y;
+    const move = ev => {
+      ctrl.x = Math.max(0, ox + ev.clientX - sx);
+      ctrl.y = Math.max(0, oy + ev.clientY - sy);
+      el.style.left = ctrl.x + 'px';
+      el.style.top = ctrl.y + 'px';
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      markMetaDirty('structure');
+      scheduleSave();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+
+function makeControlResizable(handle, el, ctrl) {
+  if (!handle) return;
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    const sx = e.clientX, sy = e.clientY, ow = ctrl.w, oh = ctrl.h;
+    const move = ev => {
+      ctrl.w = Math.max(60, ow + ev.clientX - sx);
+      ctrl.h = Math.max(28, oh + ev.clientY - sy);
+      el.style.width = ctrl.w + 'px';
+      el.style.height = ctrl.h + 'px';
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      markMetaDirty('structure');
+      scheduleSave();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+
+function bindControlActions(el, ctrl) {
+  // Button click
+  const btn = el.querySelector('.fc-btn');
+  if (btn) {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      runControlMacro(ctrl);
+    });
+  }
+
+  // Checkbox change
+  const cb = el.querySelector('.fc-checkbox input');
+  if (cb) {
+    cb.addEventListener('change', e => {
+      ctrl.checked = e.target.checked;
+      // Link ke cell
+      if (ctrl.cellRef) {
+        const addr = ctrl.cellRef.toUpperCase();
+        const tp = parseAddr(addr);
+        if (tp) {
+          commit(addr, ctrl.checked ? 'TRUE' : 'FALSE');
+        }
+      }
+      // Fire listener
+      if (window._controlListeners?.[ctrl.id]) {
+        try { window._controlListeners[ctrl.id](ctrl.checked); } catch {}
+      }
+      markMetaDirty('structure');
+      scheduleSave();
+    });
+  }
+
+  // Textbox input
+  const tb = el.querySelector('.fc-textbox');
+  if (tb) {
+    tb.addEventListener('input', e => {
+      ctrl.value = e.target.value;
+      if (ctrl.cellRef) {
+        const addr = ctrl.cellRef.toUpperCase();
+        commit(addr, ctrl.value);
+      }
+      markMetaDirty('structure');
+      scheduleSave();
+    });
+  }
+
+  // Dropdown change
+  const dd = el.querySelector('.fc-dropdown');
+  if (dd) {
+    dd.addEventListener('change', e => {
+      ctrl.selectedIndex = parseInt(e.target.value, 10);
+      if (ctrl.cellRef) {
+        const addr = ctrl.cellRef.toUpperCase();
+        const val = ctrl.options?.[ctrl.selectedIndex] ?? '';
+        commit(addr, val);
+      }
+      if (window._controlListeners?.[ctrl.id]) {
+        try { window._controlListeners[ctrl.id](ctrl.options?.[ctrl.selectedIndex]); } catch {}
+      }
+      markMetaDirty('structure');
+      scheduleSave();
+    });
+  }
+
+  // Toolbar actions
+  el.querySelector('[data-act="settings"]')?.addEventListener('click', e => {
+    e.stopPropagation();
+    openControlSettings(ctrl);
+  });
+
+  el.querySelector('[data-act="del"]')?.addEventListener('click', async e => {
+    e.stopPropagation();
+    if (!(await customConfirm('Hapus control ini?', { type: 'danger', okText: 'Hapus' }))) return;
+
+    const ctrls = getControls();
+    const idx = ctrls.findIndex(c => c.id === ctrl.id);
+    if (idx >= 0) ctrls.splice(idx, 1);
+
+    markMetaDirty('structure');
+    scheduleSave();
+    renderAllControls();
+    toast('✔ Control dihapus');
+  });
+}
+
+async function runControlMacro(ctrl) {
+  if (!ctrl.macroId) {
+    return toast('⚠ Belum ada macro yang di-assign. Klik ⚙ untuk set.');
+  }
+
+  const m = getMacroById(ctrl.macroId);
+  if (!m) return toast('⚠ Macro tidak ditemukan');
+
+  appendMacroLog(`▶ Run "${m.name}" dari control "${ctrl.label}"`, 'success');
+
+  const api = buildMacroAPI();
+  const t0 = performance.now();
+
+  try {
+    const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    const fn = new AsyncFunction('api', m.code || '');
+
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => appendMacroLog(a.map(String).join(' '), 'info');
+    console.error = (...a) => appendMacroLog(a.map(String).join(' '), 'error');
+
+    try {
+      await fn(api);
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+
+    const elapsed = (performance.now() - t0).toFixed(0);
+    toast(`✔ Macro selesai (${elapsed}ms)`);
+  } catch (err) {
+    console.error('Macro error:', err);
+    toast(`❌ ${err.message}`);
+  }
+}
+
+/* =========================================================
+   INSERT CONTROL
+   ========================================================= */
+function insertControl(type) {
+  if (!wbId) return toast('Buka workbook dulu');
+  if (currentAccessMode === 'view') return toast('👁 Mode lihat saja');
+
+  const defaults = {
+    button:   { w: 140, h: 36, label: 'Klik Saya' },
+    checkbox: { w: 180, h: 32, label: 'Checkbox' },
+    textbox:  { w: 200, h: 32, label: 'Ketik disini…' },
+    dropdown: { w: 180, h: 32, label: 'Dropdown', options: ['Opsi A', 'Opsi B', 'Opsi C'] },
+  };
+
+  const def = defaults[type] || defaults.button;
+
+  const ctrl = {
+    id: 'ctrl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    type,
+    label: def.label,
+    x: 300 + Math.random() * 100,
+    y: 200 + Math.random() * 100,
+    w: def.w,
+    h: def.h,
+    bg: type === 'button' ? '#10b981' : null,
+    color: type === 'button' ? '#ffffff' : null,
+    fontSize: 12,
+    macroId: null,
+    cellRef: null,
+    checked: false,
+    value: '',
+    options: def.options || [],
+    selectedIndex: 0
+  };
+
+  getControls().push(ctrl);
+  markMetaDirty('structure');
+  scheduleSave();
+  renderAllControls();
+  toast(`✔ ${type} ditambahkan`);
+}
+
+/* =========================================================
+   CONTROL SETTINGS MODAL
+   ========================================================= */
+let _editingCtrl = null;
+
+function openControlSettings(ctrl) {
+  _editingCtrl = ctrl;
+
+  const modal = document.getElementById('modal-control-settings');
+  if (!modal) return;
+
+  const titleMap = {
+    button:   'Pengaturan Button',
+    checkbox: 'Pengaturan Checkbox',
+    textbox:  'Pengaturan Input',
+    dropdown: 'Pengaturan Dropdown'
+  };
+
+  document.getElementById('cs-title').textContent = titleMap[ctrl.type] || 'Pengaturan Control';
+  document.getElementById('cs-label').value = ctrl.label || '';
+  document.getElementById('cs-bg').value = ctrl.bg || '#10b981';
+  document.getElementById('cs-color').value = ctrl.color || '#ffffff';
+  document.getElementById('cs-cell').value = ctrl.cellRef || '';
+
+  // Populate macro dropdown
+  const sel = document.getElementById('cs-macro');
+  const macros = getMacros();
+  sel.innerHTML = '<option value="">— Tidak ada —</option>' +
+    macros.map(m => `<option value="${m.id}" ${m.id === ctrl.macroId ? 'selected' : ''}>${escapeHtml(m.name)}</option>`).join('');
+
+  // Hide color fields untuk checkbox/textbox/dropdown
+  const colorWrap = document.getElementById('cs-bg').parentElement.parentElement;
+  const colorWrap2 = document.getElementById('cs-color').parentElement;
+  const showColor = ctrl.type === 'button';
+  document.getElementById('cs-bg').parentElement.style.display = showColor ? '' : 'none';
+  colorWrap2.style.display = showColor ? '' : 'none';
+
+  // Options editor untuk dropdown
+  let optsWrap = document.getElementById('cs-options-wrap');
+  if (ctrl.type === 'dropdown') {
+    if (!optsWrap) {
+      optsWrap = document.createElement('div');
+      optsWrap.id = 'cs-options-wrap';
+      optsWrap.className = 'modal-label';
+      optsWrap.innerHTML = `
+        <span>Opsi Dropdown (1 per baris)</span>
+        <textarea id="cs-options" rows="4" style="width:100%;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:9px;font-family:inherit;font-size:13px;outline:none;resize:vertical"></textarea>
+      `;
+      document.getElementById('cs-cell').parentElement.parentElement.insertBefore(
+        optsWrap, document.getElementById('cs-cell').parentElement
+      );
+    }
+    optsWrap.style.display = '';
+    document.getElementById('cs-options').value = (ctrl.options || []).join('\n');
+  } else if (optsWrap) {
+    optsWrap.style.display = 'none';
+  }
+
+  modal.classList.remove('hidden');
+  setTimeout(() => document.getElementById('cs-label').focus(), 50);
+}
+
+function closeControlSettings() {
+  document.getElementById('modal-control-settings')?.classList.add('hidden');
+  _editingCtrl = null;
+}
+
+function applyControlSettings() {
+  if (!_editingCtrl) return;
+
+  _editingCtrl.label = document.getElementById('cs-label').value.trim() || 'Untitled';
+  _editingCtrl.bg = document.getElementById('cs-bg').value;
+  _editingCtrl.color = document.getElementById('cs-color').value;
+  _editingCtrl.macroId = document.getElementById('cs-macro').value || null;
+  _editingCtrl.cellRef = document.getElementById('cs-cell').value.trim().toUpperCase() || null;
+
+  if (_editingCtrl.type === 'dropdown') {
+    const raw = document.getElementById('cs-options')?.value || '';
+    _editingCtrl.options = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  }
+
+  markMetaDirty('structure');
+  scheduleSave();
+  renderAllControls();
+  closeControlSettings();
+  toast('✔ Pengaturan diterapkan');
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-ctrl-button')?.addEventListener('click', () => insertControl('button'));
+document.getElementById('btn-ctrl-checkbox')?.addEventListener('click', () => insertControl('checkbox'));
+document.getElementById('btn-ctrl-textbox')?.addEventListener('click', () => insertControl('textbox'));
+document.getElementById('btn-ctrl-dropdown')?.addEventListener('click', () => insertControl('dropdown'));
+
+document.getElementById('btn-cs-cancel')?.addEventListener('click', closeControlSettings);
+document.getElementById('btn-cs-apply')?.addEventListener('click', applyControlSettings);
+document.getElementById('modal-control-settings')?.addEventListener('click', e => {
+  if (e.target.id === 'modal-control-settings') closeControlSettings();
+});
+
+// Deselect saat klik luar
+document.addEventListener('mousedown', e => {
+  if (!e.target.closest('.form-control')) {
+    document.querySelectorAll('.form-control.selected').forEach(x => x.classList.remove('selected'));
+  }
+});
+
+console.log('✅ Form Controls initialized');
 
 /* =========================================================
    INIT — dengan safety net biar UI tetap jalan
