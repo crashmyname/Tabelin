@@ -10777,6 +10777,1029 @@ document.addEventListener('mousedown', e => {
 console.log('✅ Form Controls initialized');
 
 /* =========================================================
+   EXCEL DIRECT MODE
+   ========================================================= */
+let _excelDirect = {
+  active: false,
+  filename: '',
+  workbook: null,
+  dirty: false,
+  sharedBase: null,
+  sharedPath: null,
+  sharedMtime: null
+};
+
+let _excelDirectFileHandle = null;
+let _savingToFile = false;   // 🎯 guard untuk prevent concurrent save
+
+/* =========================================================
+   OPEN — pakai File System Access API (Chrome/Edge)
+   ========================================================= */
+async function openExcelDirectPicker() {
+  if (window.showOpenFilePicker) {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{
+          description: 'Excel File',
+          accept: {
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+            'application/vnd.ms-excel': ['.xls']
+          }
+        }],
+        multiple: false
+      });
+
+      _excelDirectFileHandle = handle;
+      const file = await handle.getFile();
+      await handleExcelDirectFile(file);
+      return;
+
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      console.warn('showOpenFilePicker failed, fallback:', e);
+    }
+  }
+
+  console.log('ℹ Browser tidak support File System Access API — auto-save OFF, hanya Ctrl+S / Download');
+  _excelDirectFileHandle = null;
+  document.getElementById('excel-direct-input')?.click();
+}
+
+/* =========================================================
+   LOAD FILE → parse → tampil di grid
+   ========================================================= */
+async function handleExcelDirectFile(file) {
+  if (!file) return;
+  if (!/\.(xlsx|xls)$/i.test(file.name)) {
+    return toast('⚠ Hanya file .xlsx atau .xls');
+  }
+
+  showLoading(`Membuka ${file.name}…`);
+  await yieldToUI();
+
+  try {
+    const buffer = await file.arrayBuffer();
+    const ExcelJS = window.ExcelJS;
+    if (!ExcelJS) {
+      hideLoading();
+      return toast('⚠ Library ExcelJS tidak ter-load');
+    }
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+
+    const allSheets = [];
+
+    wb.eachSheet((ws, sheetIdx) => {
+      const cells = {};
+      const merged = [];
+      const colWidths = {};
+      const rowHeights = {};
+
+      ws.eachRow({ includeEmpty: false }, (row, rowNum) => {
+        if (row.height && row.height !== 15) {
+          rowHeights[rowNum - 1] = Math.round(row.height * 1.33);
+        }
+
+        row.eachCell({ includeEmpty: false }, (cell, colNum) => {
+          const addr = colLetter(colNum) + rowNum;
+          const v = cell.value;
+          if (v === null || v === undefined || v === '') return;
+
+          const obj = {};
+
+          if (v && typeof v === 'object') {
+            if (v.formula) {
+              obj.f = '=' + v.formula;
+              if (v.result !== undefined) obj.v = v.result;
+            } else if (v.richText) {
+              obj.v = v.richText.map(r => r.text).join('');
+            } else if (v.hyperlink) {
+              obj.v = v.text || v.hyperlink;
+              obj.link = { url: v.hyperlink, text: v.text || v.hyperlink };
+            } else if (v.result !== undefined) {
+              obj.v = v.result;
+            } else {
+              obj.v = String(v);
+            }
+          } else if (v instanceof Date) {
+            obj.v = v.getTime();
+          } else {
+            obj.v = v;
+          }
+
+          const s = {};
+          if (cell.font) {
+            if (cell.font.bold) s.bold = true;
+            if (cell.font.italic) s.italic = true;
+            if (cell.font.underline) s.underline = true;
+            if (cell.font.strike) s.strike = true;
+            if (cell.font.name) s.fontFamily = cell.font.name;
+            if (cell.font.size) s.fontSize = cell.font.size;
+            if (cell.font.color?.argb) {
+              const hex = cell.font.color.argb.slice(-6);
+              if (hex.toUpperCase() !== '000000') s.color = '#' + hex;
+            }
+          }
+          if (cell.fill?.fgColor?.argb) {
+            const hex = cell.fill.fgColor.argb.slice(-6);
+            if (hex.toUpperCase() !== 'FFFFFF') s.bg = '#' + hex;
+          }
+          if (cell.alignment?.horizontal) s.align = cell.alignment.horizontal;
+          if (cell.alignment?.wrapText) s.wrap = true;
+
+          if (Object.keys(s).length) obj.s = s;
+          cells[addr] = obj;
+        });
+      });
+
+      const merges = ws.model?.merges || [];
+      for (const m of merges) {
+        if (typeof m === 'string' && m.includes(':')) merged.push(m);
+      }
+
+      if (ws.columns) {
+        ws.columns.forEach((col, idx) => {
+          if (col.width) colWidths[idx] = Math.round(col.width * 7.5);
+        });
+      }
+
+      allSheets.push({
+        name: ws.name,
+        cells,
+        colWidths,
+        rowHeight: 26,
+        rowHeights,
+        cf: [], charts: [], merged, filters: {},
+        images: [], validations: [],
+        hidden: ws.state === 'hidden',
+        tabColor: null,
+        rowGroups: [],
+        protected: false, protectHash: null,
+        freezeRow: 0, freezeCol: 0,
+        pivots: [], advancedFilters: [], controls: []
+      });
+    });
+
+    if (!allSheets.length) {
+      hideLoading();
+      return toast('⚠ File tidak punya sheet');
+    }
+
+    _excelDirect.active = true;
+    _excelDirect.filename = file.name;
+    _excelDirect.workbook = wb;
+    _excelDirect.dirty = false;
+
+    document.body.classList.add('excel-direct-mode');
+    const badge = document.getElementById('excel-mode-badge');
+    if (badge) badge.title = file.name;
+
+    wbData = {
+      activeSheet: 0,
+      namedRanges: {},
+      macros: [],
+      sheets: allSheets
+    };
+
+    activeSheetIdx = 0;
+    loadedSheetIdxs = new Set(allSheets.map((_, i) => i));
+    wbId = null;
+    wbName = file.name.replace(/\.xlsx?$/i, '');
+    document.getElementById('wb-name').value = wbName;
+
+    document.getElementById('home-screen').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+
+    try { resetHF(); } catch (e) { console.warn(e); }
+    await recalcRowsLimit(true);
+
+    renderSheetTabs();
+    const gridWrapEl = document.getElementById('grid-wrap');
+    if (gridWrapEl) gridWrapEl.scrollTop = 0;
+    forceRefreshGrid();
+    selectCell('A1');
+
+    hideLoading();
+
+    if (window.showOpenFilePicker) {
+      toast(`✔ ${file.name} dibuka — auto-save aktif (setiap 3 detik)`);
+    } else {
+      toast(`✔ ${file.name} dibuka — Ctrl+S untuk download`);
+    }
+
+    console.log('📂 Excel Direct opened:', file.name, allSheets.length, 'sheets',
+                '| auto-save:', !!window.showOpenFilePicker);
+
+  } catch (e) {
+    hideLoading();
+    console.error('Open Excel Direct failed:', e);
+    toast('⚠ Gagal buka file: ' + e.message);
+  }
+}
+
+/* Helper col number → letter */
+function colLetter(n) {
+  let s = '';
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/* =========================================================
+   BUILD EXCEL BUFFER
+   ========================================================= */
+async function buildExcelBuffer() {
+  const ExcelJS = window.ExcelJS;
+  if (!ExcelJS) throw new Error('ExcelJS tidak ter-load');
+
+  const wb = new ExcelJS.Workbook();
+
+  wbData.sheets.forEach(s => {
+    const ws = wb.addWorksheet(s.name || 'Sheet');
+
+    if (s.colWidths) {
+      Object.entries(s.colWidths).forEach(([i, w]) => {
+        ws.getColumn(+i + 1).width = Math.max(8, (w - 5) / 7.5);
+      });
+    }
+
+    Object.entries(s.cells || {}).forEach(([addr, cl]) => {
+      const m = /^([A-Z]+)(\d+)$/.exec(addr);
+      if (!m) return;
+
+      const excelCell = ws.getCell(addr);
+
+      if (cl.f) {
+        try {
+          const formula = cl.f.slice(1);
+          const p = parseAddr(addr);
+          let result = cl.v;
+          if (result === undefined && hf && p) {
+            try {
+              const maxR = hf.__maxR || ROWS;
+              const maxC = hf.__maxC || COLS;
+              if (p.r < maxR && p.c < maxC) {
+                result = hf.getCellValue({ sheet: 0, row: p.r, col: p.c });
+              }
+            } catch {}
+          }
+          excelCell.value = { formula, result: result ?? '' };
+        } catch { excelCell.value = cl.f; }
+      } else if (cl.v !== undefined && cl.v !== null) {
+        excelCell.value = cl.v;
+      }
+
+      if (cl.s) {
+        const s = cl.s;
+        if (s.bold || s.italic || s.underline || s.color || s.fontFamily || s.fontSize) {
+          excelCell.font = {
+            bold: !!s.bold, italic: !!s.italic, underline: !!s.underline,
+            name: s.fontFamily || 'Calibri',
+            size: s.fontSize || 11,
+            color: s.color ? { argb: 'FF' + s.color.replace('#', '').toUpperCase() } : undefined
+          };
+        }
+        if (s.bg) {
+          excelCell.fill = {
+            type: 'pattern', pattern: 'solid',
+            fgColor: { argb: 'FF' + s.bg.replace('#', '').toUpperCase() }
+          };
+        }
+        if (s.align) excelCell.alignment = { horizontal: s.align, wrapText: !!s.wrap };
+        if (s.numFmt) {
+          const fmtMap = {
+            number: '#,##0', currency: '"Rp"#,##0',
+            percent: '0.00%', date: 'dd/mm/yyyy'
+          };
+          if (fmtMap[s.numFmt]) excelCell.numFmt = fmtMap[s.numFmt];
+        }
+      }
+    });
+
+    (s.merged || []).forEach(range => {
+      try { ws.mergeCells(range); } catch {}
+    });
+  });
+
+  return await wb.xlsx.writeBuffer();
+}
+
+/* =========================================================
+   DOWNLOAD EXCEL — fallback Firefox/Safari, atau klik Download
+   ========================================================= */
+async function downloadExcelDirect() {
+  if (!_excelDirect.active) return toast('⚠ Bukan mode Excel Direct');
+
+  showLoading('Menyiapkan file…');
+  await yieldToUI();
+
+  try {
+    const buffer = await buildExcelBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = _excelDirect.filename.replace(/\.xlsx?$/i, '') + '_edited.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+
+    _excelDirect.dirty = false;
+    updateExcelDirectBadge();
+    hideLoading();
+    toast('✔ File di-download (file asli tidak berubah)');
+  } catch (e) {
+    hideLoading();
+    console.error('Download Excel failed:', e);
+    toast('⚠ Gagal download: ' + e.message);
+  }
+}
+
+/* =========================================================
+   🎯 SAVE KE FILE — SILENT (tanpa full-screen loading)
+   Dipakai untuk auto-save (scheduleSave) & Ctrl+S
+   ========================================================= */
+async function saveToSameFile(silent = true) {
+  if (!_excelDirect.active) return;
+
+  if (_savingToFile) {
+    console.log('⏭ Save already in progress, skip');
+    return;
+  }
+
+  // 🎯 SHARING PATH — pakai endpoint backend
+  if (_excelDirect.sharedPath) {
+    _savingToFile = true;
+    const statusEl = document.getElementById('save-status');
+    if (statusEl) statusEl.textContent = '⟳ menyimpan…';
+
+    try {
+      const buffer = await buildExcelBuffer();
+
+      const params = new URLSearchParams();
+      if (_excelDirect.sharedBase) params.set('base', _excelDirect.sharedBase);
+      params.set('path', _excelDirect.sharedPath);
+      const res = await fetch(
+        `/api/shared-folder/file?${params.toString()}`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + token,
+            'Content-Type': 'application/octet-stream',
+            'X-Expected-Mtime': _excelDirect.sharedMtime || ''
+          },
+          body: buffer
+        }
+      );
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'HTTP ' + res.status);
+      }
+
+      const data = await res.json();
+      _excelDirect.sharedMtime = data.mtime;
+      _excelDirect.dirty = false;
+      updateExcelDirectBadge();
+
+      if (statusEl) {
+        statusEl.textContent = '✔ tersimpan';
+        setTimeout(() => {
+          if (statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+        }, 1500);
+      }
+      console.log('💾 Saved to shared:', _excelDirect.sharedPath);
+
+    } catch (e) {
+      if (statusEl) {
+        statusEl.textContent = '⚠ gagal simpan';
+        setTimeout(() => {
+          if (statusEl.textContent === '⚠ gagal simpan') statusEl.textContent = '';
+        }, 3000);
+      }
+      console.error('Save to shared failed:', e);
+      if (!silent) toast('⚠ Gagal simpan: ' + e.message);
+    } finally {
+      _savingToFile = false;
+    }
+    return;
+  }
+
+  // 🎯 LOCAL FILE — pakai File System Access API (existing)
+  if (!_excelDirectFileHandle) {
+    if (!silent) return downloadExcelDirect();
+    return;
+  }
+
+  if (!_excelDirect.dirty) return;
+
+  _savingToFile = true;
+
+  const statusEl = document.getElementById('save-status');
+  if (statusEl) statusEl.textContent = '⟳ menyimpan…';
+
+  try {
+    const buffer = await buildExcelBuffer();
+
+    let permission = 'granted';
+    if (_excelDirectFileHandle.queryPermission) {
+      permission = await _excelDirectFileHandle.queryPermission({ mode: 'readwrite' });
+    }
+
+    if (permission !== 'granted' && !silent) {
+      if (_excelDirectFileHandle.requestPermission) {
+        permission = await _excelDirectFileHandle.requestPermission({ mode: 'readwrite' });
+      }
+    }
+
+    if (permission !== 'granted') {
+      if (statusEl) statusEl.textContent = '⚠ izin ditolak';
+      setTimeout(() => { if (statusEl?.textContent === '⚠ izin ditolak') statusEl.textContent = ''; }, 2000);
+      if (!silent) toast('⚠ Izin menulis ditolak');
+      return;
+    }
+
+    const writable = await _excelDirectFileHandle.createWritable();
+    await writable.write(buffer);
+    await writable.close();
+
+    _excelDirect.dirty = false;
+    updateExcelDirectBadge();
+
+    if (statusEl) {
+      statusEl.textContent = '✔ tersimpan';
+      setTimeout(() => {
+        if (statusEl.textContent === '✔ tersimpan') statusEl.textContent = '';
+      }, 1500);
+    }
+
+  } catch (e) {
+    if (statusEl) {
+      statusEl.textContent = '⚠ gagal simpan';
+      setTimeout(() => {
+        if (statusEl.textContent === '⚠ gagal simpan') statusEl.textContent = '';
+      }, 3000);
+    }
+    console.error('Save to file failed:', e);
+    if (!silent) toast('⚠ Gagal simpan: ' + e.message);
+  } finally {
+    _savingToFile = false;
+  }
+}
+
+/* =========================================================
+   BADGE
+   ========================================================= */
+function updateExcelDirectBadge() {
+  if (!_excelDirect.active) return;
+  const badge = document.getElementById('excel-unsaved-badge');
+  if (!badge) return;
+  if (_excelDirect.dirty) badge.classList.add('show');
+  else badge.classList.remove('show');
+}
+
+/* Hook markCellDirty */
+const _origMarkCellDirtyED = markCellDirty;
+markCellDirty = function(addr) {
+  _origMarkCellDirtyED(addr);
+  if (_excelDirect.active) {
+    _excelDirect.dirty = true;
+    updateExcelDirectBadge();
+  }
+};
+
+/* =========================================================
+   🎯 OVERRIDE saveWB — auto-save silent di Excel Direct mode
+   scheduleSave() tetap jalan normal (3 detik debounce)
+   ========================================================= */
+const _origSaveWB_ED = saveWB;
+saveWB = async function(forceFull = false) {
+  if (_excelDirect.active) {
+    // Chrome/Edge: silent save (no full-screen loading)
+    // Firefox/Safari: skip (biar tidak spam download)
+    await saveToSameFile(true);
+    return;
+  }
+  return _origSaveWB_ED(forceFull);
+};
+
+/* =========================================================
+   🎯 CTRL+S — explicit save (tampilkan toast)
+   ========================================================= */
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  if (e.key.toLowerCase() !== 's') return;
+  if (!_excelDirect.active) return;
+  if (editor) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  console.log('⌨ Ctrl+S → explicit save');
+  // silent=false: kalau Firefox, fallback ke download dengan loading
+  saveToSameFile(false);
+}, true);
+
+/* =========================================================
+   EXIT MODE
+   ========================================================= */
+function exitExcelDirectMode() {
+  if (!_excelDirect.active) return true;
+  if (_excelDirect.dirty) {
+    if (!confirm('Ada perubahan belum disimpan. Yakin keluar?')) return false;
+  }
+  _excelDirect.active = false;
+  _excelDirect.filename = '';
+  _excelDirect.workbook = null;
+  _excelDirect.dirty = false;
+  _excelDirect.sharedBase = null;
+  _excelDirect.sharedPath = null;
+  _excelDirect.sharedMtime = null;
+  _excelDirectFileHandle = null;
+  _savingToFile = false;
+  document.body.classList.remove('excel-direct-mode');
+  document.getElementById('excel-unsaved-badge')?.classList.remove('show');
+  return true;
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('excel-direct-input')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (file) await handleExcelDirectFile(file);
+});
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-action="open-excel"]');
+  if (btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('file-dropdown')?.classList.add('hidden');
+    openExcelDirectPicker();
+    return;
+  }
+
+  const btn2 = e.target.closest('[data-action="save-excel"]');
+  if (btn2) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('file-dropdown')?.classList.add('hidden');
+
+    if (_excelDirect.active) {
+      // explicit save — pakai silent=false biar Firefox fallback download
+      saveToSameFile(false);
+    } else {
+      toast('⚠ Buka file Excel dulu (File → Buka File Excel Direct)');
+    }
+    return;
+  }
+}, true);
+
+/* Override showHome — exit mode dulu */
+const _origShowHome_ED = showHome;
+showHome = async function() {
+  if (_excelDirect.active && !exitExcelDirectMode()) return;
+  return _origShowHome_ED();
+};
+
+/* Warning sebelum close tab */
+window.addEventListener('beforeunload', (e) => {
+  if (_excelDirect.active && _excelDirect.dirty) {
+    e.preventDefault();
+    e.returnValue = 'Ada perubahan belum disimpan. Yakin keluar?';
+    return e.returnValue;
+  }
+});
+
+console.log('✅ Excel Direct Mode initialized (auto-save silent, Ctrl+S explicit)');
+
+/* =========================================================
+   SHARED FOLDER BROWSER
+   ========================================================= */
+let _sharedState = {
+  base: '\\\\ISE-IRPTR-01\\Document_IReporter\\',   // 🎯 base UNC aktif
+  currentPath: '',
+  items: [],
+  selectedItem: null,
+  lastModified: null
+};
+
+function openSharedFolder() {
+  const modal = document.getElementById('modal-shared');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  _sharedState.currentPath = '';
+  _sharedState.selectedItem = null;
+
+  const input = document.getElementById('shared-path-input');
+  if (input) input.value = _sharedState.base;
+
+  loadSharedFolder('');
+}
+
+function closeSharedFolder() {
+  document.getElementById('modal-shared')?.classList.add('hidden');
+}
+
+/* 🎯 Baca input path — kalau UNC/drive, set sebagai base baru */
+function applyBrowseInput() {
+  const input = document.getElementById('shared-path-input');
+  const statusEl = document.getElementById('shared-status');
+  if (!input) return;
+
+  const raw = input.value.trim();
+  if (!raw) {
+    if (statusEl) statusEl.textContent = '⚠ Path kosong';
+    return;
+  }
+
+  const isFullPath = /^\\\\[^\\]+\\[^\\]+/.test(raw) || /^[A-Za-z]:[\\\/]/.test(raw);
+
+  if (isFullPath) {
+    // Full UNC / drive → jadi base baru
+    let base = raw.replace(/\//g, '\\');
+    if (!base.endsWith('\\')) base += '\\';
+    _sharedState.base = base;
+    _sharedState.currentPath = '';
+    input.value = base;
+    if (statusEl) statusEl.textContent = '📂 Membuka ' + base;
+    loadSharedFolder('');
+  } else {
+    // Relative → tetap pakai base yang sekarang
+    _sharedState.currentPath = raw.replace(/^[\\\/]+/, '');
+    loadSharedFolder(_sharedState.currentPath);
+  }
+}
+
+async function loadSharedFolder(relPath) {
+  const list = document.getElementById('shared-list');
+  const breadcrumb = document.getElementById('shared-breadcrumb');
+  if (!list) return;
+
+  list.innerHTML = '<div class="shared-empty"><i class="fa-solid fa-spinner fa-spin"></i>Memuat…</div>';
+
+  try {
+    const params = new URLSearchParams();
+    params.set('base', _sharedState.base);
+    if (relPath) params.set('path', relPath);
+    const url = `/api/shared-folder/list?${params.toString()}`;
+
+    const res = await fetch(url, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'HTTP ' + res.status);
+    }
+
+    const data = await res.json();
+    _sharedState.currentPath = relPath || '';
+    _sharedState.items = data.items || [];
+
+    // Update breadcrumb
+    if (breadcrumb) {
+      const suffix = (relPath || '').replace(/\//g, '\\');
+      breadcrumb.textContent = _sharedState.base + suffix;
+    }
+
+    // Reset selection
+    _sharedState.selectedItem = null;
+    const _openBtn = document.getElementById('btn-shared-open-file');
+    if (_openBtn) _openBtn.disabled = true;
+
+    if (!_sharedState.items.length) {
+      list.innerHTML = `<div class="shared-empty">
+        <i class="fa-solid fa-folder-open"></i>
+        Folder kosong
+      </div>`;
+      return;
+    }
+
+    // Render items
+    list.innerHTML = _sharedState.items.map(item => {
+      const isExcel = /\.(xlsx|xls|csv)$/i.test(item.name);
+      const sizeStr = item.isDir ? '' : formatFileSize(item.size);
+      const dateStr = item.mtime ? new Date(item.mtime).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' }) : '';
+      const extClass = isExcel ? '' : 'other';
+      const icon = item.isDir ? 'fa-folder' : (isExcel ? 'fa-file-excel' : 'fa-file');
+
+      return `
+        <div class="shared-item ${item.isDir ? 'dir' : 'file'}"
+             data-name="${escapeHtml(item.name)}"
+             data-isdir="${item.isDir}"
+             data-size="${item.size}"
+             data-mtime="${item.mtime || ''}">
+          <div class="si-icon ${extClass}">
+            <i class="fa-solid ${icon}"></i>
+          </div>
+          <div class="si-body">
+            <div class="si-name">${escapeHtml(item.name)}</div>
+            <div class="si-meta">${[sizeStr, dateStr].filter(Boolean).join(' · ')}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    // Bind item click
+    list.querySelectorAll('.shared-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const name = el.dataset.name;
+        const isDir = el.dataset.isdir === 'true';
+
+        if (isDir) {
+          // Double-click untuk buka folder
+          if (el._clickTimer) {
+            clearTimeout(el._clickTimer);
+            const newPath = _sharedState.currentPath
+              ? _sharedState.currentPath + '/' + name
+              : name;
+            loadSharedFolder(newPath);
+          } else {
+            el._clickTimer = setTimeout(() => {
+              el._clickTimer = null;
+            }, 250);
+          }
+        } else {
+          // File: select
+          list.querySelectorAll('.shared-item').forEach(x => x.classList.remove('selected'));
+          el.classList.add('selected');
+          _sharedState.selectedItem = {
+            name,
+            size: parseInt(el.dataset.size, 10),
+            mtime: el.dataset.mtime
+          };
+          const _openBtn = document.getElementById('btn-shared-open-file');
+          if (_openBtn) _openBtn.disabled = false;
+
+          // Double-click untuk langsung buka
+          if (el._clickTimer) {
+            clearTimeout(el._clickTimer);
+            el._clickTimer = null;
+            openSharedFile();
+          } else {
+            el._clickTimer = setTimeout(() => {
+              el._clickTimer = null;
+            }, 250);
+          }
+        }
+      });
+    });
+
+    // Tombol "Naik folder" kalau bukan root
+    if (relPath) {
+      const upBtn = document.createElement('button');
+      upBtn.className = 'shared-up-btn';
+      upBtn.style.marginBottom = '10px';
+      upBtn.innerHTML = '<i class="fa-solid fa-arrow-up"></i> Naik ke folder induk';
+      upBtn.addEventListener('click', () => {
+        const parts = _sharedState.currentPath.split('/');
+        parts.pop();
+        loadSharedFolder(parts.join('/'));
+      });
+      list.insertBefore(upBtn, list.firstChild);
+    }
+
+  } catch (e) {
+    list.innerHTML = `<div class="shared-empty" style="color:#dc2626">
+      <i class="fa-solid fa-triangle-exclamation"></i>
+      Gagal memuat: ${escapeHtml(e.message)}
+    </div>`;
+  }
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+/* =========================================================
+   🎯 BUKA FILE DARI SHARING → pakai Excel Direct mode
+   ========================================================= */
+async function openSharedFile() {
+  if (!_sharedState.selectedItem) return toast('⚠ Pilih file dulu');
+
+  const item = _sharedState.selectedItem;
+  const fullPath = _sharedState.currentPath
+    ? _sharedState.currentPath + '/' + item.name
+    : item.name;
+
+  closeSharedFolder();
+
+  showLoading(`Membuka ${item.name}…`);
+  await yieldToUI();
+
+  try {
+    const params = new URLSearchParams();
+    params.set('base', _sharedState.base);
+    params.set('path', fullPath);
+    const res = await fetch(`/api/shared-folder/file?${params.toString()}`, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'HTTP ' + res.status);
+    }
+
+    const buffer = await res.arrayBuffer();
+    const mtime = res.headers.get('X-Last-Modified') || item.mtime;
+
+    // 🎯 Set state Excel Direct SEBELUM parse
+    _excelDirect.active = true;
+    _excelDirect.filename = item.name;
+    _excelDirect.workbook = null;
+    _excelDirect.dirty = false;
+    _excelDirectFileHandle = null;   // tidak pakai File System Access API
+
+    // Simpan path UNC untuk save balik
+    _excelDirect.sharedBase = _sharedState.base;
+    _excelDirect.sharedPath = fullPath;
+    _excelDirect.sharedMtime = mtime;
+
+    // Parse via ExcelJS (reuse handleExcelDirectFile logic)
+    await handleExcelDirectFileFromBuffer(buffer, item.name, mtime);
+
+    // Update badge title
+    const badge = document.getElementById('excel-mode-badge');
+    if (badge) badge.title = `Sharing: ${_sharedState.base}${fullPath}`;
+
+    hideLoading();
+    toast(`✔ ${item.name} dibuka dari sharing`);
+
+  } catch (e) {
+    hideLoading();
+    console.error('Open shared file failed:', e);
+    toast('⚠ Gagal buka: ' + e.message);
+    _excelDirect.active = false;
+  }
+}
+
+/* Wrapper: parse dari buffer (bukan File object) */
+async function handleExcelDirectFileFromBuffer(buffer, filename, mtime) {
+  const ExcelJS = window.ExcelJS;
+  if (!ExcelJS) throw new Error('ExcelJS tidak ter-load');
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+
+  const allSheets = [];
+
+  wb.eachSheet((ws, sheetIdx) => {
+    const cells = {};
+    const merged = [];
+    const colWidths = {};
+    const rowHeights = {};
+
+    ws.eachRow({ includeEmpty: false }, (row, rowNum) => {
+      if (row.height && row.height !== 15) {
+        rowHeights[rowNum - 1] = Math.round(row.height * 1.33);
+      }
+
+      row.eachCell({ includeEmpty: false }, (cell, colNum) => {
+        const addr = colLetter(colNum) + rowNum;
+        const v = cell.value;
+        if (v === null || v === undefined || v === '') return;
+
+        const obj = {};
+
+        if (v && typeof v === 'object') {
+          if (v.formula) {
+            obj.f = '=' + v.formula;
+            if (v.result !== undefined) obj.v = v.result;
+          } else if (v.richText) {
+            obj.v = v.richText.map(r => r.text).join('');
+          } else if (v.hyperlink) {
+            obj.v = v.text || v.hyperlink;
+            obj.link = { url: v.hyperlink, text: v.text || v.hyperlink };
+          } else if (v.result !== undefined) {
+            obj.v = v.result;
+          } else {
+            obj.v = String(v);
+          }
+        } else if (v instanceof Date) {
+          obj.v = v.getTime();
+        } else {
+          obj.v = v;
+        }
+
+        const s = {};
+        if (cell.font) {
+          if (cell.font.bold) s.bold = true;
+          if (cell.font.italic) s.italic = true;
+          if (cell.font.underline) s.underline = true;
+          if (cell.font.strike) s.strike = true;
+          if (cell.font.name) s.fontFamily = cell.font.name;
+          if (cell.font.size) s.fontSize = cell.font.size;
+          if (cell.font.color?.argb) {
+            const hex = cell.font.color.argb.slice(-6);
+            if (hex.toUpperCase() !== '000000') s.color = '#' + hex;
+          }
+        }
+        if (cell.fill?.fgColor?.argb) {
+          const hex = cell.fill.fgColor.argb.slice(-6);
+          if (hex.toUpperCase() !== 'FFFFFF') s.bg = '#' + hex;
+        }
+        if (cell.alignment?.horizontal) s.align = cell.alignment.horizontal;
+        if (cell.alignment?.wrapText) s.wrap = true;
+
+        if (Object.keys(s).length) obj.s = s;
+        cells[addr] = obj;
+      });
+    });
+
+    const merges = ws.model?.merges || [];
+    for (const m of merges) {
+      if (typeof m === 'string' && m.includes(':')) merged.push(m);
+    }
+
+    if (ws.columns) {
+      ws.columns.forEach((col, idx) => {
+        if (col.width) colWidths[idx] = Math.round(col.width * 7.5);
+      });
+    }
+
+    allSheets.push({
+      name: ws.name, cells, colWidths, rowHeight: 26, rowHeights,
+      cf: [], charts: [], merged, filters: {},
+      images: [], validations: [],
+      hidden: ws.state === 'hidden',
+      tabColor: null, rowGroups: [],
+      protected: false, protectHash: null,
+      freezeRow: 0, freezeCol: 0,
+      pivots: [], advancedFilters: [], controls: []
+    });
+  });
+
+  _excelDirect.workbook = wb;
+
+  document.body.classList.add('excel-direct-mode');
+
+  wbData = {
+    activeSheet: 0,
+    namedRanges: {},
+    macros: [],
+    sheets: allSheets
+  };
+
+  activeSheetIdx = 0;
+  loadedSheetIdxs = new Set(allSheets.map((_, i) => i));
+  wbId = null;
+  wbName = filename.replace(/\.xlsx?$/i, '');
+  document.getElementById('wb-name').value = wbName;
+
+  document.getElementById('home-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+
+  try { resetHF(); } catch (e) { console.warn(e); }
+  await recalcRowsLimit(true);
+
+  renderSheetTabs();
+  const gridWrapEl = document.getElementById('grid-wrap');
+  if (gridWrapEl) gridWrapEl.scrollTop = 0;
+  forceRefreshGrid();
+  selectCell('A1');
+}
+
+/* =========================================================
+   BIND
+   ========================================================= */
+document.getElementById('btn-shared-close')?.addEventListener('click', closeSharedFolder);
+document.getElementById('btn-shared-cancel')?.addEventListener('click', closeSharedFolder);
+document.getElementById('btn-shared-open-file')?.addEventListener('click', openSharedFile);
+document.getElementById('modal-shared')?.addEventListener('click', (e) => {
+  if (e.target.id === 'modal-shared') closeSharedFolder();
+});
+document.getElementById('btn-shared-browse')?.addEventListener('click', applyBrowseInput);
+document.getElementById('shared-path-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    applyBrowseInput();
+  }
+});
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-action="open-shared"]');
+  if (btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('file-dropdown')?.classList.add('hidden');
+    openSharedFolder();
+    return;
+  }
+}, true);
+
+console.log('✅ Shared Folder browser initialized');
+
+/* =========================================================
    INIT — dengan safety net biar UI tetap jalan
    ========================================================= */
 function bootApp() {
@@ -16935,3 +17958,14 @@ document.getElementById('btn-lock-cells')?.addEventListener('click', lockSelecti
 document.getElementById('btn-unlock-cells')?.addEventListener('click', unlockSelection);
 
 console.log('✅ Lock Cell initialized');
+
+/* =========================================================
+   WARNING SEBELUM CLOSE TAB (kalau ada perubahan)
+   ========================================================= */
+window.addEventListener('beforeunload', (e) => {
+  if (_excelDirect.active && _excelDirect.dirty) {
+    e.preventDefault();
+    e.returnValue = 'Ada perubahan belum disimpan. Yakin keluar?';
+    return e.returnValue;
+  }
+});

@@ -18,6 +18,7 @@ import chunksRouter from './routes/chunks.js';
 import importUrlRouter from './routes/import-url.js';
 import passwordRouter from './routes/password.js';
 import { setupWebSocket } from './collab.js';
+import sharedFolderRouter from './routes/shared-folder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -63,6 +64,7 @@ app.use('/api/sheets', chunksRouter);
 app.use('/api/sheets', importUrlRouter);
 app.use('/api/sheets', passwordRouter);
 app.use('/api/public', publicViewRouter);
+app.use('/api/shared-folder', sharedFolderRouter);
 
 /* =========================================
    5. ERROR HANDLER — cegah server mati

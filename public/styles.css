@@ -7082,3 +7082,176 @@ body.view-page .btn.ghost {
 body.view-page .btn.ghost:hover {
   background: #e2e8f0;
 }
+/* =========================================================
+   EXCEL DIRECT MODE
+   ========================================================= */
+body.excel-direct-mode .titlebar {
+  background: linear-gradient(135deg, #059669, #047857) !important;
+}
+
+body.excel-direct-mode .save-status {
+  color: #fef3c7;
+}
+
+.excel-mode-badge {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: rgba(255,255,255,.15);
+  border: 1px solid rgba(255,255,255,.2);
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+}
+
+body.excel-direct-mode .excel-mode-badge {
+  display: inline-flex;
+}
+
+.excel-unsaved-badge {
+  position: fixed;
+  bottom: 60px;
+  right: 20px;
+  background: #f59e0b;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(245,158,11,.4);
+  z-index: 100;
+  display: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.excel-unsaved-badge.show {
+  display: flex;
+}
+
+.excel-unsaved-badge button {
+  background: #fff;
+  color: #92400e;
+  border: 0;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+}
+/* =========================================================
+   SHARED FOLDER BROWSER
+   ========================================================= */
+.shared-list {
+  padding: 8px 16px;
+}
+
+.shared-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background .12s;
+  border: 1px solid transparent;
+  margin: 2px 0;
+}
+
+.shared-item:hover {
+  background: #f0f9ff;
+  border-color: #bae6fd;
+}
+
+.shared-item.selected {
+  background: #e0f2fe;
+  border-color: #0284c7;
+}
+
+.shared-item.dir {
+  cursor: pointer;
+}
+
+.shared-item .si-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.shared-item.dir .si-icon {
+  background: #fef3c7;
+  color: #d97706;
+}
+
+.shared-item.file .si-icon {
+  background: #d1fae5;
+  color: #059669;
+}
+
+.shared-item.file .si-icon.other {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.shared-item .si-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.shared-item .si-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #0f172a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shared-item .si-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
+.shared-empty {
+  padding: 60px 20px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.shared-empty i {
+  font-size: 48px;
+  color: #cbd5e1;
+  display: block;
+  margin-bottom: 12px;
+}
+
+.shared-up-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  background: #fff;
+  color: #475569;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all .12s;
+}
+
+.shared-up-btn:hover {
+  background: #f1f5f9;
+  border-color: #10b981;
+  color: #059669;
+}
