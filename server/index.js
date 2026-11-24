@@ -8,6 +8,8 @@ import authRouter from './routes/auth.js';
 import sheetsRouter from './routes/sheets.js';
 import ioRouter from './routes/io.js';
 import sharesRouter from './routes/shares.js';
+import sharedFolderRouter from './routes/shared-folder.js';
+import foldersRouter from './routes/folders.js';
 import revisionsRouter from './routes/revisions.js';
 import templatesRouter from './routes/templates.js';
 import apiKeysRouter from './routes/api-keys.js';
@@ -18,7 +20,6 @@ import chunksRouter from './routes/chunks.js';
 import importUrlRouter from './routes/import-url.js';
 import passwordRouter from './routes/password.js';
 import { setupWebSocket } from './collab.js';
-import sharedFolderRouter from './routes/shared-folder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -52,6 +53,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
    4. API ROUTES
    ========================================= */
 app.use('/api/auth', authRouter);
+app.use('/api', foldersRouter);
 app.use('/api/sheets', sheetsRouter);
 app.use('/api/sheets', ioRouter);
 app.use('/api/sheets', sharesRouter);

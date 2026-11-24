@@ -7255,3 +7255,59 @@ body.excel-direct-mode .excel-mode-badge {
   border-color: #10b981;
   color: #059669;
 }
+
+/* TEMPEL di bagian PALING BAWAH styles.css */
+
+/* ---------- Layout Home: sidebar + konten ---------- */
+.home-layout{display:grid;grid-template-columns:240px 1fr;gap:20px;align-items:start;margin-top:8px}
+.home-content{min-width:0}
+
+/* ---------- Sidebar folder ---------- */
+.folder-sidebar{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:12px;position:sticky;top:12px}
+.folder-side-title{font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin:4px 8px 8px}
+.folder-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:#334155;user-select:none;transition:background .12s}
+.folder-item i.fa-solid{width:16px;text-align:center;color:#64748b}
+.folder-item:hover{background:#f1f5f9}
+.folder-item.active{background:#e0e7ff;color:#3730a3;font-weight:600}
+.folder-item.active i.fa-solid{color:#4f46e5}
+.folder-item.drop-over{outline:2px dashed #6366f1;background:#eef2ff}
+.folder-item .f-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.folder-item .f-count{font-size:11px;color:#94a3b8}
+.folder-item .f-actions{display:none;gap:2px}
+.folder-item:hover .f-actions{display:flex}
+.folder-item:hover .f-count{display:none}
+.folder-item .f-actions button{border:0;background:none;color:#64748b;cursor:pointer;padding:3px 5px;border-radius:4px;font-size:11px}
+.folder-item .f-actions button:hover{background:#cbd5e1;color:#0f172a}
+
+/* ---------- Breadcrumb ---------- */
+.folder-breadcrumb{font-size:13px;color:#64748b;margin-bottom:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.folder-breadcrumb a{color:#4f46e5;cursor:pointer}
+.folder-breadcrumb a:hover{text-decoration:underline}
+
+/* ---------- Kartu workbook ---------- */
+.home-card{position:relative}
+.home-card.dragging{opacity:.4}
+.home-card-folder{margin-top:6px;font-size:11px;color:#64748b;display:flex;align-items:center;gap:5px}
+/* Tombol pindah: diletakkan di kiri tombol hapus. Kalau .home-card-del kamu posisinya beda, sesuaikan right-nya */
+.home-card-move{position:absolute;top:10px;right:44px;width:28px;height:28px;border:0;border-radius:8px;
+  background:rgba(100,116,139,.12);color:#475569;cursor:pointer;display:none;align-items:center;justify-content:center}
+.home-card:hover .home-card-move{display:flex}
+.home-card-move:hover{background:#6366f1;color:#fff}
+/* kalau kartu tidak punya tombol hapus (workbook dibagikan), geser ke kanan */
+.home-card.shared .home-card-move{right:10px}
+
+/* ---------- Menu "Pindahkan ke…" ---------- */
+.move-menu{position:fixed;z-index:9999;background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+  box-shadow:0 10px 30px rgba(0,0,0,.15);padding:6px;min-width:210px;max-height:320px;overflow:auto}
+.move-menu.hidden{display:none}
+.move-menu button{display:flex;gap:8px;align-items:center;width:100%;border:0;background:none;padding:8px 10px;
+  border-radius:6px;font:inherit;font-size:13px;cursor:pointer;text-align:left;color:#334155}
+.move-menu button:hover:not(:disabled){background:#f1f5f9}
+.move-menu button:disabled{opacity:.4;cursor:default}
+.move-menu .move-empty{padding:10px;font-size:12px;color:#94a3b8;text-align:center}
+
+/* ---------- Responsif ---------- */
+@media (max-width:800px){
+  .home-layout{grid-template-columns:1fr}
+  .folder-sidebar{position:static}
+}

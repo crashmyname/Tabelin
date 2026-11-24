@@ -13123,9 +13123,11 @@ async function renderHomeList() {
 
   let list = [];
   try {
-    const res = await fetch('/api/sheets', {
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
+    const [res] = await Promise.all([
+      fetch('/api/sheets', { headers: { 'Authorization': 'Bearer ' + token } }),
+      // kalau folder gagal dimuat, workbook tetap tampil (hanya tanpa folder)
+      Folders.load().catch(e => console.warn('load folders failed:', e))
+    ]);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     list = await res.json();
   } catch (e) {
@@ -13138,28 +13140,47 @@ async function renderHomeList() {
     return;
   }
 
-  // Terapkan filter dari input
+  Folders.attach(list);        // tempelkan folder_id ke tiap workbook
+  window.homeSheets = list;    // simpan supaya pindah folder / ganti folder tidak perlu fetch ulang
+  drawHomeList();
+}
+
+// 2) Gambar daftar dari data yang sudah ada di memori
+function drawHomeList() {
+  const box = document.getElementById('home-list');
+  const list = window.homeSheets || [];
+
+  Folders.renderTree();        // update sidebar + breadcrumb + jumlah
+
   const searchVal = (document.getElementById('home-search')?.value || '').trim().toLowerCase();
   const filterVal = document.getElementById('home-filter')?.value || 'all';
 
-  let filtered = list;
+  let filtered = list.filter(Folders.matches);             // <-- filter folder
   if (filterVal === 'mine') filtered = filtered.filter(s => s.access === 'owner');
   else if (filterVal === 'shared') filtered = filtered.filter(s => s.access !== 'owner');
   if (searchVal) {
-    filtered = filtered.filter(s =>
-      String(s.name || '').toLowerCase().includes(searchVal)
-    );
+    filtered = filtered.filter(s => String(s.name || '').toLowerCase().includes(searchVal));
   }
 
   box.innerHTML = '';
   if (!filtered.length) {
-    const isEmpty = !list.length;
+    const noWorkbook = !list.length;
+    const inFolder = Folders.current !== 'all';
+    let icon = 'fa-magnifying-glass', title = 'Tidak ada hasil',
+        text = 'Coba kata kunci lain atau ubah filter';
+    if (noWorkbook) {
+      icon = 'fa-folder-open'; title = 'Belum ada workbook';
+      text = 'Buat workbook pertama untuk mulai bekerja';
+    } else if (inFolder && !searchVal && filterVal === 'all') {
+      icon = 'fa-folder-open'; title = 'Folder ini kosong';
+      text = 'Drag workbook ke folder ini, atau klik ikon folder di kartu workbook';
+    }
     box.innerHTML = `
       <div class="home-empty">
-        <i class="fa-solid ${isEmpty ? 'fa-folder-open' : 'fa-magnifying-glass'}"></i>
-        <h3>${isEmpty ? 'Belum ada workbook' : 'Tidak ada hasil'}</h3>
-        <p>${isEmpty ? 'Buat workbook pertama untuk mulai bekerja' : 'Coba kata kunci lain atau ubah filter'}</p>
-        ${isEmpty ? `<button class="btn primary" onclick="newWB()" style="display:inline-flex;gap:8px">
+        <i class="fa-solid ${icon}"></i>
+        <h3>${title}</h3>
+        <p>${text}</p>
+        ${noWorkbook ? `<button class="btn primary" onclick="newWB()" style="display:inline-flex;gap:8px">
           <i class="fa-solid fa-plus"></i> Workbook Baru
         </button>` : ''}
       </div>`;
@@ -13169,6 +13190,7 @@ async function renderHomeList() {
   for (const s of filtered) {
     const card = document.createElement('div');
     card.className = 'home-card' + (s.access !== 'owner' ? ' shared' : '');
+    card.draggable = true;                                   // <-- bisa di-drag ke folder
 
     const isOwner = s.access === 'owner';
     const badgeClass = `badge-${s.access || 'view'}`;
@@ -13182,6 +13204,10 @@ async function renderHomeList() {
       });
     } catch { dateStr = '-'; }
 
+    const folderName = s.folder_id
+      ? (Folders.list.find(f => f.id === Number(s.folder_id))?.name || '')
+      : '';
+
     card.innerHTML = `
       <div class="home-card-icon">
         <i class="fa-solid ${isOwner ? 'fa-file-lines' : 'fa-share-nodes'}"></i>
@@ -13191,16 +13217,38 @@ async function renderHomeList() {
         <span class="home-card-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
         <span>${escapeHtml(dateStr)}</span>
       </div>
+      ${folderName && Folders.current === 'all'
+        ? `<div class="home-card-folder"><i class="fa-solid fa-folder"></i> ${escapeHtml(folderName)}</div>`
+        : ''}
+      <button class="home-card-move" data-move="${s.id}" title="Pindahkan ke folder">
+        <i class="fa-solid fa-folder-tree"></i>
+      </button>
       ${isOwner ? `<button class="home-card-del" data-del="${s.id}" title="Hapus">
         <i class="fa-solid fa-trash"></i>
       </button>` : ''}
     `;
 
+    // buka workbook (kecuali klik tombol move / delete)
     card.addEventListener('click', async (e) => {
-      if (e.target.closest('[data-del]')) return;   // jangan buka kalau klik delete
+      if (e.target.closest('[data-del], [data-move]')) return;
       await openWB(s.id);
     });
 
+    // drag & drop
+    card.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/sheet-id', String(s.id));
+      e.dataTransfer.effectAllowed = 'move';
+      card.classList.add('dragging');
+    });
+    card.addEventListener('dragend', () => card.classList.remove('dragging'));
+
+    // tombol pindah folder
+    card.querySelector('[data-move]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      Folders.showMoveMenu(s.id, e.currentTarget);
+    });
+
+    // tombol hapus (sama seperti sebelumnya)
     const delBtn = card.querySelector('[data-del]');
     if (delBtn) {
       delBtn.addEventListener('click', async (e) => {

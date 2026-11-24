@@ -167,30 +167,37 @@
     <div class="home-hero">
       <h1>Workbook Saya</h1>
       <p class="muted">Pilih workbook untuk mulai bekerja, atau buat baru</p>
-
       <div class="home-actions">
-        <button class="btn primary" id="btn-home-new">
-          <i class="fa-solid fa-plus"></i> Workbook Baru
-        </button>
-        <button class="btn ghost" id="btn-home-templates">
-          <i class="fa-solid fa-layer-group"></i> Template
-        </button>
+        <button class="btn primary" id="btn-home-new"><i class="fa-solid fa-plus"></i> Workbook Baru</button>
+        <button class="btn ghost" id="btn-home-templates"><i class="fa-solid fa-layer-group"></i> Template</button>
+        <button class="btn ghost" id="btn-folder-new"><i class="fa-solid fa-folder-plus"></i> Folder Baru</button>
       </div>
     </div>
 
-    <div class="home-filters">
-      <div class="home-search-wrap">
-        <i class="fa-solid fa-magnifying-glass"></i>
-        <input id="home-search" placeholder="Cari workbook…" />
-      </div>
-      <select id="home-filter">
-        <option value="all">Semua</option>
-        <option value="mine">Milik Saya</option>
-        <option value="shared">Dibagikan ke Saya</option>
-      </select>
-    </div>
+    <div class="home-layout">
+      <!-- SIDEBAR FOLDER -->
+      <aside class="folder-sidebar">
+        <div class="folder-side-title">Folder</div>
+        <div id="folder-tree" class="folder-tree"></div>
+      </aside>
 
-    <div id="home-list" class="home-list"></div>
+      <!-- KONTEN -->
+      <section class="home-content">
+        <div class="folder-breadcrumb" id="folder-breadcrumb"></div>
+        <div class="home-filters">
+          <div class="home-search-wrap">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input id="home-search" placeholder="Cari workbook…" />
+          </div>
+          <select id="home-filter">
+            <option value="all">Semua</option>
+            <option value="mine">Milik Saya</option>
+            <option value="shared">Dibagikan ke Saya</option>
+          </select>
+        </div>
+        <div id="home-list" class="home-list"></div>
+      </section>
+    </div>
   </main>
 </div>
 
@@ -862,6 +869,25 @@
     </div>
   </div>
 </div>
+<div id="modal-folder" class="modal hidden">
+  <div class="modal-card" style="min-width:400px">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-folder-plus"></i> <span id="folder-modal-title">Folder Baru</span></h3>
+    </div>
+    <div style="padding:0 24px">
+      <label class="modal-label">
+        <span>Nama Folder</span>
+        <input id="folder-name-input" maxlength="60" placeholder="Contoh: Laporan 2026" autocomplete="off" />
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" id="btn-folder-save"><i class="fa-solid fa-check"></i> Simpan</button>
+      <button class="btn ghost" id="btn-folder-cancel">Batal</button>
+    </div>
+  </div>
+</div>
+
+<div id="move-menu" class="move-menu hidden"></div>
 
 <div id="modal-chart" class="modal hidden">
   <div class="modal-card">
@@ -2272,6 +2298,7 @@ html
 </div>
 <script src="/collab.js"></script>
 <script src="/chunks.js"></script>
+<script src="/folders.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
